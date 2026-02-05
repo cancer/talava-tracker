@@ -1,0 +1,8 @@
+[package]
+name = "talava-tracker"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rosc = "0.10"      # OSCプロトコル（VMT連携）
+anyhow = "1.0"     # エラーハンドリング
