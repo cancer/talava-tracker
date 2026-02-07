@@ -13,6 +13,8 @@ pub struct Config {
     pub camera: CameraConfig,
     #[serde(default)]
     pub debug: DebugConfig,
+    #[serde(default)]
+    pub smooth: SmoothConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,11 +51,21 @@ pub struct DebugConfig {
     pub view: bool,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SmoothConfig {
+    #[serde(default = "default_smooth_position")]
+    pub position: f32,
+    #[serde(default = "default_smooth_rotation")]
+    pub rotation: f32,
+}
+
 fn default_vmt_addr() -> String { "127.0.0.1:39570".to_string() }
 fn default_scale() -> f32 { 1.0 }
 fn default_offset_y() -> f32 { 1.0 }
 fn default_width() -> u32 { 640 }
 fn default_height() -> u32 { 480 }
+fn default_smooth_position() -> f32 { 0.5 }
+fn default_smooth_rotation() -> f32 { 0.3 }
 
 impl Default for VmtConfig {
     fn default() -> Self {
@@ -88,6 +100,15 @@ impl Default for DebugConfig {
     }
 }
 
+impl Default for SmoothConfig {
+    fn default() -> Self {
+        Self {
+            position: default_smooth_position(),
+            rotation: default_smooth_rotation(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -95,6 +116,7 @@ impl Default for Config {
             tracker: TrackerConfig::default(),
             camera: CameraConfig::default(),
             debug: DebugConfig::default(),
+            smooth: SmoothConfig::default(),
         }
     }
 }

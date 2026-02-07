@@ -18,3 +18,8 @@ height = 480
 # デバッグ設定
 [debug]
 view = true
+
+# スムージング設定
+[smooth]
+position = 0.5
+rotation = 0.3

@@ -5,7 +5,7 @@ use talava_tracker::camera::OpenCvCamera;
 use talava_tracker::config::Config;
 use talava_tracker::pose::{self, preprocess_for_movenet, PoseDetector};
 use talava_tracker::render::{Key, MinifbRenderer};
-use talava_tracker::tracker::HipTracker;
+use talava_tracker::tracker::{HipTracker, Smoother};
 use talava_tracker::vmt::VmtClient;
 
 const MODEL_PATH: &str = "models/movenet_lightning.onnx";
@@ -17,12 +17,14 @@ fn main() -> Result<()> {
     // 設定読み込み
     let config = Config::load_or_default(CONFIG_PATH);
 
-    println!("Tracker Sender - Phase 3");
+    println!("Tracker Sender - Phase 4");
     println!("VMT target: {}", config.vmt.addr);
     println!("Debug view: {}", if config.debug.view { "ON" } else { "OFF" });
     println!("Tracker: scale=({}, {}), mirror_x={}, offset_y={}",
         config.tracker.scale_x, config.tracker.scale_y,
         config.tracker.mirror_x, config.tracker.offset_y);
+    println!("Smooth: position={}, rotation={}",
+        config.smooth.position, config.smooth.rotation);
     println!();
     println!("操作: [C] キャリブレーション  [Esc] 終了");
     println!();
@@ -40,6 +42,7 @@ fn main() -> Result<()> {
     println!("Model loaded");
 
     let mut hip_tracker = HipTracker::from_config(&config.tracker);
+    let mut smoother = Smoother::new(config.smooth.position, config.smooth.rotation);
     let vmt = VmtClient::new(&config.vmt.addr)?;
     println!("VMT client ready");
 
@@ -94,6 +97,7 @@ fn main() -> Result<()> {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 if hip_tracker.calibrate(&pose) {
+                    smoother.reset();
                     println!("Calibrated!");
                 } else {
                     println!("Calibration failed: hip not detected");
@@ -109,8 +113,8 @@ fn main() -> Result<()> {
             r.update()?;
         }
 
-        // トラッカー変換 & 送信
-        if let Some(tracker_pose) = hip_tracker.compute(&pose) {
+        // トラッカー変換 & 平滑化 & 送信
+        if let Some(tracker_pose) = hip_tracker.compute(&pose).map(|p| smoother.apply(p)) {
             if frame_count == 0 {
                 eprintln!("Pos: [{:.2}, {:.2}, {:.2}] Rot: [{:.2}, {:.2}, {:.2}, {:.2}]{}",
                     tracker_pose.position[0], tracker_pose.position[1], tracker_pose.position[2],
