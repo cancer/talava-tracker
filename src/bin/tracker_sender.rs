@@ -3,21 +3,24 @@ use std::time::Instant;
 
 use talava_tracker::camera::OpenCvCamera;
 use talava_tracker::config::Config;
-use talava_tracker::pose::{self, preprocess_for_movenet, PoseDetector};
+use talava_tracker::pose::{preprocess_for_movenet, PoseDetector};
 use talava_tracker::render::{Key, MinifbRenderer};
-use talava_tracker::tracker::{HipTracker, Smoother};
+use talava_tracker::tracker::{BodyTracker, Smoother};
 use talava_tracker::vmt::VmtClient;
 
 const MODEL_PATH: &str = "models/movenet_lightning.onnx";
 const CONFIG_PATH: &str = "config.toml";
-const HIP_TRACKER_INDEX: i32 = 0;
+const HIP_INDEX: i32 = 0;
+const LEFT_FOOT_INDEX: i32 = 1;
+const RIGHT_FOOT_INDEX: i32 = 2;
+const CHEST_INDEX: i32 = 3;
 const CONFIDENCE_THRESHOLD: f32 = 0.3;
 
 fn main() -> Result<()> {
     // 設定読み込み
     let config = Config::load_or_default(CONFIG_PATH);
 
-    println!("Tracker Sender - Phase 4");
+    println!("Tracker Sender - Phase 5");
     println!("VMT target: {}", config.vmt.addr);
     println!("Debug view: {}", if config.debug.view { "ON" } else { "OFF" });
     println!("Tracker: scale=({}, {}), mirror_x={}, offset_y={}",
@@ -41,8 +44,13 @@ fn main() -> Result<()> {
     let mut detector = PoseDetector::new(MODEL_PATH)?;
     println!("Model loaded");
 
-    let mut hip_tracker = HipTracker::from_config(&config.tracker);
-    let mut smoother = Smoother::new(config.smooth.position, config.smooth.rotation);
+    let mut body_tracker = BodyTracker::from_config(&config.tracker);
+    let mut smoothers = [
+        Smoother::from_config(&config.smooth),
+        Smoother::from_config(&config.smooth),
+        Smoother::from_config(&config.smooth),
+        Smoother::from_config(&config.smooth),
+    ];
     let vmt = VmtClient::new(&config.vmt.addr)?;
     println!("VMT client ready");
 
@@ -96,8 +104,10 @@ fn main() -> Result<()> {
         if let Some(deadline) = calibration_deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                if hip_tracker.calibrate(&pose) {
-                    smoother.reset();
+                if body_tracker.calibrate(&pose) {
+                    for s in &mut smoothers {
+                        s.reset();
+                    }
                     println!("Calibrated!");
                 } else {
                     println!("Calibration failed: hip not detected");
@@ -114,19 +124,27 @@ fn main() -> Result<()> {
         }
 
         // トラッカー変換 & 平滑化 & 送信
-        if let Some(tracker_pose) = hip_tracker.compute(&pose).map(|p| smoother.apply(p)) {
-            if frame_count == 0 {
-                eprintln!("Pos: [{:.2}, {:.2}, {:.2}] Rot: [{:.2}, {:.2}, {:.2}, {:.2}]{}",
-                    tracker_pose.position[0], tracker_pose.position[1], tracker_pose.position[2],
-                    tracker_pose.rotation[0], tracker_pose.rotation[1], tracker_pose.rotation[2], tracker_pose.rotation[3],
-                    if hip_tracker.is_calibrated() { " [CAL]" } else { "" });
+        let body_poses = body_tracker.compute(&pose);
+        let tracker_data = [
+            (HIP_INDEX, body_poses.hip),
+            (LEFT_FOOT_INDEX, body_poses.left_foot),
+            (RIGHT_FOOT_INDEX, body_poses.right_foot),
+            (CHEST_INDEX, body_poses.chest),
+        ];
+        for (i, (index, pose_opt)) in tracker_data.iter().enumerate() {
+            if let Some(p) = pose_opt {
+                let smoothed = smoothers[i].apply(*p);
+                vmt.send(*index, 1, &smoothed)?;
+                send_count += 1;
             }
-            vmt.send(HIP_TRACKER_INDEX, 1, &tracker_pose)?;
-            send_count += 1;
-        } else if frame_count == 0 {
-            let lh = pose.get(pose::KeypointIndex::LeftHip);
-            let rh = pose.get(pose::KeypointIndex::RightHip);
-            eprintln!("Hip confidence: L={:.2} R={:.2}", lh.confidence, rh.confidence);
+        }
+        if frame_count == 0 {
+            if let Some(ref hip) = body_poses.hip {
+                eprint!("Hip: [{:.2}, {:.2}, {:.2}]", hip.position[0], hip.position[1], hip.position[2]);
+            }
+            let active = [body_poses.hip.is_some(), body_poses.left_foot.is_some(), body_poses.right_foot.is_some(), body_poses.chest.is_some()];
+            let count = active.iter().filter(|&&x| x).count();
+            eprintln!(" Active: {}/4{}", count, if body_tracker.is_calibrated() { " [CAL]" } else { "" });
         }
 
         // FPS表示
