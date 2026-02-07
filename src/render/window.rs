@@ -42,6 +42,11 @@ impl MinifbRenderer {
         self.window.is_open() && !self.window.is_key_down(Key::Escape)
     }
 
+    /// 指定キーが押されたか（押した瞬間のみ true）
+    pub fn is_key_pressed(&self, key: Key) -> bool {
+        self.window.is_key_pressed(key, minifb::KeyRepeat::No)
+    }
+
     /// BGR Mat をバッファにコピー
     pub fn draw_frame(&mut self, frame: &Mat) -> Result<()> {
         let frame_width = frame.cols() as usize;

@@ -4,7 +4,7 @@ use std::time::Instant;
 use talava_tracker::camera::OpenCvCamera;
 use talava_tracker::config::Config;
 use talava_tracker::pose::{self, preprocess_for_movenet, PoseDetector};
-use talava_tracker::render::MinifbRenderer;
+use talava_tracker::render::{Key, MinifbRenderer};
 use talava_tracker::tracker::HipTracker;
 use talava_tracker::vmt::VmtClient;
 
@@ -23,7 +23,9 @@ fn main() -> Result<()> {
     println!("Tracker: scale=({}, {}), mirror_x={}, offset_y={}",
         config.tracker.scale_x, config.tracker.scale_y,
         config.tracker.mirror_x, config.tracker.offset_y);
-    println!("Press Ctrl+C to exit");
+    println!();
+    println!("操作: [C] キャリブレーション  [Esc] 終了");
+    println!();
 
     // 初期化
     let mut camera = OpenCvCamera::open_with_resolution(
@@ -37,7 +39,7 @@ fn main() -> Result<()> {
     let mut detector = PoseDetector::new(MODEL_PATH)?;
     println!("Model loaded");
 
-    let hip_tracker = HipTracker::from_config(&config.tracker);
+    let mut hip_tracker = HipTracker::from_config(&config.tracker);
     let vmt = VmtClient::new(&config.vmt.addr)?;
     println!("VMT client ready");
 
@@ -52,6 +54,10 @@ fn main() -> Result<()> {
     let mut frame_count = 0u32;
     let mut fps_timer = Instant::now();
     let mut send_count = 0u32;
+
+    // キャリブレーション用カウントダウン
+    let mut calibration_deadline: Option<Instant> = None;
+    const CALIBRATION_DELAY_SECS: u64 = 5;
 
     loop {
         // デバッグウィンドウが閉じられたら終了
@@ -74,6 +80,28 @@ fn main() -> Result<()> {
         let input = preprocess_for_movenet(&frame)?;
         let pose = detector.detect(input)?;
 
+        // キャリブレーション（Cキーで5秒カウントダウン開始）
+        if let Some(ref r) = renderer {
+            if r.is_key_pressed(Key::C) {
+                let deadline = Instant::now() + std::time::Duration::from_secs(CALIBRATION_DELAY_SECS);
+                calibration_deadline = Some(deadline);
+                println!("Calibration in {}s... 基準位置に立ってください", CALIBRATION_DELAY_SECS);
+            }
+        }
+
+        // カウントダウン中 → 時間が来たら実行
+        if let Some(deadline) = calibration_deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                if hip_tracker.calibrate(&pose) {
+                    println!("Calibrated!");
+                } else {
+                    println!("Calibration failed: hip not detected");
+                }
+                calibration_deadline = None;
+            }
+        }
+
         // デバッグ描画
         if let Some(ref mut r) = renderer {
             r.draw_frame(&frame)?;
@@ -84,9 +112,10 @@ fn main() -> Result<()> {
         // トラッカー変換 & 送信
         if let Some(tracker_pose) = hip_tracker.compute(&pose) {
             if frame_count == 0 {
-                eprintln!("Pos: [{:.2}, {:.2}, {:.2}] Rot: [{:.2}, {:.2}, {:.2}, {:.2}]",
+                eprintln!("Pos: [{:.2}, {:.2}, {:.2}] Rot: [{:.2}, {:.2}, {:.2}, {:.2}]{}",
                     tracker_pose.position[0], tracker_pose.position[1], tracker_pose.position[2],
-                    tracker_pose.rotation[0], tracker_pose.rotation[1], tracker_pose.rotation[2], tracker_pose.rotation[3]);
+                    tracker_pose.rotation[0], tracker_pose.rotation[1], tracker_pose.rotation[2], tracker_pose.rotation[3],
+                    if hip_tracker.is_calibrated() { " [CAL]" } else { "" });
             }
             vmt.send(HIP_TRACKER_INDEX, 1, &tracker_pose)?;
             send_count += 1;
