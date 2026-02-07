@@ -1,0 +1,20 @@
+# VMT設定
+[vmt]
+addr = "192.168.10.35:39570"
+
+# トラッカー設定
+[tracker]
+scale_x = 1.0
+scale_y = 1.0
+mirror_x = false
+offset_y = 1.0
+
+# カメラ設定
+[camera]
+index = 0
+width = 640
+height = 480
+
+# デバッグ設定
+[debug]
+view = true

@@ -2,6 +2,7 @@
 name = "talava-tracker"
 version = "0.1.0"
 edition = "2021"
+default-run = "tracker_sender"
 
 [dependencies]
 rosc = "0.10"      # OSCプロトコル（VMT連携）
@@ -10,6 +11,8 @@ ort = "2.0.0-rc.9" # ONNX Runtime
 ndarray = "0.17"   # テンソル操作
 opencv = { version = "0.93", default-features = false, features = ["videoio", "imgproc"] }
 minifb = "0.27"    # シンプルなウィンドウ描画
+toml = "0.9.11"
+serde = { version = "1.0.228", features = ["derive"] }
 
 [[bin]]
 name = "bench_inference"

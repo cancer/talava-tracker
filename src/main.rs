@@ -1,45 +1,15 @@
 use anyhow::Result;
 use std::io::{self, Write};
-use std::process::Command;
+use talava_tracker::config::Config;
 use talava_tracker::vmt::{TrackerPose, VmtClient};
 
-/// WSL2環境でWindowsホストのIPを取得
-fn get_wsl_host_ip() -> Option<String> {
-    let output = Command::new("ip")
-        .args(["route", "show", "default"])
-        .output()
-        .ok()?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // "default via 172.28.176.1 dev eth0 ..." から IPを抽出
-    stdout.split_whitespace().nth(2).map(|s| s.to_string())
-}
-
-/// VMTアドレスを決定
-fn get_vmt_addr() -> String {
-    // 環境変数が設定されていればそれを使用
-    if let Ok(addr) = std::env::var("VMT_ADDR") {
-        return addr;
-    }
-
-    // WSL環境ならWindowsホストIPを使用
-    if std::path::Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists() {
-        if let Some(host_ip) = get_wsl_host_ip() {
-            return format!("{}:39570", host_ip);
-        }
-    }
-
-    // デフォルトはlocalhost
-    "127.0.0.1:39570".to_string()
-}
+const CONFIG_PATH: &str = "config.toml";
 
 fn main() -> Result<()> {
-    println!("=== Talava Tracker - VMT Test ===");
-    println!("VMTに接続します...");
+    let config = Config::load_or_default(CONFIG_PATH);
 
-    let vmt_addr = get_vmt_addr();
-    let client = VmtClient::new(&vmt_addr)?;
-    println!("接続先: {}", vmt_addr);
+    println!("=== Talava Tracker - VMT Test ===");
+    println!("接続先: {}", config.vmt.addr);
     println!();
     println!("コマンド:");
     println!("  p x y z       - 位置を設定 (例: p 0 1 0)");
@@ -49,9 +19,10 @@ fn main() -> Result<()> {
     println!("  q             - 終了");
     println!();
 
+    let client = VmtClient::new(&config.vmt.addr)?;
     let mut pose = TrackerPose::identity();
     let index = 0;
-    let enable = true;
+    let enable = 1;
 
     loop {
         print!("> ");
