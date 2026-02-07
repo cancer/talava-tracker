@@ -95,7 +95,14 @@ impl HipTracker {
         if left_shoulder.is_valid(self.confidence_threshold)
             && right_shoulder.is_valid(self.confidence_threshold)
         {
-            let dx = right_shoulder.x - left_shoulder.x;
+            // 正面向きで dx > 0 にする
+            // 左右反転カメラ(mirror_x=false): left.x - right.x
+            // 通常カメラ(mirror_x=true):      right.x - left.x
+            let dx = if self.mirror_x {
+                right_shoulder.x - left_shoulder.x
+            } else {
+                left_shoulder.x - right_shoulder.x
+            };
             let dy = right_shoulder.y - left_shoulder.y;
             f32::atan2(dy, dx)
         } else {
@@ -131,7 +138,7 @@ impl HipTracker {
         };
 
         // 座標変換: 基準点からの差分をメートルに変換
-        let mut pos_x = (hip_x - ref_x) * self.scale_x;
+        let mut pos_x = (ref_x - hip_x) * self.scale_x;
         if self.mirror_x {
             pos_x = -pos_x;
         }
