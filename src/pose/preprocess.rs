@@ -35,15 +35,21 @@ pub fn preprocess_for_movenet(frame: &Mat) -> Result<Array4<f32>> {
     resized.convert_to(&mut float_mat, CV_32FC3, 1.0, 0.0)?;
 
     // ndarray に変換 [1, 192, 192, 3]
-    let mut tensor = Array4::<f32>::zeros((1, MOVENET_INPUT_SIZE as usize, MOVENET_INPUT_SIZE as usize, 3));
-
-    for y in 0..MOVENET_INPUT_SIZE {
-        for x in 0..MOVENET_INPUT_SIZE {
-            let pixel = float_mat.at_2d::<opencv::core::Vec3f>(y, x)?;
-            tensor[[0, y as usize, x as usize, 0]] = pixel[0];
-            tensor[[0, y as usize, x as usize, 1]] = pixel[1];
-            tensor[[0, y as usize, x as usize, 2]] = pixel[2];
-        }
+    let h = MOVENET_INPUT_SIZE as usize;
+    let w = MOVENET_INPUT_SIZE as usize;
+    let mut tensor = Array4::<f32>::zeros((1, h, w, 3));
+    let dst = tensor.as_slice_mut().unwrap();
+    let row_floats = w * 3;
+    let data = float_mat.data_bytes()?;
+    let step = float_mat.mat_step().get(0); // 行あたりのバイト数（パディング含む）
+    for y in 0..h {
+        let src = unsafe {
+            std::slice::from_raw_parts(
+                data.as_ptr().add(y * step) as *const f32,
+                row_floats,
+            )
+        };
+        dst[y * row_floats..(y + 1) * row_floats].copy_from_slice(src);
     }
 
     Ok(tensor)

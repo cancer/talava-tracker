@@ -17,12 +17,9 @@ pub struct PoseDetector {
 impl PoseDetector {
     /// ONNXモデルを読み込んで初期化
     pub fn new<P: AsRef<Path>>(model_path: P) -> Result<Self> {
-        let coreml = CoreMLExecutionProvider::default();
-        println!("CoreML available: {}", coreml.is_available().unwrap_or(false));
-
+        // CoreML disabled temporarily (hangs on model load)
         let session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_execution_providers([coreml.build()])?
             .commit_from_file(model_path.as_ref())
             .context("Failed to load ONNX model")?;
 
