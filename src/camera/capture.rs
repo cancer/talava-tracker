@@ -42,6 +42,7 @@ impl OpenCvCamera {
         if let Some(f) = fps {
             capture.set(videoio::CAP_PROP_FPS, f as f64)?;
         }
+        capture.set(videoio::CAP_PROP_BUFFERSIZE, 1.0)?;
 
         let actual_width = capture.get(videoio::CAP_PROP_FRAME_WIDTH)? as u32;
         let actual_height = capture.get(videoio::CAP_PROP_FRAME_HEIGHT)? as u32;
