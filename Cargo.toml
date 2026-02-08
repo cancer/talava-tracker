@@ -7,7 +7,7 @@ default-run = "tracker_sender"
 [dependencies]
 rosc = "0.10"      # OSCプロトコル（VMT連携）
 anyhow = "1.0"     # エラーハンドリング
-ort = "2.0.0-rc.9" # ONNX Runtime
+ort = { version = "2.0.0-rc.9", features = ["coreml"] } # ONNX Runtime
 ndarray = "0.17"   # テンソル操作
 opencv = { version = "0.93", default-features = false, features = ["videoio", "imgproc"] }
 minifb = "0.27"    # シンプルなウィンドウ描画

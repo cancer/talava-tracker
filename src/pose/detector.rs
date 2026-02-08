@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use ndarray::Array4;
+use ort::ep::ExecutionProvider;
+use ort::execution_providers::CoreMLExecutionProvider;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;
@@ -15,8 +17,12 @@ pub struct PoseDetector {
 impl PoseDetector {
     /// ONNXモデルを読み込んで初期化
     pub fn new<P: AsRef<Path>>(model_path: P) -> Result<Self> {
+        let coreml = CoreMLExecutionProvider::default();
+        println!("CoreML available: {}", coreml.is_available().unwrap_or(false));
+
         let session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_execution_providers([coreml.build()])?
             .commit_from_file(model_path.as_ref())
             .context("Failed to load ONNX model")?;
 
