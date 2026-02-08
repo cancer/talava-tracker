@@ -1,7 +1,5 @@
 use anyhow::{Context, Result};
 use ndarray::Array4;
-use ort::ep::ExecutionProvider;
-use ort::execution_providers::CoreMLExecutionProvider;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;

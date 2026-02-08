@@ -15,6 +15,8 @@ pub struct Config {
     pub debug: DebugConfig,
     #[serde(default)]
     pub smooth: SmoothConfig,
+    #[serde(default)]
+    pub app: AppConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,6 +61,19 @@ pub struct SmoothConfig {
     pub rotation: f32,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AppConfig {
+    #[serde(default = "default_target_fps")]
+    pub target_fps: u32,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self { target_fps: default_target_fps() }
+    }
+}
+
+fn default_target_fps() -> u32 { 30 }
 fn default_vmt_addr() -> String { "127.0.0.1:39570".to_string() }
 fn default_scale() -> f32 { 1.0 }
 fn default_offset_y() -> f32 { 1.0 }
@@ -117,6 +132,7 @@ impl Default for Config {
             camera: CameraConfig::default(),
             debug: DebugConfig::default(),
             smooth: SmoothConfig::default(),
+            app: AppConfig::default(),
         }
     }
 }

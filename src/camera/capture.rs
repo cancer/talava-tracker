@@ -4,6 +4,8 @@ use opencv::{
     prelude::*,
     videoio::{self, VideoCapture, VideoCaptureAPIs, VideoCaptureTrait},
 };
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 /// OpenCVを使用したカメラキャプチャ
 pub struct OpenCvCamera {
@@ -73,5 +75,49 @@ impl OpenCvCamera {
         }
 
         Ok(frame)
+    }
+}
+
+/// 別スレッドでカメラキャプチャを行い、最新フレームを提供する
+pub struct ThreadedCamera {
+    latest: Arc<Mutex<Option<Mat>>>,
+    width: u32,
+    height: u32,
+    _handle: thread::JoinHandle<()>,
+}
+
+impl ThreadedCamera {
+    pub fn start(index: i32, width: Option<u32>, height: Option<u32>) -> Result<Self> {
+        let mut camera = OpenCvCamera::open_with_resolution(index, width, height)?;
+        let (w, h) = camera.resolution();
+        let latest = Arc::new(Mutex::new(None::<Mat>));
+        let latest_ref = latest.clone();
+
+        let handle = thread::spawn(move || {
+            loop {
+                match camera.read_frame() {
+                    Ok(frame) => {
+                        *latest_ref.lock().unwrap() = Some(frame);
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
+
+        Ok(Self {
+            latest,
+            width: w,
+            height: h,
+            _handle: handle,
+        })
+    }
+
+    pub fn resolution(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// 最新フレームを取得。新しいフレームがなければNone
+    pub fn take_frame(&self) -> Option<Mat> {
+        self.latest.lock().unwrap().take()
     }
 }

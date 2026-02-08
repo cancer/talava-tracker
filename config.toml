@@ -19,6 +19,10 @@ height = 480
 [debug]
 view = true
 
+# アプリ設定
+[app]
+target_fps = 60
+
 # スムージング設定
 [smooth]
 position = 0.5
