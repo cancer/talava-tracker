@@ -66,6 +66,13 @@ fn main() -> Result<()> {
     let mut fps_timer = Instant::now();
     let mut send_count = 0u32;
 
+    // 各段階の累積時間（ms）
+    let mut t_camera = 0.0f64;
+    let mut t_preprocess = 0.0f64;
+    let mut t_inference = 0.0f64;
+    let mut t_render = 0.0f64;
+    let mut t_tracker = 0.0f64;
+
     // キャリブレーション用カウントダウン
     let mut calibration_deadline: Option<Instant> = None;
     const CALIBRATION_DELAY_SECS: u64 = 5;
@@ -79,6 +86,7 @@ fn main() -> Result<()> {
         }
 
         // フレーム取得
+        let t0 = Instant::now();
         let frame = match camera.read_frame() {
             Ok(f) => f,
             Err(e) => {
@@ -86,10 +94,15 @@ fn main() -> Result<()> {
                 continue;
             }
         };
+        let t1 = Instant::now();
+
+        // 前処理
+        let input = preprocess_for_movenet(&frame)?;
+        let t2 = Instant::now();
 
         // 推論
-        let input = preprocess_for_movenet(&frame)?;
         let pose = detector.detect(input)?;
+        let t3 = Instant::now();
 
         // キャリブレーション（Cキーで5秒カウントダウン開始）
         if let Some(ref r) = renderer {
@@ -122,6 +135,7 @@ fn main() -> Result<()> {
             r.draw_pose(&pose, CONFIDENCE_THRESHOLD);
             r.update()?;
         }
+        let t4 = Instant::now();
 
         // トラッカー変換 & 平滑化 & 送信
         let body_poses = body_tracker.compute(&pose);
@@ -147,14 +161,31 @@ fn main() -> Result<()> {
             eprintln!(" Active: {}/4{}", count, if body_tracker.is_calibrated() { " [CAL]" } else { "" });
         }
 
+        let t5 = Instant::now();
+
+        // 累積
+        t_camera += (t1 - t0).as_secs_f64() * 1000.0;
+        t_preprocess += (t2 - t1).as_secs_f64() * 1000.0;
+        t_inference += (t3 - t2).as_secs_f64() * 1000.0;
+        t_render += (t4 - t3).as_secs_f64() * 1000.0;
+        t_tracker += (t5 - t4).as_secs_f64() * 1000.0;
+
         // FPS表示
         frame_count += 1;
         let elapsed = fps_timer.elapsed().as_secs_f32();
         if elapsed >= 1.0 {
-            println!("FPS: {:.1}, Sent: {}", frame_count as f32 / elapsed, send_count);
+            let n = frame_count as f64;
+            println!("FPS: {:.1} | camera {:.1}ms  preprocess {:.1}ms  inference {:.1}ms  render {:.1}ms  tracker {:.1}ms",
+                frame_count as f32 / elapsed,
+                t_camera / n, t_preprocess / n, t_inference / n, t_render / n, t_tracker / n);
             frame_count = 0;
             send_count = 0;
             fps_timer = Instant::now();
+            t_camera = 0.0;
+            t_preprocess = 0.0;
+            t_inference = 0.0;
+            t_render = 0.0;
+            t_tracker = 0.0;
         }
     }
 
