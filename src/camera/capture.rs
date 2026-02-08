@@ -116,8 +116,11 @@ impl ThreadedCamera {
         (self.width, self.height)
     }
 
-    /// 最新フレームを取得。新しいフレームがなければNone
-    pub fn take_frame(&self) -> Option<Mat> {
-        self.latest.lock().unwrap().take()
+    /// 最新フレームを取得。フレームは保持されるので何度でも取得可能。
+    /// カメラスレッドが新フレームを書き込むまで同じフレームが返る。
+    /// 初回フレーム到着前のみNone。
+    pub fn get_frame(&self) -> Option<Mat> {
+        let guard = self.latest.lock().unwrap();
+        guard.as_ref().map(|m| m.clone())
     }
 }

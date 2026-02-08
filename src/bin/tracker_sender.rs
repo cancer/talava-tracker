@@ -89,8 +89,8 @@ fn main() -> Result<()> {
             }
         }
 
-        // 最新フレーム取得（なければスキップ）
-        let frame = match camera.take_frame() {
+        // 最新フレーム取得（初回フレーム到着前のみスキップ）
+        let frame = match camera.get_frame() {
             Some(f) => f,
             None => {
                 std::thread::sleep(Duration::from_millis(1));
