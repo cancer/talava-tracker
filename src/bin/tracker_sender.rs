@@ -1,4 +1,6 @@
 use anyhow::Result;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use talava_tracker::camera::ThreadedCamera;
@@ -32,7 +34,7 @@ fn main() -> Result<()> {
     println!("Smooth: position={}, rotation={}",
         config.smooth.position, config.smooth.rotation);
     println!();
-    println!("操作: [C] キャリブレーション  [Esc] 終了");
+    println!("操作: [C] キャリブレーション  [Esc] 終了  (コンソール: c + Enter)");
     println!();
 
     let camera = ThreadedCamera::start(
@@ -80,6 +82,24 @@ fn main() -> Result<()> {
     let mut calibration_deadline: Option<Instant> = None;
     const CALIBRATION_DELAY_SECS: u64 = 5;
 
+    // コンソール入力スレッド
+    let console_calibrate = Arc::new(AtomicBool::new(false));
+    {
+        let flag = console_calibrate.clone();
+        std::thread::spawn(move || {
+            let stdin = std::io::stdin();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if stdin.read_line(&mut line).is_ok() {
+                    if line.trim().eq_ignore_ascii_case("c") {
+                        flag.store(true, Ordering::Release);
+                    }
+                }
+            }
+        });
+    }
+
     // フレーム追跡
     let mut last_frame_id: u64 = 0;
     let mut last_inference_time = Instant::now();
@@ -92,6 +112,15 @@ fn main() -> Result<()> {
             if !r.is_open() {
                 break;
             }
+        }
+
+        // キャリブレーション要求検知（コンソール or デバッグウィンドウ）
+        let cal_from_console = console_calibrate.swap(false, Ordering::AcqRel);
+        let cal_from_renderer = renderer.as_ref().map_or(false, |r| r.is_key_pressed(Key::C));
+        if (cal_from_console || cal_from_renderer) && calibration_deadline.is_none() {
+            let deadline = Instant::now() + Duration::from_secs(CALIBRATION_DELAY_SECS);
+            calibration_deadline = Some(deadline);
+            println!("Calibration in {}s... 基準位置に立ってください", CALIBRATION_DELAY_SECS);
         }
 
         let current_frame_id = camera.frame_id();
@@ -113,14 +142,7 @@ fn main() -> Result<()> {
             let pose = detector.detect(input)?;
             let t3 = Instant::now();
 
-            // キャリブレーション
-            if let Some(ref r) = renderer {
-                if r.is_key_pressed(Key::C) && calibration_deadline.is_none() {
-                    let deadline = Instant::now() + Duration::from_secs(CALIBRATION_DELAY_SECS);
-                    calibration_deadline = Some(deadline);
-                    println!("Calibration in {}s... 基準位置に立ってください", CALIBRATION_DELAY_SECS);
-                }
-            }
+            // キャリブレーション実行（カウントダウン完了時）
             if let Some(deadline) = calibration_deadline {
                 if deadline.saturating_duration_since(Instant::now()).is_zero() {
                     if body_tracker.calibrate(&pose) {
