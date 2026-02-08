@@ -4,6 +4,7 @@ use opencv::{
     prelude::*,
     videoio::{self, VideoCapture, VideoCaptureAPIs, VideoCaptureTrait},
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -81,6 +82,7 @@ impl OpenCvCamera {
 /// 別スレッドでカメラキャプチャを行い、最新フレームを提供する
 pub struct ThreadedCamera {
     latest: Arc<Mutex<Option<Mat>>>,
+    frame_id: Arc<AtomicU64>,
     width: u32,
     height: u32,
     _handle: thread::JoinHandle<()>,
@@ -92,12 +94,15 @@ impl ThreadedCamera {
         let (w, h) = camera.resolution();
         let latest = Arc::new(Mutex::new(None::<Mat>));
         let latest_ref = latest.clone();
+        let frame_id = Arc::new(AtomicU64::new(0));
+        let frame_id_ref = frame_id.clone();
 
         let handle = thread::spawn(move || {
             loop {
                 match camera.read_frame() {
                     Ok(frame) => {
                         *latest_ref.lock().unwrap() = Some(frame);
+                        frame_id_ref.fetch_add(1, Ordering::Release);
                     }
                     Err(_) => {}
                 }
@@ -106,6 +111,7 @@ impl ThreadedCamera {
 
         Ok(Self {
             latest,
+            frame_id,
             width: w,
             height: h,
             _handle: handle,
@@ -114,6 +120,11 @@ impl ThreadedCamera {
 
     pub fn resolution(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    /// 現在のフレームIDを取得。新フレームが到着するたびにインクリメントされる。
+    pub fn frame_id(&self) -> u64 {
+        self.frame_id.load(Ordering::Acquire)
     }
 
     /// 最新フレームを取得。フレームは保持されるので何度でも取得可能。

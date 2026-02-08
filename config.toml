@@ -17,13 +17,17 @@ height = 480
 
 # デバッグ設定
 [debug]
-view = true
+view = false
 
 # アプリ設定
 [app]
-target_fps = 60
+target_fps = 90
 
 # スムージング設定
 [smooth]
 position = 0.5
 rotation = 0.3
+
+# 補間設定 (none / extrapolate / lerp)
+[interpolation]
+mode = "extrapolate"

@@ -17,6 +17,8 @@ pub struct Config {
     pub smooth: SmoothConfig,
     #[serde(default)]
     pub app: AppConfig,
+    #[serde(default)]
+    pub interpolation: InterpolationConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +76,19 @@ impl Default for AppConfig {
 }
 
 fn default_target_fps() -> u32 { 30 }
+fn default_interpolation_mode() -> String { "extrapolate".to_string() }
+
+#[derive(Debug, Deserialize)]
+pub struct InterpolationConfig {
+    #[serde(default = "default_interpolation_mode")]
+    pub mode: String,
+}
+
+impl Default for InterpolationConfig {
+    fn default() -> Self {
+        Self { mode: default_interpolation_mode() }
+    }
+}
 fn default_vmt_addr() -> String { "127.0.0.1:39570".to_string() }
 fn default_scale() -> f32 { 1.0 }
 fn default_offset_y() -> f32 { 1.0 }
@@ -133,6 +148,7 @@ impl Default for Config {
             debug: DebugConfig::default(),
             smooth: SmoothConfig::default(),
             app: AppConfig::default(),
+            interpolation: InterpolationConfig::default(),
         }
     }
 }
