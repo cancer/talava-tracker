@@ -70,6 +70,7 @@ fn main() -> Result<()> {
     let mut fps_timer = Instant::now();
 
     // 各段階の累積時間（ms）
+    let mut t_clone = 0.0f64;
     let mut t_preprocess = 0.0f64;
     let mut t_inference = 0.0f64;
     let mut t_render = 0.0f64;
@@ -90,6 +91,7 @@ fn main() -> Result<()> {
         }
 
         // 最新フレーム取得（初回フレーム到着前のみスキップ）
+        let t0 = Instant::now();
         let frame = match camera.get_frame() {
             Some(f) => f,
             None => {
@@ -97,8 +99,6 @@ fn main() -> Result<()> {
                 continue;
             }
         };
-
-        // 前処理
         let t1 = Instant::now();
         let input = preprocess_for_movenet(&frame)?;
         let t2 = Instant::now();
@@ -165,6 +165,7 @@ fn main() -> Result<()> {
         let t5 = Instant::now();
 
         // 累積
+        t_clone += (t1 - t0).as_secs_f64() * 1000.0;
         t_preprocess += (t2 - t1).as_secs_f64() * 1000.0;
         t_inference += (t3 - t2).as_secs_f64() * 1000.0;
         t_render += (t4 - t3).as_secs_f64() * 1000.0;
@@ -175,21 +176,21 @@ fn main() -> Result<()> {
         let elapsed = fps_timer.elapsed().as_secs_f32();
         if elapsed >= 1.0 {
             let n = frame_count as f64;
-            println!("FPS: {:.1} | preprocess {:.1}ms  inference {:.1}ms  render {:.1}ms  tracker {:.1}ms",
+            println!("FPS: {:.1} | clone {:.1}ms  preprocess {:.1}ms  inference {:.1}ms  render {:.1}ms  tracker {:.1}ms",
                 frame_count as f32 / elapsed,
-                t_preprocess / n, t_inference / n, t_render / n, t_tracker / n);
+                t_clone / n, t_preprocess / n, t_inference / n, t_render / n, t_tracker / n);
             frame_count = 0;
             fps_timer = Instant::now();
+            t_clone = 0.0;
             t_preprocess = 0.0;
             t_inference = 0.0;
             t_render = 0.0;
             t_tracker = 0.0;
         }
 
-        // FPS上限制御
-        let loop_elapsed = loop_start.elapsed();
-        if loop_elapsed < frame_duration {
-            std::thread::sleep(frame_duration - loop_elapsed);
+        // FPS上限制御（spin wait for precision）
+        while loop_start.elapsed() < frame_duration {
+            std::hint::spin_loop();
         }
     }
 
