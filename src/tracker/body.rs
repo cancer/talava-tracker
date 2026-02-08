@@ -22,6 +22,7 @@ pub struct BodyTracker {
     confidence_threshold: f32,
     scale_x: f32,
     scale_y: f32,
+    body_scale: f32,
     mirror_x: bool,
     offset_y: f32,
     calibration: Option<Calibration>,
@@ -33,6 +34,7 @@ impl BodyTracker {
             confidence_threshold: 0.1,
             scale_x: config.scale_x,
             scale_y: config.scale_y,
+            body_scale: config.body_scale,
             mirror_x: config.mirror_x,
             offset_y: config.offset_y,
             calibration: None,
@@ -72,24 +74,35 @@ impl BodyTracker {
     }
 
     pub fn compute(&self, pose: &Pose) -> BodyPoses {
+        let left_hip = pose.get(KeypointIndex::LeftHip);
+        let right_hip = pose.get(KeypointIndex::RightHip);
+        let hip_center = if left_hip.is_valid(self.confidence_threshold)
+            && right_hip.is_valid(self.confidence_threshold)
+        {
+            Some(((left_hip.x + right_hip.x) / 2.0, (left_hip.y + right_hip.y) / 2.0))
+        } else {
+            None
+        };
+
         BodyPoses {
-            hip: self.compute_hip(pose),
-            left_foot: self.compute_left_foot(pose),
-            right_foot: self.compute_right_foot(pose),
-            chest: self.compute_chest(pose),
+            hip: self.compute_hip(pose, hip_center),
+            left_foot: self.compute_left_foot(pose, hip_center),
+            right_foot: self.compute_right_foot(pose, hip_center),
+            chest: self.compute_chest(pose, hip_center),
         }
     }
 
-    fn convert_position(&self, x: f32, y: f32) -> [f32; 3] {
+    fn convert_position(&self, x: f32, y: f32, hip_x: f32, hip_y: f32) -> [f32; 3] {
         let (ref_x, ref_y) = match &self.calibration {
             Some(cal) => (cal.hip_x, cal.hip_y),
             None => (0.5, 0.5),
         };
-        let mut pos_x = (ref_x - x) * self.scale_x;
+        // 腰の移動をscale倍 + 腰からのオフセットはbody_scale倍
+        let mut pos_x = (ref_x - hip_x) * self.scale_x + (hip_x - x) * self.body_scale;
         if self.mirror_x {
             pos_x = -pos_x;
         }
-        let pos_y = self.offset_y + (ref_y - y) * self.scale_y;
+        let pos_y = self.offset_y + (ref_y - hip_y) * self.scale_y + (hip_y - y) * self.body_scale;
         [pos_x, pos_y, 0.0]
     }
 
@@ -136,19 +149,9 @@ impl BodyTracker {
         [0.0, half.sin(), 0.0, half.cos()]
     }
 
-    fn compute_hip(&self, pose: &Pose) -> Option<TrackerPose> {
-        let left_hip = pose.get(KeypointIndex::LeftHip);
-        let right_hip = pose.get(KeypointIndex::RightHip);
-
-        if !left_hip.is_valid(self.confidence_threshold)
-            || !right_hip.is_valid(self.confidence_threshold)
-        {
-            return None;
-        }
-
-        let x = (left_hip.x + right_hip.x) / 2.0;
-        let y = (left_hip.y + right_hip.y) / 2.0;
-        let position = self.convert_position(x, y);
+    fn compute_hip(&self, pose: &Pose, hip_center: Option<(f32, f32)>) -> Option<TrackerPose> {
+        let (hip_x, hip_y) = hip_center?;
+        let position = self.convert_position(hip_x, hip_y, hip_x, hip_y);
 
         let ref_yaw = self.calibration.as_ref().map_or(0.0, |c| c.yaw_shoulder);
         let yaw = self.compute_shoulder_yaw(pose) - ref_yaw;
@@ -157,7 +160,8 @@ impl BodyTracker {
         Some(TrackerPose::new(position, rotation))
     }
 
-    fn compute_left_foot(&self, pose: &Pose) -> Option<TrackerPose> {
+    fn compute_left_foot(&self, pose: &Pose, hip_center: Option<(f32, f32)>) -> Option<TrackerPose> {
+        let (hip_x, hip_y) = hip_center?;
         let knee = pose.get(KeypointIndex::LeftKnee);
         let ankle = pose.get(KeypointIndex::LeftAnkle);
 
@@ -167,7 +171,7 @@ impl BodyTracker {
             return None;
         }
 
-        let position = self.convert_position(ankle.x, ankle.y);
+        let position = self.convert_position(ankle.x, ankle.y, hip_x, hip_y);
 
         let ref_yaw = self
             .calibration
@@ -180,7 +184,8 @@ impl BodyTracker {
         Some(TrackerPose::new(position, rotation))
     }
 
-    fn compute_right_foot(&self, pose: &Pose) -> Option<TrackerPose> {
+    fn compute_right_foot(&self, pose: &Pose, hip_center: Option<(f32, f32)>) -> Option<TrackerPose> {
+        let (hip_x, hip_y) = hip_center?;
         let knee = pose.get(KeypointIndex::RightKnee);
         let ankle = pose.get(KeypointIndex::RightAnkle);
 
@@ -190,7 +195,7 @@ impl BodyTracker {
             return None;
         }
 
-        let position = self.convert_position(ankle.x, ankle.y);
+        let position = self.convert_position(ankle.x, ankle.y, hip_x, hip_y);
 
         let ref_yaw = self
             .calibration
@@ -203,7 +208,8 @@ impl BodyTracker {
         Some(TrackerPose::new(position, rotation))
     }
 
-    fn compute_chest(&self, pose: &Pose) -> Option<TrackerPose> {
+    fn compute_chest(&self, pose: &Pose, hip_center: Option<(f32, f32)>) -> Option<TrackerPose> {
+        let (hip_x, hip_y) = hip_center?;
         let left_shoulder = pose.get(KeypointIndex::LeftShoulder);
         let right_shoulder = pose.get(KeypointIndex::RightShoulder);
 
@@ -215,7 +221,7 @@ impl BodyTracker {
 
         let x = (left_shoulder.x + right_shoulder.x) / 2.0;
         let y = (left_shoulder.y + right_shoulder.y) / 2.0;
-        let position = self.convert_position(x, y);
+        let position = self.convert_position(x, y, hip_x, hip_y);
 
         let ref_yaw = self.calibration.as_ref().map_or(0.0, |c| c.yaw_shoulder);
         let yaw = self.compute_shoulder_yaw(pose) - ref_yaw;
