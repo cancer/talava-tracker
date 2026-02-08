@@ -207,10 +207,10 @@ mod tests {
         let cal_pose = make_pose((0.5, 0.5), (0.5, 0.5), (0.4, 0.3), (0.6, 0.3));
         tracker.calibrate(&cal_pose);
 
-        // 右に0.1移動 → pos_x = 0.1 * scale_x
+        // 画像上で右に0.1移動（mirror_x=false反転カメラ → 実際は左移動）→ pos_x = -0.1
         let moved_pose = make_pose((0.6, 0.5), (0.6, 0.5), (0.5, 0.3), (0.7, 0.3));
         let result = tracker.compute(&moved_pose).unwrap();
-        assert!((result.position[0] - 0.1).abs() < 0.01);
+        assert!((result.position[0] - (-0.1)).abs() < 0.01);
         assert!((result.position[1] - 1.0).abs() < 0.01);
     }
 
