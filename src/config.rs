@@ -19,6 +19,8 @@ pub struct Config {
     pub app: AppConfig,
     #[serde(default)]
     pub interpolation: InterpolationConfig,
+    #[serde(default)]
+    pub filter: FilterConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +91,34 @@ impl Default for InterpolationConfig {
         Self { mode: default_interpolation_mode() }
     }
 }
+fn default_pos_min_cutoff() -> f32 { 1.5 }
+fn default_pos_beta() -> f32 { 0.01 }
+fn default_rot_min_cutoff() -> f32 { 1.0 }
+fn default_rot_beta() -> f32 { 0.01 }
+
+#[derive(Debug, Deserialize)]
+pub struct FilterConfig {
+    #[serde(default = "default_pos_min_cutoff")]
+    pub position_min_cutoff: f32,
+    #[serde(default = "default_pos_beta")]
+    pub position_beta: f32,
+    #[serde(default = "default_rot_min_cutoff")]
+    pub rotation_min_cutoff: f32,
+    #[serde(default = "default_rot_beta")]
+    pub rotation_beta: f32,
+}
+
+impl Default for FilterConfig {
+    fn default() -> Self {
+        Self {
+            position_min_cutoff: default_pos_min_cutoff(),
+            position_beta: default_pos_beta(),
+            rotation_min_cutoff: default_rot_min_cutoff(),
+            rotation_beta: default_rot_beta(),
+        }
+    }
+}
+
 fn default_vmt_addr() -> String { "127.0.0.1:39570".to_string() }
 fn default_scale() -> f32 { 1.0 }
 fn default_offset_y() -> f32 { 1.0 }
@@ -149,6 +179,7 @@ impl Default for Config {
             smooth: SmoothConfig::default(),
             app: AppConfig::default(),
             interpolation: InterpolationConfig::default(),
+            filter: FilterConfig::default(),
         }
     }
 }

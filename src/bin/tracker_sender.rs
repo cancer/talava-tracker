@@ -7,7 +7,7 @@ use talava_tracker::camera::ThreadedCamera;
 use talava_tracker::config::Config;
 use talava_tracker::pose::{preprocess_for_movenet, PoseDetector};
 use talava_tracker::render::{Key, MinifbRenderer};
-use talava_tracker::tracker::{BodyTracker, Extrapolator, Lerper, Smoother};
+use talava_tracker::tracker::{BodyTracker, Extrapolator, Lerper, PoseFilter};
 use talava_tracker::vmt::{TrackerPose, VmtClient};
 
 const MODEL_PATH: &str = "models/movenet_lightning.onnx";
@@ -31,8 +31,9 @@ fn main() -> Result<()> {
     println!("Tracker: scale=({}, {}), mirror_x={}, offset_y={}",
         config.tracker.scale_x, config.tracker.scale_y,
         config.tracker.mirror_x, config.tracker.offset_y);
-    println!("Smooth: position={}, rotation={}",
-        config.smooth.position, config.smooth.rotation);
+    println!("Filter: pos(cutoff={}, beta={}) rot(cutoff={}, beta={})",
+        config.filter.position_min_cutoff, config.filter.position_beta,
+        config.filter.rotation_min_cutoff, config.filter.rotation_beta);
     println!();
     println!("操作: [C] キャリブレーション  [Esc] 終了  (コンソール: c + Enter)");
     println!();
@@ -49,8 +50,8 @@ fn main() -> Result<()> {
     println!("Model loaded");
 
     let mut body_tracker = BodyTracker::from_config(&config.tracker);
-    let mut smoothers: [Smoother; TRACKER_COUNT] =
-        std::array::from_fn(|_| Smoother::from_config(&config.smooth));
+    let mut filters: [PoseFilter; TRACKER_COUNT] =
+        std::array::from_fn(|_| PoseFilter::from_config(&config.filter));
     let mut extrapolators: [Extrapolator; TRACKER_COUNT] =
         std::array::from_fn(|_| Extrapolator::new());
     let mut lerpers: [Lerper; TRACKER_COUNT] =
@@ -146,7 +147,7 @@ fn main() -> Result<()> {
             if let Some(deadline) = calibration_deadline {
                 if deadline.saturating_duration_since(Instant::now()).is_zero() {
                     if body_tracker.calibrate(&pose) {
-                        for s in &mut smoothers { s.reset(); }
+                        for f in &mut filters { f.reset(); }
                         extrapolators = std::array::from_fn(|_| Extrapolator::new());
                         lerpers = std::array::from_fn(|_| Lerper::new());
                         last_poses = [None; TRACKER_COUNT];
@@ -178,7 +179,7 @@ fn main() -> Result<()> {
                 if let Some(p) = poses[i] {
                     extrapolators[i].update(p);
                     lerpers[i].update(p, lerp_t);
-                    let smoothed = smoothers[i].apply(p);
+                    let smoothed = filters[i].apply(p);
                     vmt.send(TRACKER_INDICES[i], 1, &smoothed)?;
                     last_poses[i] = Some(smoothed);
                 }
@@ -211,7 +212,7 @@ fn main() -> Result<()> {
                 "extrapolate" => {
                     for i in 0..TRACKER_COUNT {
                         if let Some(predicted) = extrapolators[i].predict(dt) {
-                            let smoothed = smoothers[i].apply(predicted);
+                            let smoothed = filters[i].apply(predicted);
                             vmt.send(TRACKER_INDICES[i], 1, &smoothed)?;
                             last_poses[i] = Some(smoothed);
                         }
@@ -222,7 +223,7 @@ fn main() -> Result<()> {
                     let t = (dt / camera_interval).min(1.0);
                     for i in 0..TRACKER_COUNT {
                         if let Some(interpolated) = lerpers[i].interpolate(t) {
-                            let smoothed = smoothers[i].apply(interpolated);
+                            let smoothed = filters[i].apply(interpolated);
                             vmt.send(TRACKER_INDICES[i], 1, &smoothed)?;
                             last_poses[i] = Some(smoothed);
                         }

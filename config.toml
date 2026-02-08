@@ -23,10 +23,13 @@ view = false
 [app]
 target_fps = 90
 
-# スムージング設定
-[smooth]
-position = 0.5
-rotation = 0.3
+# One Euro Filter設定
+# min_cutoff: 低い=ジッタ少ない(静止時安定), beta: 高い=速い動きに追従
+[filter]
+position_min_cutoff = 1.5
+position_beta = 0.01
+rotation_min_cutoff = 1.0
+rotation_beta = 0.01
 
 # 補間設定 (none / extrapolate / lerp)
 [interpolation]
