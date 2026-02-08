@@ -6,7 +6,7 @@ use talava_tracker::vmt::{TrackerPose, VmtClient};
 const CONFIG_PATH: &str = "config.toml";
 
 fn main() -> Result<()> {
-    let config = Config::load_or_default(CONFIG_PATH);
+    let config = Config::load(CONFIG_PATH)?;
 
     println!("=== Talava Tracker - VMT Test ===");
     println!("接続先: {}", config.vmt.addr);

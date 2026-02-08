@@ -191,7 +191,4 @@ impl Config {
         Ok(config)
     }
 
-    pub fn load_or_default<P: AsRef<Path>>(path: P) -> Self {
-        Self::load(path).unwrap_or_default()
-    }
 }

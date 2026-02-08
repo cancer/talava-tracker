@@ -21,7 +21,7 @@ const TRACKER_COUNT: usize = 4;
 const TRACKER_INDICES: [i32; TRACKER_COUNT] = [HIP_INDEX, LEFT_FOOT_INDEX, RIGHT_FOOT_INDEX, CHEST_INDEX];
 
 fn main() -> Result<()> {
-    let config = Config::load_or_default(CONFIG_PATH);
+    let config = Config::load(CONFIG_PATH)?;
 
     println!("Tracker Sender - Phase 6");
     println!("VMT target: {}", config.vmt.addr);
