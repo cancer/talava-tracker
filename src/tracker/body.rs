@@ -219,8 +219,17 @@ impl BodyTracker {
             return None;
         }
 
+        // X座標は肩中点
         let x = (left_shoulder.x + right_shoulder.x) / 2.0;
-        let y = (left_shoulder.y + right_shoulder.y) / 2.0;
+
+        // Y座標: Spine03があればそれを使用、なければ肩中点
+        let spine03 = pose.get(KeypointIndex::Spine03);
+        let y = if spine03.is_valid(self.confidence_threshold) {
+            spine03.y
+        } else {
+            (left_shoulder.y + right_shoulder.y) / 2.0
+        };
+
         let position = self.convert_position(x, y, hip_x, hip_y);
 
         let ref_yaw = self.calibration.as_ref().map_or(0.0, |c| c.yaw_shoulder);

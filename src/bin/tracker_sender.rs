@@ -5,12 +5,11 @@ use std::time::{Duration, Instant};
 
 use talava_tracker::camera::ThreadedCamera;
 use talava_tracker::config::Config;
-use talava_tracker::pose::{preprocess_for_movenet, PoseDetector};
+use talava_tracker::pose::{preprocess_for_movenet, preprocess_for_spinepose, ModelType, PoseDetector};
 use talava_tracker::render::{Key, MinifbRenderer};
 use talava_tracker::tracker::{BodyTracker, Extrapolator, Lerper, PoseFilter};
 use talava_tracker::vmt::{TrackerPose, VmtClient};
 
-const MODEL_PATH: &str = "models/movenet_lightning.onnx";
 const CONFIG_PATH: &str = "config.toml";
 const HIP_INDEX: i32 = 0;
 const LEFT_FOOT_INDEX: i32 = 1;
@@ -23,7 +22,15 @@ const TRACKER_INDICES: [i32; TRACKER_COUNT] = [HIP_INDEX, LEFT_FOOT_INDEX, RIGHT
 fn main() -> Result<()> {
     let config = Config::load(CONFIG_PATH)?;
 
+    let (model_path, model_type): (&str, ModelType) = match config.app.model.as_str() {
+        "movenet" => ("models/movenet_lightning.onnx", ModelType::MoveNet),
+        "spinepose_small" => ("models/spinepose_small.onnx", ModelType::SpinePose),
+        "spinepose_medium" => ("models/spinepose_medium.onnx", ModelType::SpinePose),
+        other => anyhow::bail!("Unknown model: {}", other),
+    };
+
     println!("Tracker Sender - Phase 6");
+    println!("Model: {}", config.app.model);
     println!("VMT target: {}", config.vmt.addr);
     println!("Target FPS: {}", config.app.target_fps);
     println!("Interpolation: {}", config.interpolation.mode);
@@ -47,7 +54,7 @@ fn main() -> Result<()> {
     let (width, height) = camera.resolution();
     println!("Camera: {}x{}", width, height);
 
-    let mut detector = PoseDetector::new(MODEL_PATH)?;
+    let mut detector = PoseDetector::new(model_path, model_type)?;
     println!("Model loaded");
 
     let mut body_tracker = BodyTracker::from_config(&config.tracker);
@@ -139,7 +146,10 @@ fn main() -> Result<()> {
                 }
             };
             let t1 = Instant::now();
-            let input = preprocess_for_movenet(&frame)?;
+            let input = match model_type {
+                ModelType::MoveNet => preprocess_for_movenet(&frame)?,
+                ModelType::SpinePose => preprocess_for_spinepose(&frame)?,
+            };
             let t2 = Instant::now();
             let pose = detector.detect(input)?;
             let t3 = Instant::now();
@@ -191,6 +201,13 @@ fn main() -> Result<()> {
 
             // ログ（1秒に1回）
             if frame_count == 0 {
+                let lh = pose.get(talava_tracker::pose::KeypointIndex::LeftHip);
+                let rh = pose.get(talava_tracker::pose::KeypointIndex::RightHip);
+                let ls = pose.get(talava_tracker::pose::KeypointIndex::LeftShoulder);
+                let rs = pose.get(talava_tracker::pose::KeypointIndex::RightShoulder);
+                let sp = pose.get(talava_tracker::pose::KeypointIndex::Spine03);
+                eprintln!("KP | Hip L({:.3},{:.3}) R({:.3},{:.3}) | Sh L({:.3},{:.3}) R({:.3},{:.3}) | Sp03({:.3},{:.3}) c={:.2}",
+                    lh.x, lh.y, rh.x, rh.y, ls.x, ls.y, rs.x, rs.y, sp.x, sp.y, sp.confidence);
                 if let Some(ref hip) = poses[0] {
                     eprint!("Hip: [{:.2}, {:.2}, {:.2}]", hip.position[0], hip.position[1], hip.position[2]);
                 }

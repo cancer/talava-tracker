@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::time::Instant;
 
 use talava_tracker::camera::OpenCvCamera;
-use talava_tracker::pose::{preprocess_for_movenet, PoseDetector};
+use talava_tracker::pose::{preprocess_for_movenet, ModelType, PoseDetector};
 use talava_tracker::render::MinifbRenderer;
 
 /// 信頼度の閾値
@@ -23,7 +23,7 @@ fn main() -> Result<()> {
 
     // モデルを読み込む
     println!("Loading model from {}...", MODEL_PATH);
-    let mut detector = PoseDetector::new(MODEL_PATH)?;
+    let mut detector = PoseDetector::new(MODEL_PATH, ModelType::MoveNet)?;
     println!("Model loaded");
 
     // ウィンドウを作成

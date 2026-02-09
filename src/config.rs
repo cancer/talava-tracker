@@ -71,15 +71,21 @@ pub struct SmoothConfig {
 pub struct AppConfig {
     #[serde(default = "default_target_fps")]
     pub target_fps: u32,
+    #[serde(default = "default_model")]
+    pub model: String,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
-        Self { target_fps: default_target_fps() }
+        Self {
+            target_fps: default_target_fps(),
+            model: default_model(),
+        }
     }
 }
 
 fn default_target_fps() -> u32 { 30 }
+fn default_model() -> String { "spinepose_medium".to_string() }
 fn default_interpolation_mode() -> String { "extrapolate".to_string() }
 
 #[derive(Debug, Deserialize)]

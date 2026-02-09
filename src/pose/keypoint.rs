@@ -1,4 +1,4 @@
-/// MoveNet の 17 キーポイントインデックス
+/// 37 キーポイントインデックス
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(usize)]
 pub enum KeypointIndex {
@@ -19,10 +19,30 @@ pub enum KeypointIndex {
     RightKnee = 14,
     LeftAnkle = 15,
     RightAnkle = 16,
+    Head = 17,
+    Neck = 18,
+    Hip = 19,
+    LeftBigToe = 20,
+    RightBigToe = 21,
+    LeftSmallToe = 22,
+    RightSmallToe = 23,
+    LeftHeel = 24,
+    RightHeel = 25,
+    Spine01 = 26,
+    Spine02 = 27,
+    Spine03 = 28,
+    Spine04 = 29,
+    Spine05 = 30,
+    LeftLatissimus = 31,
+    RightLatissimus = 32,
+    LeftClavicle = 33,
+    RightClavicle = 34,
+    Neck02 = 35,
+    Neck03 = 36,
 }
 
 impl KeypointIndex {
-    pub const COUNT: usize = 17;
+    pub const COUNT: usize = 37;
 
     pub fn from_index(index: usize) -> Option<Self> {
         match index {
@@ -43,6 +63,26 @@ impl KeypointIndex {
             14 => Some(Self::RightKnee),
             15 => Some(Self::LeftAnkle),
             16 => Some(Self::RightAnkle),
+            17 => Some(Self::Head),
+            18 => Some(Self::Neck),
+            19 => Some(Self::Hip),
+            20 => Some(Self::LeftBigToe),
+            21 => Some(Self::RightBigToe),
+            22 => Some(Self::LeftSmallToe),
+            23 => Some(Self::RightSmallToe),
+            24 => Some(Self::LeftHeel),
+            25 => Some(Self::RightHeel),
+            26 => Some(Self::Spine01),
+            27 => Some(Self::Spine02),
+            28 => Some(Self::Spine03),
+            29 => Some(Self::Spine04),
+            30 => Some(Self::Spine05),
+            31 => Some(Self::LeftLatissimus),
+            32 => Some(Self::RightLatissimus),
+            33 => Some(Self::LeftClavicle),
+            34 => Some(Self::RightClavicle),
+            35 => Some(Self::Neck02),
+            36 => Some(Self::Neck03),
             _ => None,
         }
     }
@@ -87,7 +127,7 @@ impl Default for Keypoint {
     }
 }
 
-/// 17キーポイントからなる姿勢
+/// 37キーポイントからなる姿勢
 #[derive(Debug, Clone)]
 pub struct Pose {
     pub keypoints: [Keypoint; KeypointIndex::COUNT],
@@ -124,14 +164,15 @@ mod tests {
 
     #[test]
     fn test_keypoint_index_count() {
-        assert_eq!(KeypointIndex::COUNT, 17);
+        assert_eq!(KeypointIndex::COUNT, 37);
     }
 
     #[test]
     fn test_keypoint_index_from_index() {
         assert_eq!(KeypointIndex::from_index(0), Some(KeypointIndex::Nose));
         assert_eq!(KeypointIndex::from_index(16), Some(KeypointIndex::RightAnkle));
-        assert_eq!(KeypointIndex::from_index(17), None);
+        assert_eq!(KeypointIndex::from_index(17), Some(KeypointIndex::Head));
+        assert_eq!(KeypointIndex::from_index(37), None);
     }
 
     #[test]
