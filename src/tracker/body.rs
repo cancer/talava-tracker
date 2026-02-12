@@ -23,6 +23,7 @@ pub struct BodyTracker {
     scale_x: f32,
     scale_y: f32,
     body_scale: f32,
+    leg_scale: f32,
     mirror_x: bool,
     offset_y: f32,
     calibration: Option<Calibration>,
@@ -35,6 +36,7 @@ impl BodyTracker {
             scale_x: config.scale_x,
             scale_y: config.scale_y,
             body_scale: config.body_scale,
+            leg_scale: config.leg_scale,
             mirror_x: config.mirror_x,
             offset_y: config.offset_y,
             calibration: None,
@@ -92,17 +94,17 @@ impl BodyTracker {
         }
     }
 
-    fn convert_position(&self, x: f32, y: f32, hip_x: f32, hip_y: f32) -> [f32; 3] {
+    fn convert_position(&self, x: f32, y: f32, hip_x: f32, hip_y: f32, part_scale: f32) -> [f32; 3] {
         let (ref_x, ref_y) = match &self.calibration {
             Some(cal) => (cal.hip_x, cal.hip_y),
             None => (0.5, 0.5),
         };
-        // 腰の移動をscale倍 + 腰からのオフセットはbody_scale倍
-        let mut pos_x = (ref_x - hip_x) * self.scale_x + (hip_x - x) * self.body_scale;
+        // 腰の移動をscale倍 + 腰からのオフセットはpart_scale倍
+        let mut pos_x = (ref_x - hip_x) * self.scale_x + (hip_x - x) * part_scale;
         if self.mirror_x {
             pos_x = -pos_x;
         }
-        let pos_y = self.offset_y + (ref_y - hip_y) * self.scale_y + (hip_y - y) * self.body_scale;
+        let pos_y = self.offset_y + (ref_y - hip_y) * self.scale_y + (hip_y - y) * part_scale;
         [pos_x, pos_y, 0.0]
     }
 
@@ -151,7 +153,7 @@ impl BodyTracker {
 
     fn compute_hip(&self, pose: &Pose, hip_center: Option<(f32, f32)>) -> Option<TrackerPose> {
         let (hip_x, hip_y) = hip_center?;
-        let position = self.convert_position(hip_x, hip_y, hip_x, hip_y);
+        let position = self.convert_position(hip_x, hip_y, hip_x, hip_y, self.body_scale);
 
         let ref_yaw = self.calibration.as_ref().map_or(0.0, |c| c.yaw_shoulder);
         let yaw = self.compute_shoulder_yaw(pose) - ref_yaw;
@@ -171,7 +173,7 @@ impl BodyTracker {
             return None;
         }
 
-        let position = self.convert_position(ankle.x, ankle.y, hip_x, hip_y);
+        let position = self.convert_position(ankle.x, ankle.y, hip_x, hip_y, self.leg_scale);
 
         let ref_yaw = self
             .calibration
@@ -195,7 +197,7 @@ impl BodyTracker {
             return None;
         }
 
-        let position = self.convert_position(ankle.x, ankle.y, hip_x, hip_y);
+        let position = self.convert_position(ankle.x, ankle.y, hip_x, hip_y, self.leg_scale);
 
         let ref_yaw = self
             .calibration
@@ -230,7 +232,7 @@ impl BodyTracker {
             (left_shoulder.y + right_shoulder.y) / 2.0
         };
 
-        let position = self.convert_position(x, y, hip_x, hip_y);
+        let position = self.convert_position(x, y, hip_x, hip_y, self.body_scale);
 
         let ref_yaw = self.calibration.as_ref().map_or(0.0, |c| c.yaw_shoulder);
         let yaw = self.compute_shoulder_yaw(pose) - ref_yaw;
