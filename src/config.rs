@@ -55,6 +55,9 @@ pub struct CameraConfig {
     pub width: u32,
     #[serde(default = "default_height")]
     pub height: u32,
+    /// 垂直画角（度）。0で補正無効
+    #[serde(default)]
+    pub fov_v: f32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,6 +175,7 @@ impl Default for CameraConfig {
             index: 0,
             width: default_width(),
             height: default_height(),
+            fov_v: 0.0,
         }
     }
 }

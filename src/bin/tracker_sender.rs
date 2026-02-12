@@ -21,9 +21,11 @@ const HIP_INDEX: i32 = 0;
 const LEFT_FOOT_INDEX: i32 = 1;
 const RIGHT_FOOT_INDEX: i32 = 2;
 const CHEST_INDEX: i32 = 3;
+const LEFT_KNEE_INDEX: i32 = 4;
+const RIGHT_KNEE_INDEX: i32 = 5;
 const CONFIDENCE_THRESHOLD: f32 = 0.3;
-const TRACKER_COUNT: usize = 4;
-const TRACKER_INDICES: [i32; TRACKER_COUNT] = [HIP_INDEX, LEFT_FOOT_INDEX, RIGHT_FOOT_INDEX, CHEST_INDEX];
+const TRACKER_COUNT: usize = 6;
+const TRACKER_INDICES: [i32; TRACKER_COUNT] = [HIP_INDEX, LEFT_FOOT_INDEX, RIGHT_FOOT_INDEX, CHEST_INDEX, LEFT_KNEE_INDEX, RIGHT_KNEE_INDEX];
 
 struct InferenceRequest {
     frame: Mat,
@@ -74,7 +76,7 @@ fn main() -> Result<()> {
     let (width, height) = camera.resolution();
     println!("Camera: {}x{}", width, height);
 
-    let mut body_tracker = BodyTracker::from_config(&config.tracker);
+    let mut body_tracker = BodyTracker::new(&config.tracker, config.camera.fov_v);
     let mut filters: [PoseFilter; TRACKER_COUNT] =
         std::array::from_fn(|_| PoseFilter::from_config(&config.filter));
     let mut extrapolators: [Extrapolator; TRACKER_COUNT] =
@@ -299,7 +301,7 @@ fn main() -> Result<()> {
             // トラッカー変換 & 補間器更新 & 平滑化 & 送信
             let t_tracker_start = Instant::now();
             let body_poses = body_tracker.compute(&result.pose);
-            let poses = [body_poses.hip, body_poses.left_foot, body_poses.right_foot, body_poses.chest];
+            let poses = [body_poses.hip, body_poses.left_foot, body_poses.right_foot, body_poses.chest, body_poses.left_knee, body_poses.right_knee];
 
             let dt_since_last = last_inference_time.elapsed().as_secs_f32();
             let camera_interval = 1.0 / 30.0;
@@ -332,7 +334,7 @@ fn main() -> Result<()> {
                     eprint!("Hip: [{:.2}, {:.2}, {:.2}]", hip.position[0], hip.position[1], hip.position[2]);
                 }
                 let count = poses.iter().filter(|p| p.is_some()).count();
-                eprintln!(" Active: {}/4{}", count, if body_tracker.is_calibrated() { " [CAL]" } else { "" });
+                eprintln!(" Active: {}/{}{}", count, TRACKER_COUNT, if body_tracker.is_calibrated() { " [CAL]" } else { "" });
             }
 
             // 計測集計
