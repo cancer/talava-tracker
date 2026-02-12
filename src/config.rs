@@ -73,6 +73,8 @@ pub struct AppConfig {
     pub target_fps: u32,
     #[serde(default = "default_model")]
     pub model: String,
+    #[serde(default = "default_detector")]
+    pub detector: String,
 }
 
 impl Default for AppConfig {
@@ -80,12 +82,14 @@ impl Default for AppConfig {
         Self {
             target_fps: default_target_fps(),
             model: default_model(),
+            detector: default_detector(),
         }
     }
 }
 
 fn default_target_fps() -> u32 { 30 }
 fn default_model() -> String { "spinepose_medium".to_string() }
+fn default_detector() -> String { "keypoint".to_string() }
 fn default_interpolation_mode() -> String { "extrapolate".to_string() }
 
 #[derive(Debug, Deserialize)]

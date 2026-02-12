@@ -89,8 +89,11 @@ pub fn preprocess_for_spinepose(frame: &Mat) -> Result<Array4<f32>> {
     let h = SPINEPOSE_INPUT_HEIGHT as usize;
     let w = SPINEPOSE_INPUT_WIDTH as usize;
     let mean = [123.675f32, 116.28, 103.53];
-    let std_dev = [58.395f32, 57.12, 57.375];
+    let inv_std = [1.0 / 58.395f32, 1.0 / 57.12, 1.0 / 57.375];
     let mut tensor = Array4::<f32>::zeros((1, 3, h, w));
+    let dst = tensor.as_slice_mut().unwrap();
+    // NCHW layout: stride = [3*h*w, h*w, w, 1]
+    let ch_stride = h * w;
     let data = float_mat.data_bytes()?;
     let step = float_mat.mat_step().get(0);
     for y_idx in 0..h {
@@ -100,11 +103,13 @@ pub fn preprocess_for_spinepose(frame: &Mat) -> Result<Array4<f32>> {
                 w * 3,
             )
         };
+        let row_offset = y_idx * w;
         for x_idx in 0..w {
-            for c in 0..3 {
-                let val = row_ptr[x_idx * 3 + c];
-                tensor[[0, c, y_idx, x_idx]] = (val - mean[c]) / std_dev[c];
-            }
+            let src_base = x_idx * 3;
+            let dst_base = row_offset + x_idx;
+            dst[dst_base] = (row_ptr[src_base] - mean[0]) * inv_std[0];
+            dst[ch_stride + dst_base] = (row_ptr[src_base + 1] - mean[1]) * inv_std[1];
+            dst[2 * ch_stride + dst_base] = (row_ptr[src_base + 2] - mean[2]) * inv_std[2];
         }
     }
 

@@ -5,7 +5,10 @@ use std::time::{Duration, Instant};
 
 use talava_tracker::camera::ThreadedCamera;
 use talava_tracker::config::Config;
-use talava_tracker::pose::{preprocess_for_movenet, preprocess_for_spinepose, ModelType, PoseDetector};
+use talava_tracker::pose::{
+    bbox_from_keypoints, crop_for_pose, preprocess_for_movenet, preprocess_for_spinepose,
+    remap_pose, CropRegion, ModelType, PersonDetector, Pose, PoseDetector,
+};
 use talava_tracker::render::{Key, MinifbRenderer};
 use talava_tracker::tracker::{BodyTracker, Extrapolator, Lerper, PoseFilter};
 use talava_tracker::vmt::{TrackerPose, VmtClient};
@@ -31,6 +34,7 @@ fn main() -> Result<()> {
 
     println!("Tracker Sender - Phase 6");
     println!("Model: {}", config.app.model);
+    println!("Detector: {}", config.app.detector);
     println!("VMT target: {}", config.vmt.addr);
     println!("Target FPS: {}", config.app.target_fps);
     println!("Interpolation: {}", config.interpolation.mode);
@@ -57,6 +61,17 @@ fn main() -> Result<()> {
     let mut detector = PoseDetector::new(model_path, model_type)?;
     println!("Model loaded");
 
+    let mut person_detector = match config.app.detector.as_str() {
+        "yolo" => {
+            let pd = PersonDetector::new("models/yolov8n.onnx", 160)?;
+            println!("Person detector loaded (YOLOv8n 160x160)");
+            Some(pd)
+        }
+        _ => None,
+    };
+    let mut prev_pose: Option<Pose> = None;
+    let detector_mode = config.app.detector.clone();
+
     let mut body_tracker = BodyTracker::from_config(&config.tracker);
     let mut filters: [PoseFilter; TRACKER_COUNT] =
         std::array::from_fn(|_| PoseFilter::from_config(&config.filter));
@@ -82,6 +97,7 @@ fn main() -> Result<()> {
     let mut inference_count = 0u32;
     let mut fps_timer = Instant::now();
     let mut t_clone = 0.0f64;
+    let mut t_detect = 0.0f64;
     let mut t_preprocess = 0.0f64;
     let mut t_inference = 0.0f64;
     let mut t_render = 0.0f64;
@@ -146,12 +162,42 @@ fn main() -> Result<()> {
                 }
             };
             let t1 = Instant::now();
+
+            // 人物検出 → クロップ
+            let (input_frame, crop_region) = match detector_mode.as_str() {
+                "keypoint" => {
+                    match prev_pose.as_ref()
+                        .and_then(|p| bbox_from_keypoints(p, width, height, CONFIDENCE_THRESHOLD))
+                    {
+                        Some(bbox) => crop_for_pose(&frame, &bbox, width, height)?,
+                        None => (frame.clone(), CropRegion::full()),
+                    }
+                }
+                "yolo" => {
+                    match person_detector.as_mut().unwrap().detect(&frame)? {
+                        Some(bbox) => crop_for_pose(&frame, &bbox, width, height)?,
+                        None => (frame.clone(), CropRegion::full()),
+                    }
+                }
+                _ => (frame.clone(), CropRegion::full()),  // "none"
+            };
+            let t1b = Instant::now();
+
+            // 前処理
             let input = match model_type {
-                ModelType::MoveNet => preprocess_for_movenet(&frame)?,
-                ModelType::SpinePose => preprocess_for_spinepose(&frame)?,
+                ModelType::MoveNet => preprocess_for_movenet(&input_frame)?,
+                ModelType::SpinePose => preprocess_for_spinepose(&input_frame)?,
             };
             let t2 = Instant::now();
-            let pose = detector.detect(input)?;
+
+            // 推論
+            let mut pose = detector.detect(input)?;
+
+            // クロップ座標→フレーム座標にリマップ
+            if !crop_region.is_full() {
+                pose = remap_pose(&pose, &crop_region);
+            }
+            prev_pose = Some(pose.clone());
             let t3 = Instant::now();
 
             // キャリブレーション実行（カウントダウン完了時）
@@ -217,7 +263,8 @@ fn main() -> Result<()> {
             let t5 = Instant::now();
 
             t_clone += (t1 - t0).as_secs_f64() * 1000.0;
-            t_preprocess += (t2 - t1).as_secs_f64() * 1000.0;
+            t_detect += (t1b - t1).as_secs_f64() * 1000.0;
+            t_preprocess += (t2 - t1b).as_secs_f64() * 1000.0;
             t_inference += (t3 - t2).as_secs_f64() * 1000.0;
             t_render += (t4 - t3).as_secs_f64() * 1000.0;
             t_tracker += (t5 - t4).as_secs_f64() * 1000.0;
@@ -264,10 +311,10 @@ fn main() -> Result<()> {
         if elapsed >= 1.0 {
             if inference_count > 0 {
                 let n = inference_count as f64;
-                println!("FPS: {:.1} (infer: {}) | clone {:.1}ms  preprocess {:.1}ms  inference {:.1}ms  render {:.1}ms  tracker {:.1}ms",
+                println!("FPS: {:.1} (infer: {}) | clone {:.1}ms  detect {:.1}ms  preprocess {:.1}ms  inference {:.1}ms  render {:.1}ms  tracker {:.1}ms",
                     frame_count as f32 / elapsed,
                     inference_count,
-                    t_clone / n, t_preprocess / n, t_inference / n, t_render / n, t_tracker / n);
+                    t_clone / n, t_detect / n, t_preprocess / n, t_inference / n, t_render / n, t_tracker / n);
             } else {
                 println!("FPS: {:.1} (infer: 0)", frame_count as f32 / elapsed);
             }
@@ -275,6 +322,7 @@ fn main() -> Result<()> {
             inference_count = 0;
             fps_timer = Instant::now();
             t_clone = 0.0;
+            t_detect = 0.0;
             t_preprocess = 0.0;
             t_inference = 0.0;
             t_render = 0.0;
