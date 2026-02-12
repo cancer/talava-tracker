@@ -8,6 +8,7 @@ scale_x = 3.0
 scale_y = 3.4
 body_scale = 1.0
 leg_scale = 2.5
+depth_scale = 1.0
 mirror_x = false
 offset_y = 1.0
 

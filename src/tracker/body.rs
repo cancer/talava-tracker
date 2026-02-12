@@ -13,6 +13,7 @@ pub struct BodyPoses {
 struct Calibration {
     hip_x: f32,
     hip_y: f32,
+    torso_height: f32,
     yaw_shoulder: f32,
     yaw_left_foot: f32,
     yaw_right_foot: f32,
@@ -24,6 +25,7 @@ pub struct BodyTracker {
     scale_y: f32,
     body_scale: f32,
     leg_scale: f32,
+    depth_scale: f32,
     mirror_x: bool,
     offset_y: f32,
     calibration: Option<Calibration>,
@@ -37,6 +39,7 @@ impl BodyTracker {
             scale_y: config.scale_y,
             body_scale: config.body_scale,
             leg_scale: config.leg_scale,
+            depth_scale: config.depth_scale,
             mirror_x: config.mirror_x,
             offset_y: config.offset_y,
             calibration: None,
@@ -55,6 +58,7 @@ impl BodyTracker {
 
         let hip_x = (left_hip.x + right_hip.x) / 2.0;
         let hip_y = (left_hip.y + right_hip.y) / 2.0;
+        let torso_height = self.compute_torso_height(pose).unwrap_or(0.0);
         let yaw_shoulder = self.compute_shoulder_yaw(pose);
         let yaw_left_foot =
             self.compute_foot_yaw(pose, KeypointIndex::LeftKnee, KeypointIndex::LeftAnkle);
@@ -64,6 +68,7 @@ impl BodyTracker {
         self.calibration = Some(Calibration {
             hip_x,
             hip_y,
+            torso_height,
             yaw_shoulder,
             yaw_left_foot,
             yaw_right_foot,
@@ -86,15 +91,17 @@ impl BodyTracker {
             None
         };
 
+        let pos_z = self.estimate_depth(pose);
+
         BodyPoses {
-            hip: self.compute_hip(pose, hip_center),
-            left_foot: self.compute_left_foot(pose, hip_center),
-            right_foot: self.compute_right_foot(pose, hip_center),
-            chest: self.compute_chest(pose, hip_center),
+            hip: self.compute_hip(pose, hip_center, pos_z),
+            left_foot: self.compute_left_foot(pose, hip_center, pos_z),
+            right_foot: self.compute_right_foot(pose, hip_center, pos_z),
+            chest: self.compute_chest(pose, hip_center, pos_z),
         }
     }
 
-    fn convert_position(&self, x: f32, y: f32, hip_x: f32, hip_y: f32, part_scale: f32) -> [f32; 3] {
+    fn convert_position(&self, x: f32, y: f32, hip_x: f32, hip_y: f32, part_scale: f32, pos_z: f32) -> [f32; 3] {
         let (ref_x, ref_y) = match &self.calibration {
             Some(cal) => (cal.hip_x, cal.hip_y),
             None => (0.5, 0.5),
@@ -105,7 +112,43 @@ impl BodyTracker {
             pos_x = -pos_x;
         }
         let pos_y = self.offset_y + (ref_y - hip_y) * self.scale_y + (hip_y - y) * part_scale;
-        [pos_x, pos_y, 0.0]
+        [pos_x, pos_y, pos_z]
+    }
+
+    /// 胴体の縦の長さ（肩中点→腰中点の垂直距離）
+    fn compute_torso_height(&self, pose: &Pose) -> Option<f32> {
+        let ls = pose.get(KeypointIndex::LeftShoulder);
+        let rs = pose.get(KeypointIndex::RightShoulder);
+        let lh = pose.get(KeypointIndex::LeftHip);
+        let rh = pose.get(KeypointIndex::RightHip);
+
+        if !ls.is_valid(self.confidence_threshold)
+            || !rs.is_valid(self.confidence_threshold)
+            || !lh.is_valid(self.confidence_threshold)
+            || !rh.is_valid(self.confidence_threshold)
+        {
+            return None;
+        }
+
+        let shoulder_y = (ls.y + rs.y) / 2.0;
+        let hip_y = (lh.y + rh.y) / 2.0;
+        Some((hip_y - shoulder_y).abs())
+    }
+
+    /// 胴体高さの変化から奥行きを推定
+    /// 近づく→体が大きく映る→胴体高さ増→z正
+    fn estimate_depth(&self, pose: &Pose) -> f32 {
+        let cal = match &self.calibration {
+            Some(cal) if cal.torso_height > 0.01 => cal,
+            _ => return 0.0,
+        };
+
+        let current = match self.compute_torso_height(pose) {
+            Some(h) if h > 0.01 => h,
+            _ => return 0.0,
+        };
+
+        (1.0 - cal.torso_height / current) * self.depth_scale
     }
 
     fn compute_shoulder_yaw(&self, pose: &Pose) -> f32 {
@@ -151,9 +194,9 @@ impl BodyTracker {
         [0.0, half.sin(), 0.0, half.cos()]
     }
 
-    fn compute_hip(&self, pose: &Pose, hip_center: Option<(f32, f32)>) -> Option<TrackerPose> {
+    fn compute_hip(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32) -> Option<TrackerPose> {
         let (hip_x, hip_y) = hip_center?;
-        let position = self.convert_position(hip_x, hip_y, hip_x, hip_y, self.body_scale);
+        let position = self.convert_position(hip_x, hip_y, hip_x, hip_y, self.body_scale, pos_z);
 
         let ref_yaw = self.calibration.as_ref().map_or(0.0, |c| c.yaw_shoulder);
         let yaw = self.compute_shoulder_yaw(pose) - ref_yaw;
@@ -162,7 +205,7 @@ impl BodyTracker {
         Some(TrackerPose::new(position, rotation))
     }
 
-    fn compute_left_foot(&self, pose: &Pose, hip_center: Option<(f32, f32)>) -> Option<TrackerPose> {
+    fn compute_left_foot(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32) -> Option<TrackerPose> {
         let (hip_x, hip_y) = hip_center?;
         let knee = pose.get(KeypointIndex::LeftKnee);
         let ankle = pose.get(KeypointIndex::LeftAnkle);
@@ -173,7 +216,7 @@ impl BodyTracker {
             return None;
         }
 
-        let position = self.convert_position(ankle.x, ankle.y, hip_x, hip_y, self.leg_scale);
+        let position = self.convert_position(ankle.x, ankle.y, hip_x, hip_y, self.leg_scale, pos_z);
 
         let ref_yaw = self
             .calibration
@@ -186,7 +229,7 @@ impl BodyTracker {
         Some(TrackerPose::new(position, rotation))
     }
 
-    fn compute_right_foot(&self, pose: &Pose, hip_center: Option<(f32, f32)>) -> Option<TrackerPose> {
+    fn compute_right_foot(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32) -> Option<TrackerPose> {
         let (hip_x, hip_y) = hip_center?;
         let knee = pose.get(KeypointIndex::RightKnee);
         let ankle = pose.get(KeypointIndex::RightAnkle);
@@ -197,7 +240,7 @@ impl BodyTracker {
             return None;
         }
 
-        let position = self.convert_position(ankle.x, ankle.y, hip_x, hip_y, self.leg_scale);
+        let position = self.convert_position(ankle.x, ankle.y, hip_x, hip_y, self.leg_scale, pos_z);
 
         let ref_yaw = self
             .calibration
@@ -210,7 +253,7 @@ impl BodyTracker {
         Some(TrackerPose::new(position, rotation))
     }
 
-    fn compute_chest(&self, pose: &Pose, hip_center: Option<(f32, f32)>) -> Option<TrackerPose> {
+    fn compute_chest(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32) -> Option<TrackerPose> {
         let (hip_x, hip_y) = hip_center?;
         let left_shoulder = pose.get(KeypointIndex::LeftShoulder);
         let right_shoulder = pose.get(KeypointIndex::RightShoulder);
@@ -232,7 +275,7 @@ impl BodyTracker {
             (left_shoulder.y + right_shoulder.y) / 2.0
         };
 
-        let position = self.convert_position(x, y, hip_x, hip_y, self.body_scale);
+        let position = self.convert_position(x, y, hip_x, hip_y, self.body_scale, pos_z);
 
         let ref_yaw = self.calibration.as_ref().map_or(0.0, |c| c.yaw_shoulder);
         let yaw = self.compute_shoulder_yaw(pose) - ref_yaw;
@@ -366,5 +409,75 @@ mod tests {
         assert!(result.left_foot.is_some());
         assert!(result.right_foot.is_some());
         assert!(result.chest.is_some());
+    }
+
+    #[test]
+    fn test_depth_closer_positive_z() {
+        let config = TrackerConfig::default();
+        let mut tracker = BodyTracker::from_config(&config);
+
+        // キャリブレーション: 肩y=0.3, 腰y=0.5 → 胴体高さ=0.2
+        let cal_pose = make_pose(
+            (0.4, 0.5), (0.6, 0.5),
+            (0.4, 0.3), (0.6, 0.3),
+            (0.4, 0.7), (0.6, 0.7),
+            (0.4, 0.9), (0.6, 0.9),
+        );
+        assert!(tracker.calibrate(&cal_pose));
+
+        // 近づく: 胴体が大きく映る（肩y=0.25, 腰y=0.55 → 胴体高さ=0.3）
+        let closer_pose = make_pose(
+            (0.35, 0.55), (0.65, 0.55),
+            (0.35, 0.25), (0.65, 0.25),
+            (0.35, 0.75), (0.65, 0.75),
+            (0.35, 0.95), (0.65, 0.95),
+        );
+        let result = tracker.compute(&closer_pose);
+        let hip = result.hip.unwrap();
+        assert!(hip.position[2] > 0.0, "closer should give positive z, got {}", hip.position[2]);
+    }
+
+    #[test]
+    fn test_depth_farther_negative_z() {
+        let config = TrackerConfig::default();
+        let mut tracker = BodyTracker::from_config(&config);
+
+        // キャリブレーション: 胴体高さ=0.2
+        let cal_pose = make_pose(
+            (0.4, 0.5), (0.6, 0.5),
+            (0.4, 0.3), (0.6, 0.3),
+            (0.4, 0.7), (0.6, 0.7),
+            (0.4, 0.9), (0.6, 0.9),
+        );
+        assert!(tracker.calibrate(&cal_pose));
+
+        // 離れる: 胴体が小さく映る（肩y=0.35, 腰y=0.5 → 胴体高さ=0.15）
+        let farther_pose = make_pose(
+            (0.45, 0.5), (0.55, 0.5),
+            (0.45, 0.35), (0.55, 0.35),
+            (0.45, 0.65), (0.55, 0.65),
+            (0.45, 0.8), (0.55, 0.8),
+        );
+        let result = tracker.compute(&farther_pose);
+        let hip = result.hip.unwrap();
+        assert!(hip.position[2] < 0.0, "farther should give negative z, got {}", hip.position[2]);
+    }
+
+    #[test]
+    fn test_depth_zero_at_calibration() {
+        let config = TrackerConfig::default();
+        let mut tracker = BodyTracker::from_config(&config);
+
+        let pose = make_pose(
+            (0.4, 0.5), (0.6, 0.5),
+            (0.4, 0.3), (0.6, 0.3),
+            (0.4, 0.7), (0.6, 0.7),
+            (0.4, 0.9), (0.6, 0.9),
+        );
+        assert!(tracker.calibrate(&pose));
+
+        let result = tracker.compute(&pose);
+        let hip = result.hip.unwrap();
+        assert!((hip.position[2]).abs() < 0.01, "same pose as calibration should give z≈0, got {}", hip.position[2]);
     }
 }

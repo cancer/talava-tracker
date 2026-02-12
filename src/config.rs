@@ -39,6 +39,8 @@ pub struct TrackerConfig {
     pub body_scale: f32,
     #[serde(default = "default_leg_scale")]
     pub leg_scale: f32,
+    #[serde(default = "default_depth_scale")]
+    pub depth_scale: f32,
     #[serde(default)]
     pub mirror_x: bool,
     #[serde(default = "default_offset_y")]
@@ -137,6 +139,7 @@ fn default_vmt_addr() -> String { "127.0.0.1:39570".to_string() }
 fn default_scale() -> f32 { 1.0 }
 fn default_body_scale() -> f32 { 1.0 }
 fn default_leg_scale() -> f32 { 1.0 }
+fn default_depth_scale() -> f32 { 1.0 }
 fn default_offset_y() -> f32 { 1.0 }
 fn default_width() -> u32 { 640 }
 fn default_height() -> u32 { 480 }
@@ -156,6 +159,7 @@ impl Default for TrackerConfig {
             scale_y: default_scale(),
             body_scale: default_body_scale(),
             leg_scale: default_leg_scale(),
+            depth_scale: default_depth_scale(),
             mirror_x: false,
             offset_y: default_offset_y(),
         }

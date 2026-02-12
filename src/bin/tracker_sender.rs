@@ -55,9 +55,9 @@ fn main() -> Result<()> {
     println!("Target FPS: {}", config.app.target_fps);
     println!("Interpolation: {}", config.interpolation.mode);
     println!("Debug view: {}", if config.debug.view { "ON" } else { "OFF" });
-    println!("Tracker: scale=({}, {}), body_scale={}, leg_scale={}, mirror_x={}, offset_y={}",
+    println!("Tracker: scale=({}, {}), body_scale={}, leg_scale={}, depth_scale={}, mirror_x={}, offset_y={}",
         config.tracker.scale_x, config.tracker.scale_y,
-        config.tracker.body_scale, config.tracker.leg_scale,
+        config.tracker.body_scale, config.tracker.leg_scale, config.tracker.depth_scale,
         config.tracker.mirror_x, config.tracker.offset_y);
     println!("Filter: pos(cutoff={}, beta={}) rot(cutoff={}, beta={})",
         config.filter.position_min_cutoff, config.filter.position_beta,
