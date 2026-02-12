@@ -4,11 +4,11 @@ addr = "192.168.10.35:39570"
 
 # トラッカー設定
 [tracker]
-scale_x = 2.0
-scale_y = 2.0
+scale_x = 3.0
+scale_y = 3.2
 body_scale = 1.0
 mirror_x = false
-offset_y = 1.0
+offset_y = 1.3
 
 # カメラ設定
 [camera]
@@ -23,7 +23,8 @@ view = false
 # アプリ設定
 [app]
 target_fps = 90
-model = "spinepose_medium"
+model = "spinepose_small"  # "movenet" | "spinepose_small" | "spinepose_medium"
+detector = "keypoint"  # "keypoint" | "yolo" | "none"
 
 # One Euro Filter設定
 # min_cutoff: 低い=ジッタ少ない(静止時安定), beta: 高い=速い動きに追従
