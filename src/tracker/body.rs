@@ -15,6 +15,7 @@ pub struct BodyPoses {
 struct Calibration {
     hip_x: f32,
     hip_y: f32,
+    shoulder_y: f32,
     torso_height: f32,
     yaw_shoulder: f32,
     yaw_left_foot: f32,
@@ -73,6 +74,17 @@ impl BodyTracker {
 
         let hip_x = (left_hip.x + right_hip.x) / 2.0;
         let hip_y = (left_hip.y + right_hip.y) / 2.0;
+
+        let left_shoulder = pose.get(KeypointIndex::LeftShoulder);
+        let right_shoulder = pose.get(KeypointIndex::RightShoulder);
+        let shoulder_y = if left_shoulder.is_valid(self.confidence_threshold)
+            && right_shoulder.is_valid(self.confidence_threshold)
+        {
+            (left_shoulder.y + right_shoulder.y) / 2.0
+        } else {
+            0.5
+        };
+
         let torso_height = self.compute_torso_height(pose).unwrap_or(0.0);
         let yaw_shoulder = self.compute_shoulder_yaw(pose);
         let yaw_left_foot =
@@ -114,6 +126,7 @@ impl BodyTracker {
         self.calibration = Some(Calibration {
             hip_x,
             hip_y,
+            shoulder_y,
             torso_height,
             yaw_shoulder,
             yaw_left_foot,
@@ -163,9 +176,13 @@ impl BodyTracker {
         if half_fov < 0.01 {
             return 1.0;
         }
-        // 画像y → カメラ中心からの角度
-        let theta = ((y - 0.5) * 2.0 * half_fov.tan()).atan();
-        // 斜め距離の補正: 1/cos(θ)
+        // カメラ高さ基準: 肩位置からの角度で補正
+        // カメラが肩の高さにある場合、肩から離れるほど斜め距離が増える
+        let camera_y = match &self.calibration {
+            Some(cal) => cal.shoulder_y,
+            None => 0.5,
+        };
+        let theta = ((y - camera_y) * 2.0 * half_fov.tan()).atan();
         1.0 / theta.cos()
     }
 
@@ -174,14 +191,22 @@ impl BodyTracker {
             Some(cal) => (cal.hip_x, cal.hip_y),
             None => (0.5, 0.5),
         };
-        // FOV補正: 画像端ほどパーツオフセットを拡大
         let fov = self.fov_scale(y);
-        // body_ratioで奥行き正規化
-        let mut pos_x = ((ref_x - hip_x) * self.scale_x + (hip_x - x) * part_scale * fov) * body_ratio;
+
+        // パースペクティブ補正: 奥行き変化による見かけの腰位置シフトを除去
+        // ピンホールカメラモデルでは画像中心(0.5)からのオフセットが深度に反比例する
+        // 前後移動がVR空間の上下移動に化けるのを防ぐ
+        let perspective_x_shift = (ref_x - 0.5) * (1.0 / body_ratio - 1.0);
+        let perspective_y_shift = (ref_y - 0.5) * (1.0 / body_ratio - 1.0);
+
+        let global_x = (ref_x - hip_x + perspective_x_shift) * self.scale_x;
+        let global_y = (ref_y - hip_y + perspective_y_shift) * self.scale_y;
+
+        let mut pos_x = (global_x + (hip_x - x) * part_scale * fov) * body_ratio;
         if self.mirror_x {
             pos_x = -pos_x;
         }
-        let pos_y = self.offset_y + ((ref_y - hip_y) * self.scale_y + (hip_y - y) * part_scale * fov) * body_ratio;
+        let pos_y = self.offset_y + (global_y + (hip_y - y) * part_scale * fov) * body_ratio;
         [pos_x, pos_y, pos_z]
     }
 
