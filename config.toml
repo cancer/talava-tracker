@@ -7,21 +7,21 @@ addr = "192.168.10.35:39570"
 scale_x = 3.0
 scale_y = 3.4
 body_scale = 3.0
-leg_scale = 2.0
-depth_scale = 1.0
+leg_scale = 2.2
+depth_scale = 3.0
 mirror_x = false
-offset_y = 1.0
+offset_y = 1.2
 
 # カメラ設定
 [camera]
 index = 0
 width = 640
 height = 480
-fov_v = 49  # 垂直画角（度）。0で補正無効。一般的なWebカメラ: 43-55
+fov_v = 55  # 垂直画角（度）。0で補正無効。一般的なWebカメラ: 43-55
 
 # デバッグ設定
 [debug]
-view = true
+view = false
 
 # アプリ設定
 [app]
