@@ -12,6 +12,8 @@ pub struct Config {
     #[serde(default)]
     pub camera: CameraConfig,
     #[serde(default)]
+    pub cameras: Vec<CameraEntry>,
+    #[serde(default)]
     pub debug: DebugConfig,
     #[serde(default)]
     pub smooth: SmoothConfig,
@@ -138,6 +140,42 @@ impl Default for FilterConfig {
     }
 }
 
+/// 複数カメラ設定エントリ
+#[derive(Debug, Deserialize, Clone)]
+pub struct CameraEntry {
+    pub index: i32,
+    #[serde(default = "default_width")]
+    pub width: u32,
+    #[serde(default = "default_height")]
+    pub height: u32,
+    /// カメラ位置 [x, y, z] メートル
+    #[serde(default)]
+    pub position: [f32; 3],
+    /// カメラ回転 [rx, ry, rz] 度 (Euler)
+    #[serde(default)]
+    pub rotation: [f32; 3],
+    /// 垂直画角（度）
+    #[serde(default)]
+    pub fov_v: f32,
+}
+
+impl Config {
+    /// cameras配列が設定されていればそれを、なければ既存のcamera設定から生成
+    pub fn camera_entries(&self) -> Vec<CameraEntry> {
+        if !self.cameras.is_empty() {
+            return self.cameras.clone();
+        }
+        vec![CameraEntry {
+            index: self.camera.index,
+            width: self.camera.width,
+            height: self.camera.height,
+            position: [0.0, 0.0, 0.0],
+            rotation: [0.0, 0.0, 0.0],
+            fov_v: self.camera.fov_v,
+        }]
+    }
+}
+
 fn default_vmt_addr() -> String { "127.0.0.1:39570".to_string() }
 fn default_scale() -> f32 { 1.0 }
 fn default_body_scale() -> f32 { 1.0 }
@@ -201,6 +239,7 @@ impl Default for Config {
             vmt: VmtConfig::default(),
             tracker: TrackerConfig::default(),
             camera: CameraConfig::default(),
+            cameras: Vec::new(),
             debug: DebugConfig::default(),
             smooth: SmoothConfig::default(),
             app: AppConfig::default(),

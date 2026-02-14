@@ -12,12 +12,29 @@ depth_scale = 3.0
 mirror_x = false
 offset_y = 1.2
 
-# カメラ設定
+# カメラ設定 (tracker_sender用、単一カメラ)
 [camera]
 index = 0
 width = 640
 height = 480
 fov_v = 55  # 垂直画角（度）。0で補正無効。一般的なWebカメラ: 43-55
+
+# 複数カメラ設定 (tracker_bevy用)
+# [[cameras]]が設定されていればそちらを使用、なければ[camera]をフォールバック
+# position: カメラ位置 [x, y, z] メートル
+# rotation: カメラ回転 [rx, ry, rz] 度 (Euler XYZ)
+#
+# [[cameras]]
+# index = 0
+# fov_v = 55
+# position = [0.0, 1.0, 0.0]
+# rotation = [0.0, 0.0, 0.0]
+#
+# [[cameras]]
+# index = 1
+# fov_v = 55
+# position = [0.5, 1.0, 0.3]
+# rotation = [0.0, -30.0, 0.0]
 
 # デバッグ設定
 [debug]
@@ -26,7 +43,7 @@ view = false
 # アプリ設定
 [app]
 target_fps = 90
-model = "spinepose_medium"  # "movenet" | "spinepose_small" | "spinepose_medium"
+model = "rtmw3d"  # "movenet" | "spinepose_small" | "spinepose_medium" | "rtmw3d"
 detector = "keypoint"  # "keypoint" | "yolo" | "none"
 
 # One Euro Filter設定

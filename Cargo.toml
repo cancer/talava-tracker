@@ -13,7 +13,13 @@ opencv = { version = "0.93", default-features = false, features = ["videoio", "i
 minifb = "0.27"    # シンプルなウィンドウ描画
 toml = "0.9.11"
 serde = { version = "1.0.228", features = ["derive"] }
+bevy = { version = "0.15", default-features = false }
+nalgebra = "0.33"  # 三角測量の線形代数
 
 [[bin]]
 name = "bench_inference"
 path = "src/bin/bench_inference.rs"
+
+[[bin]]
+name = "tracker_bevy"
+path = "src/bin/tracker_bevy.rs"
