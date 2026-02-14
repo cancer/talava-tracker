@@ -95,13 +95,19 @@ pub struct Keypoint {
     pub x: f32,
     /// 正規化されたY座標 (0.0〜1.0)
     pub y: f32,
+    /// 深度（メートル単位、3Dモデル使用時のみ有効。0.0 = データなし）
+    pub z: f32,
     /// 信頼度スコア (0.0〜1.0)
     pub confidence: f32,
 }
 
 impl Keypoint {
     pub fn new(x: f32, y: f32, confidence: f32) -> Self {
-        Self { x, y, confidence }
+        Self { x, y, z: 0.0, confidence }
+    }
+
+    pub fn new_3d(x: f32, y: f32, z: f32, confidence: f32) -> Self {
+        Self { x, y, z, confidence }
     }
 
     /// 信頼度が閾値以上か
@@ -122,6 +128,7 @@ impl Default for Keypoint {
         Self {
             x: 0.0,
             y: 0.0,
+            z: 0.0,
             confidence: 0.0,
         }
     }

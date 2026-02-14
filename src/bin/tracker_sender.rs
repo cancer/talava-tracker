@@ -9,8 +9,9 @@ use opencv::core::Mat;
 use talava_tracker::camera::ThreadedCamera;
 use talava_tracker::config::Config;
 use talava_tracker::pose::{
-    bbox_from_keypoints, crop_for_pose, preprocess_for_movenet, preprocess_for_spinepose,
-    remap_pose, CropRegion, ModelType, PersonDetector, Pose, PoseDetector,
+    bbox_from_keypoints, crop_for_pose, preprocess_for_movenet, preprocess_for_rtmw3d,
+    preprocess_for_spinepose, remap_pose, CropRegion, ModelType, PersonDetector, Pose,
+    PoseDetector,
 };
 use talava_tracker::render::{Key, MinifbRenderer};
 use talava_tracker::tracker::{BodyTracker, Extrapolator, Lerper, PoseFilter};
@@ -47,6 +48,7 @@ fn main() -> Result<()> {
         "movenet" => ("models/movenet_lightning.onnx", ModelType::MoveNet),
         "spinepose_small" => ("models/spinepose_small.onnx", ModelType::SpinePose),
         "spinepose_medium" => ("models/spinepose_medium.onnx", ModelType::SpinePose),
+        "rtmw3d" => ("models/rtmw3d-x.onnx", ModelType::RTMW3D),
         other => anyhow::bail!("Unknown model: {}", other),
     };
 
@@ -186,6 +188,7 @@ fn main() -> Result<()> {
                 let input = match model_type {
                     ModelType::MoveNet => preprocess_for_movenet(&input_frame),
                     ModelType::SpinePose => preprocess_for_spinepose(&input_frame),
+                    ModelType::RTMW3D => preprocess_for_rtmw3d(&input_frame),
                 };
                 let input = match input {
                     Ok(v) => v,

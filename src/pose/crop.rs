@@ -147,6 +147,7 @@ pub fn remap_pose(pose: &Pose, crop: &CropRegion) -> Pose {
         keypoints[i] = Keypoint {
             x: crop.x + kp.x * crop.width,
             y: crop.y + kp.y * crop.height,
+            z: kp.z,
             confidence: kp.confidence,
         };
     }

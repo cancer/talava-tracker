@@ -10,4 +10,5 @@ pub use detector::PoseDetector;
 pub use keypoint::{Keypoint, KeypointIndex, Pose};
 pub use person_detector::PersonDetector;
 pub use preprocess::preprocess_for_movenet;
+pub use preprocess::preprocess_for_rtmw3d;
 pub use preprocess::preprocess_for_spinepose;

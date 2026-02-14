@@ -17,6 +17,7 @@ struct Calibration {
     hip_y: f32,
     shoulder_y: f32,
     torso_height: f32,
+    hip_z: f32, // 3Dモデルの基準z座標（キャリブレーション時の腰z）
     yaw_shoulder: f32,
     yaw_left_foot: f32,
     yaw_right_foot: f32,
@@ -86,6 +87,10 @@ impl BodyTracker {
         };
 
         let torso_height = self.compute_torso_height(pose).unwrap_or(0.0);
+
+        // 3Dモデルのz座標を保存（キャリブレーション基準点）
+        let hip_z = (left_hip.z + right_hip.z) / 2.0;
+
         let yaw_shoulder = self.compute_shoulder_yaw(pose);
         let yaw_left_foot =
             self.compute_foot_yaw(pose, KeypointIndex::LeftKnee, KeypointIndex::LeftAnkle);
@@ -128,6 +133,7 @@ impl BodyTracker {
             hip_y,
             shoulder_y,
             torso_height,
+            hip_z,
             yaw_shoulder,
             yaw_left_foot,
             yaw_right_foot,
@@ -230,9 +236,23 @@ impl BodyTracker {
         Some((hip_y - shoulder_y).abs())
     }
 
-    /// 胴体高さの変化から奥行きを推定
-    /// 近づく→体が大きく映る→胴体高さ増→z正
+    /// 奥行きを推定
+    /// 3Dモデルのz座標がある場合はそれを使用、なければ胴体高さ比率から推定
     fn estimate_depth(&self, pose: &Pose) -> f32 {
+        // 3Dモデルのz座標がある場合
+        let left_hip = pose.get(KeypointIndex::LeftHip);
+        let right_hip = pose.get(KeypointIndex::RightHip);
+        if left_hip.is_valid(self.confidence_threshold)
+            && right_hip.is_valid(self.confidence_threshold)
+            && (left_hip.z.abs() > 0.001 || right_hip.z.abs() > 0.001)
+        {
+            let hip_z = (left_hip.z + right_hip.z) / 2.0;
+            // キャリブレーション済みなら基準z値からの差分を使用
+            let ref_z = self.calibration.as_ref().map_or(0.0, |c| c.hip_z);
+            return (hip_z - ref_z) * self.depth_scale;
+        }
+
+        // フォールバック: 胴体高さ比率ベース推定
         let cal = match &self.calibration {
             Some(cal) if cal.torso_height > 0.01 => cal,
             _ => return 0.0,
