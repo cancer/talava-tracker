@@ -17,6 +17,7 @@ serde_json = "1.0"
 bevy = { version = "0.15", default-features = false }
 nalgebra = "0.33"  # 三角測量の線形代数
 signal-hook = "0.4.3"
+chrono = "0.4.43"
 
 [[bin]]
 name = "bench_inference"

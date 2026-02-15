@@ -1,4 +1,6 @@
 use anyhow::Result;
+use std::fs;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::sync::Arc;
@@ -101,6 +103,9 @@ struct FpsCounter {
     timer: Instant,
 }
 
+#[derive(Resource)]
+struct LogFileRes(LogFile);
+
 struct DebugView {
     renderer: MinifbRenderer,
     view_w: usize,
@@ -108,13 +113,35 @@ struct DebugView {
     num_cameras: usize,
 }
 
+type LogFile = Arc<Mutex<std::io::BufWriter<std::fs::File>>>;
+
+fn open_log_file() -> Result<LogFile> {
+    fs::create_dir_all("logs")?;
+    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let path = format!("logs/tracker_{}.log", ts);
+    let file = std::fs::File::create(&path)?;
+    eprintln!("Log: {}", path);
+    Ok(Arc::new(Mutex::new(std::io::BufWriter::new(file))))
+}
+
+macro_rules! log {
+    ($logfile:expr, $($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        println!("{}", msg);
+        if let Ok(mut f) = $logfile.lock() {
+            let _ = writeln!(f, "{}", msg);
+        }
+    }};
+}
+
 fn main() -> Result<()> {
     let config = Config::load(CONFIG_PATH)?;
+    let logfile = open_log_file()?;
 
-    println!("Tracker Bevy - Multi-camera triangulation");
-    println!("VMT target: {}", config.vmt.addr);
-    println!("Target FPS: {}", config.app.target_fps);
-    println!("Interpolation: {}", config.interpolation.mode);
+    log!(logfile, "Tracker Bevy - Multi-camera triangulation");
+    log!(logfile, "VMT target: {}", config.vmt.addr);
+    log!(logfile, "Target FPS: {}", config.app.target_fps);
+    log!(logfile, "Interpolation: {}", config.interpolation.mode);
 
     // カメラ起動: calibration.jsonがあればそちらから、なければconfig.tomlの設定を使用
     let mut cameras = Vec::new();
@@ -126,8 +153,8 @@ fn main() -> Result<()> {
         // キャリブレーションファイルからカメラ起動
         match load_calibration(cal_path) {
             Ok(cal) => {
-                println!("Calibration: {}", cal_path);
-                println!("Cameras: {}", cal.cameras.len());
+                log!(logfile, "Calibration: {}", cal_path);
+                log!(logfile, "Cameras: {}", cal.cameras.len());
                 for cam_cal in &cal.cameras {
                     let cam = ThreadedCamera::start(
                         cam_cal.camera_index,
@@ -135,7 +162,7 @@ fn main() -> Result<()> {
                         Some(cam_cal.height),
                     )?;
                     let (w, h) = cam.resolution();
-                    println!("Camera {}: {}x{}", cam_cal.camera_index, w, h);
+                    log!(logfile, "Camera {}: {}x{}", cam_cal.camera_index, w, h);
                     let dc: [f64; 5] = [
                         cam_cal.dist_coeffs.get(0).copied().unwrap_or(0.0),
                         cam_cal.dist_coeffs.get(1).copied().unwrap_or(0.0),
@@ -157,7 +184,7 @@ fn main() -> Result<()> {
                 }
             }
             Err(e) => {
-                eprintln!("Calibration load failed: {}. Falling back to config.", e);
+                log!(logfile, "Calibration load failed: {}. Falling back to config.", e);
                 // フォールバック: config.toml
                 let entries = config.camera_entries();
                 for entry in &entries {
@@ -167,7 +194,7 @@ fn main() -> Result<()> {
                         Some(entry.height),
                     )?;
                     let (w, h) = cam.resolution();
-                    println!("Camera {}: {}x{}", entry.index, w, h);
+                    log!(logfile, "Camera {}: {}x{}", entry.index, w, h);
                     if entries.len() >= 2 {
                         params.push(CameraParams::from_config(
                             entry.fov_v, w, h, entry.position, entry.rotation,
@@ -182,7 +209,7 @@ fn main() -> Result<()> {
     } else {
         // config.tomlのカメラ設定を使用
         let entries = config.camera_entries();
-        println!("Cameras: {}", entries.len());
+        log!(logfile, "Cameras: {}", entries.len());
         for entry in &entries {
             let cam = ThreadedCamera::start(
                 entry.index,
@@ -190,7 +217,7 @@ fn main() -> Result<()> {
                 Some(entry.height),
             )?;
             let (w, h) = cam.resolution();
-            println!("Camera {}: {}x{}", entry.index, w, h);
+            log!(logfile, "Camera {}: {}x{}", entry.index, w, h);
             if entries.len() >= 2 {
                 params.push(CameraParams::from_config(
                     entry.fov_v, w, h, entry.position, entry.rotation,
@@ -204,8 +231,8 @@ fn main() -> Result<()> {
 
     let num_cameras = cameras.len();
     let multi_camera = num_cameras >= 2;
-    println!("Mode: {}", if multi_camera { "triangulation" } else { "single camera" });
-    println!();
+    log!(logfile, "Mode: {}", if multi_camera { "triangulation" } else { "single camera" });
+    log!(logfile, "");
 
     // 推論スレッド
     let (frame_tx, frame_rx) = mpsc::sync_channel::<InferenceRequest>(num_cameras);
@@ -216,22 +243,23 @@ fn main() -> Result<()> {
         "spinepose_small" => ("models/spinepose_small.onnx", ModelType::SpinePose),
         "spinepose_medium" => ("models/spinepose_medium.onnx", ModelType::SpinePose),
         "rtmw3d" => ("models/rtmw3d-x.onnx", ModelType::RTMW3D),
-        other => { eprintln!("Unknown model: {}", other); std::process::exit(1); }
+        other => { log!(logfile, "Unknown model: {}", other); std::process::exit(1); }
     };
     let detector_mode = config.app.detector.clone();
-    println!("Model: {}", config.app.model);
-    println!("Detector: {}", config.app.detector);
+    log!(logfile, "Model: {}", config.app.model);
+    log!(logfile, "Detector: {}", config.app.detector);
 
+    let logfile_infer = logfile.clone();
     std::thread::spawn(move || {
         let mut detector = PoseDetector::new(model_path, model_type)
             .expect("Failed to load pose model");
-        println!("Inference thread: model loaded");
+        log!(logfile_infer, "Inference thread: model loaded");
 
         let mut person_detector = match detector_mode.as_str() {
             "yolo" => {
                 let pd = PersonDetector::new("models/yolov8n.onnx", 160)
                     .expect("Failed to load person detector");
-                println!("Inference thread: person detector loaded");
+                log!(logfile_infer, "Inference thread: person detector loaded");
                 Some(pd)
             }
             _ => None,
@@ -271,13 +299,13 @@ fn main() -> Result<()> {
             };
             let input = match input {
                 Ok(v) => v,
-                Err(e) => { eprintln!("preprocess error: {}", e); continue; }
+                Err(e) => { log!(logfile_infer, "preprocess error: {}", e); continue; }
             };
 
             // 推論
             let mut pose = match detector.detect(input) {
                 Ok(v) => v,
-                Err(e) => { eprintln!("inference error: {}", e); continue; }
+                Err(e) => { log!(logfile_infer, "inference error: {}", e); continue; }
             };
 
             if !crop_region.is_full() {
@@ -302,7 +330,7 @@ fn main() -> Result<()> {
         std::array::from_fn(|_| Lerper::new());
 
     let vmt = VmtClient::new(&config.vmt.addr)?;
-    println!("VMT client ready");
+    log!(logfile, "VMT client ready");
 
     // キャリブレーショントリガー: SIGUSR1シグナルまたはコンソール入力 "c"
     let console_flag = Arc::new(AtomicBool::new(false));
@@ -331,18 +359,18 @@ fn main() -> Result<()> {
         let total_w = view_w * num_cameras;
         match MinifbRenderer::new("tracker_bevy debug", total_w, view_h) {
             Ok(renderer) => {
-                println!("Debug view: {}x{} ({}cameras)", total_w, view_h, num_cameras);
+                log!(logfile, "Debug view: {}x{} ({}cameras)", total_w, view_h, num_cameras);
                 Some(DebugView { renderer, view_w, view_h, num_cameras })
             }
-            Err(e) => { eprintln!("Debug view failed: {}", e); None }
+            Err(e) => { log!(logfile, "Debug view failed: {}", e); None }
         }
     } else {
         None
     };
 
-    println!();
-    println!("操作: [C + Enter] キャリブレーション  [Ctrl+C] 終了");
-    println!();
+    log!(logfile, "");
+    log!(logfile, "操作: [C + Enter] キャリブレーション  [Ctrl+C] 終了");
+    log!(logfile, "");
 
     let frame_duration = Duration::from_secs_f64(1.0 / config.app.target_fps as f64);
 
@@ -388,7 +416,8 @@ fn main() -> Result<()> {
             frame_count: 0,
             inference_count: 0,
             timer: Instant::now(),
-        });
+        })
+        .insert_resource(LogFileRes(logfile.clone()));
 
     if let Some(dv) = debug_view {
         app.insert_non_send_resource(dv)
@@ -405,7 +434,7 @@ fn main() -> Result<()> {
 
     app.run();
 
-    println!("Shutting down...");
+    log!(logfile, "Shutting down...");
     Ok(())
 }
 
@@ -434,9 +463,8 @@ fn send_frames_system(
                         cam_inputs.in_flight[i] = true;
                     }
                     Err(mpsc::TrySendError::Full(_)) => {}
-                    Err(mpsc::TrySendError::Disconnected(_)) => {
-                        eprintln!("Inference thread disconnected");
-                    }
+                    Err(mpsc::TrySendError::Disconnected(_)) => {}
+                    // Inference thread disconnected は無視（終了時に発生）
                 }
             }
         }
@@ -509,11 +537,12 @@ fn calibration_system(
     mut cal: ResMut<CalibrationState>,
     mut tracker_state: ResMut<TrackerState>,
     pose_state: Res<PoseState>,
+    lf: Res<LogFileRes>,
 ) {
     // 手動キャリブレーション（コンソール入力 or SIGUSR1）
     if cal.console_flag.swap(false, Ordering::AcqRel) && cal.deadline.is_none() {
         cal.deadline = Some(Instant::now() + Duration::from_secs(5));
-        println!("Calibration in 5s... 基準位置に立ってください");
+        log!(lf.0, "Calibration in 5s... 基準位置に立ってください");
     }
 
     // 自動キャリブレーション: 未キャリブ時、hipを3秒間安定検出したら自動発動
@@ -547,10 +576,10 @@ fn calibration_system(
                 if std_dev < 0.3 {
                     cal.auto_cal_triggered = true;
                     cal.deadline = Some(now);
-                    println!("Auto-calibration triggered (hip z stable: mean={:.2}, std={:.2}, n={})",
+                    log!(lf.0, "Auto-calibration triggered (hip z stable: mean={:.2}, std={:.2}, n={})",
                         mean, std_dev, cal.recent_hip_z.len());
                 } else {
-                    println!("Auto-cal rejected: hip z unstable (mean={:.2}, std={:.2}, n={})",
+                    log!(lf.0, "Auto-cal rejected: hip z unstable (mean={:.2}, std={:.2}, n={})",
                         mean, std_dev, cal.recent_hip_z.len());
                     cal.first_hip_time = None;
                     cal.recent_hip_z.clear();
@@ -577,9 +606,9 @@ fn calibration_system(
                     tracker_state.extrapolators = std::array::from_fn(|_| Extrapolator::new());
                     tracker_state.lerpers = std::array::from_fn(|_| Lerper::new());
                     tracker_state.last_poses = [None; TRACKER_COUNT];
-                    println!("Calibrated!");
+                    log!(lf.0, "Calibrated!");
                 } else {
-                    println!("Calibration failed: hip not detected");
+                    log!(lf.0, "Calibration failed: hip not detected");
                 }
             }
             cal.deadline = None;
@@ -791,7 +820,7 @@ fn debug_view_system(
     let _ = debug_view.renderer.update();
 }
 
-fn fps_system(mut fps: ResMut<FpsCounter>, tracker_state: Res<TrackerState>) {
+fn fps_system(mut fps: ResMut<FpsCounter>, tracker_state: Res<TrackerState>, lf: Res<LogFileRes>) {
     fps.frame_count += 1;
     let elapsed = fps.timer.elapsed().as_secs_f32();
     if elapsed >= 1.0 {
@@ -807,7 +836,7 @@ fn fps_system(mut fps: ResMut<FpsCounter>, tracker_state: Res<TrackerState>) {
                 }
             }
         }
-        println!(
+        log!(lf.0,
             "FPS: {:.1} (infer: {}) | {}",
             fps.frame_count as f32 / elapsed,
             fps.inference_count,

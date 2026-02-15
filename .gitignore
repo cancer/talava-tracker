@@ -4,3 +4,4 @@ calibration.json
 *.bak
 *.png
 test_vmt.py
+logs/
