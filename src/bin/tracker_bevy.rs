@@ -135,6 +135,12 @@ macro_rules! log {
 }
 
 fn main() -> Result<()> {
+    // macOSスリープ防止: プロセス終了時に自動解除
+    let _caffeinate = std::process::Command::new("caffeinate")
+        .args(["-i", "-w", &std::process::id().to_string()])
+        .spawn()
+        .ok();
+
     let config = Config::load(CONFIG_PATH)?;
     let logfile = open_log_file()?;
 
