@@ -2,10 +2,20 @@ use nalgebra::{Matrix3, Matrix3x4, Matrix4, Vector3, Vector4};
 
 use crate::pose::{Keypoint, KeypointIndex, Pose};
 
+/// リプロジェクションエラー閾値（ピクセル）
+/// 三角測量した3D点をカメラに再投影した際の最大許容誤差
+const MAX_REPROJ_ERROR: f32 = 75.0;
+
 /// カメラパラメータ（射影行列 P = K[R|t]）
 #[derive(Debug, Clone)]
 pub struct CameraParams {
     pub projection: Matrix3x4<f32>,
+    pub image_width: f32,
+    pub image_height: f32,
+    /// 内部パラメータ行列（歪み補正用）
+    intrinsic: Matrix3<f32>,
+    /// 歪み係数 [k1, k2, p1, p2, k3]
+    dist_coeffs: [f32; 5],
 }
 
 impl CameraParams {
@@ -24,6 +34,8 @@ impl CameraParams {
     ) -> Self {
         let w = width as f32;
         let h = height as f32;
+        let image_width = w;
+        let image_height = h;
 
         // 内部パラメータ行列 K
         let fy = h / (2.0 * (fov_v_deg.to_radians() / 2.0).tan());
@@ -87,7 +99,7 @@ impl CameraParams {
         }
 
         let projection = k * rt;
-        Self { projection }
+        Self { projection, image_width, image_height, intrinsic: k, dist_coeffs: [0.0; 5] }
     }
 
     /// キャリブレーション結果から射影行列を構築
@@ -95,7 +107,7 @@ impl CameraParams {
     /// - intrinsic: 内部パラメータ行列 K (row-major 3x3, f64)
     /// - rvec: 回転ベクトル (Rodrigues, f64)
     /// - tvec: 並進ベクトル (f64)
-    pub fn from_calibration(intrinsic: &[f64; 9], rvec: &[f64; 3], tvec: &[f64; 3]) -> Self {
+    pub fn from_calibration(intrinsic: &[f64; 9], dist_coeffs: &[f64; 5], rvec: &[f64; 3], tvec: &[f64; 3], width: u32, height: u32) -> Self {
         // K行列 (row-major → nalgebra column-major)
         let k = Matrix3::new(
             intrinsic[0] as f32, intrinsic[1] as f32, intrinsic[2] as f32,
@@ -135,7 +147,90 @@ impl CameraParams {
         }
 
         let projection = k * rt;
-        Self { projection }
+        let dc: [f32; 5] = [
+            dist_coeffs[0] as f32, dist_coeffs[1] as f32,
+            dist_coeffs[2] as f32, dist_coeffs[3] as f32,
+            dist_coeffs[4] as f32,
+        ];
+        Self {
+            projection,
+            image_width: width as f32,
+            image_height: height as f32,
+            intrinsic: k,
+            dist_coeffs: dc,
+        }
+    }
+
+    /// 歪んだピクセル座標を歪み補正して理想ピクセル座標に変換
+    /// Newton-Raphson法による歪み補正（大きな歪み係数でも収束）
+    pub fn undistort_point(&self, u_dist: f32, v_dist: f32) -> (f32, f32) {
+        let fx = self.intrinsic[(0, 0)];
+        let fy = self.intrinsic[(1, 1)];
+        let cx = self.intrinsic[(0, 2)];
+        let cy = self.intrinsic[(1, 2)];
+        let [k1, k2, p1, p2, k3] = self.dist_coeffs;
+
+        // 歪み係数がゼロなら補正不要
+        if k1 == 0.0 && k2 == 0.0 && p1 == 0.0 && p2 == 0.0 && k3 == 0.0 {
+            return (u_dist, v_dist);
+        }
+
+        // ピクセル→正規化カメラ座標（歪みあり = ターゲット）
+        let xd = (u_dist - cx) / fx;
+        let yd = (v_dist - cy) / fy;
+
+        // Newton-Raphson: 順方向歪みモデル f(x,y) = target を解く
+        // f_x(x,y) = x*R + 2*p1*x*y + p2*(r2 + 2*x^2)
+        // f_y(x,y) = y*R + p1*(r2 + 2*y^2) + 2*p2*x*y
+        // R = 1 + k1*r2 + k2*r4 + k3*r6
+        let mut x = xd;
+        let mut y = yd;
+        let mut best_x = x;
+        let mut best_y = y;
+        let mut best_residual = f32::MAX;
+
+        for _ in 0..30 {
+            let r2 = x * x + y * y;
+            let r4 = r2 * r2;
+            let r6 = r4 * r2;
+            let radial = 1.0 + k1 * r2 + k2 * r4 + k3 * r6;
+            let dr_dr2 = k1 + 2.0 * k2 * r2 + 3.0 * k3 * r4;
+
+            // 順方向歪み適用
+            let fx_val = x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x) - xd;
+            let fy_val = y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y - yd;
+
+            let residual = fx_val * fx_val + fy_val * fy_val;
+            if residual < best_residual {
+                best_residual = residual;
+                best_x = x;
+                best_y = y;
+            }
+
+            // 十分収束したら終了
+            if residual < 1e-12 {
+                break;
+            }
+
+            // ヤコビアン
+            let j00 = radial + 2.0 * x * x * dr_dr2 + 2.0 * p1 * y + 6.0 * p2 * x;
+            let j01 = 2.0 * x * y * dr_dr2 + 2.0 * p1 * x + 2.0 * p2 * y;
+            let j10 = j01; // 対称
+            let j11 = radial + 2.0 * y * y * dr_dr2 + 6.0 * p1 * y + 2.0 * p2 * x;
+
+            let det = j00 * j11 - j01 * j10;
+            if det.abs() < 1e-10 {
+                break; // 特異ヤコビアン → best値を使用
+            }
+
+            let dx = -(j11 * fx_val - j01 * fy_val) / det;
+            let dy = -(-j10 * fx_val + j00 * fy_val) / det;
+
+            x += dx;
+            y += dy;
+        }
+
+        (best_x * fx + cx, best_y * fy + cy)
     }
 }
 
@@ -219,24 +314,40 @@ pub fn triangulate_poses(
             let kp = &poses_2d[cam_idx].keypoints[kp_idx];
             if kp.confidence >= confidence_threshold {
                 valid_cameras.push(cameras[cam_idx]);
-                // 正規化座標(0-1)をピクセル座標に変換
-                // 射影行列がピクセル座標ベースなので
-                let p = &cameras[cam_idx].projection;
-                // 画像サイズは射影行列から推定: cx ≈ P[0,2], cy ≈ P[1,2]
-                // ただし正規化座標なので直接使う
-                // Actually: u = kp.x * width, v = kp.y * height
-                // 射影行列の cx = width/2 なので width ≈ cx * 2
-                let width = p[(0, 2)] * 2.0;
-                let height = p[(1, 2)] * 2.0;
-                valid_points.push((kp.x * width, kp.y * height));
+                // 正規化座標(0-1)→歪みピクセル座標→歪み補正ピクセル座標
+                let cam = cameras[cam_idx];
+                let u_dist = kp.x * cam.image_width;
+                let v_dist = kp.y * cam.image_height;
+                let (u, v) = cam.undistort_point(u_dist, v_dist);
+                valid_points.push((u, v));
                 conf_sum += kp.confidence;
             }
         }
 
         if valid_cameras.len() >= 2 {
             let (x, y, z) = triangulate_point(&valid_cameras, &valid_points);
-            let avg_conf = conf_sum / valid_cameras.len() as f32;
-            keypoints[kp_idx] = Keypoint::new_3d(x, y, z, avg_conf);
+
+            // リプロジェクションエラーチェック: 三角測量結果をカメラに再投影し、
+            // 元の2D検出との誤差が大きい場合は棄却
+            let point_3d = Vector4::new(x, y, z, 1.0);
+            let mut max_reproj_err = 0.0f32;
+            for i in 0..valid_cameras.len() {
+                let projected = valid_cameras[i].projection * point_3d;
+                if projected[2].abs() < 1e-6 {
+                    max_reproj_err = f32::MAX;
+                    break;
+                }
+                let u_proj = projected[0] / projected[2];
+                let v_proj = projected[1] / projected[2];
+                let (u_obs, v_obs) = valid_points[i];
+                let err = ((u_proj - u_obs).powi(2) + (v_proj - v_obs).powi(2)).sqrt();
+                max_reproj_err = max_reproj_err.max(err);
+            }
+
+            if max_reproj_err < MAX_REPROJ_ERROR {
+                let avg_conf = conf_sum / valid_cameras.len() as f32;
+                keypoints[kp_idx] = Keypoint::new_3d(x, y, z, avg_conf);
+            }
         }
     }
 

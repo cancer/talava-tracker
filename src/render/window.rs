@@ -155,4 +155,11 @@ impl MinifbRenderer {
             self.buffer[y as usize * self.width + x as usize] = color;
         }
     }
+
+    /// バッファインデックスに直接書き込み
+    pub fn set_pixel_raw(&mut self, index: usize, color: u32) {
+        if index < self.buffer.len() {
+            self.buffer[index] = color;
+        }
+    }
 }

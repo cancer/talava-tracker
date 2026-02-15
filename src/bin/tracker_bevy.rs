@@ -15,6 +15,7 @@ use talava_tracker::pose::{
     bbox_from_keypoints, crop_for_pose, preprocess_for_movenet, preprocess_for_spinepose,
     preprocess_for_rtmw3d, remap_pose, CropRegion, ModelType, PersonDetector, PoseDetector, Pose,
 };
+use talava_tracker::render::MinifbRenderer;
 use talava_tracker::tracker::{BodyTracker, Extrapolator, Lerper, PoseFilter};
 use talava_tracker::triangulation::{triangulate_poses, CameraParams};
 use talava_tracker::vmt::{TrackerPose, VmtClient};
@@ -48,6 +49,7 @@ struct CameraInputs {
     last_frame_ids: Vec<u64>,
     widths: Vec<u32>,
     heights: Vec<u32>,
+    in_flight: Vec<bool>,
 }
 
 #[derive(Resource)]
@@ -72,6 +74,7 @@ struct TrackerState {
     lerpers: [Lerper; TRACKER_COUNT],
     last_poses: [Option<TrackerPose>; TRACKER_COUNT],
     last_update_times: [Instant; TRACKER_COUNT],
+    stale: [bool; TRACKER_COUNT],
     last_inference_time: Instant,
     interp_mode: String,
 }
@@ -83,6 +86,12 @@ struct VmtSender(VmtClient);
 struct CalibrationState {
     deadline: Option<Instant>,
     console_flag: Arc<AtomicBool>,
+    /// 起動後の自動キャリブレーション: hip検出開始からの経過時間で発動
+    auto_cal_triggered: bool,
+    first_hip_time: Option<Instant>,
+    last_hip_time: Option<Instant>,
+    /// 自動キャリブレーション用: 直近のhip z値を蓄積し安定性を判定
+    recent_hip_z: Vec<f32>,
 }
 
 #[derive(Resource)]
@@ -90,6 +99,13 @@ struct FpsCounter {
     frame_count: u32,
     inference_count: u32,
     timer: Instant,
+}
+
+struct DebugView {
+    renderer: MinifbRenderer,
+    view_w: usize,
+    view_h: usize,
+    num_cameras: usize,
 }
 
 fn main() -> Result<()> {
@@ -120,10 +136,20 @@ fn main() -> Result<()> {
                     )?;
                     let (w, h) = cam.resolution();
                     println!("Camera {}: {}x{}", cam_cal.camera_index, w, h);
+                    let dc: [f64; 5] = [
+                        cam_cal.dist_coeffs.get(0).copied().unwrap_or(0.0),
+                        cam_cal.dist_coeffs.get(1).copied().unwrap_or(0.0),
+                        cam_cal.dist_coeffs.get(2).copied().unwrap_or(0.0),
+                        cam_cal.dist_coeffs.get(3).copied().unwrap_or(0.0),
+                        cam_cal.dist_coeffs.get(4).copied().unwrap_or(0.0),
+                    ];
                     params.push(CameraParams::from_calibration(
                         &cam_cal.intrinsic_matrix,
+                        &dc,
                         &cam_cal.rvec,
                         &cam_cal.tvec,
+                        cam_cal.width,
+                        cam_cal.height,
                     ));
                     widths.push(w);
                     heights.push(h);
@@ -267,7 +293,7 @@ fn main() -> Result<()> {
 
     // Body tracker
     let fov_v = if multi_camera { 0.0 } else { config.camera.fov_v };
-    let body_tracker = BodyTracker::new(&config.tracker, fov_v);
+    let body_tracker = BodyTracker::new(&config.tracker, fov_v, multi_camera);
     let filters: [PoseFilter; TRACKER_COUNT] =
         std::array::from_fn(|_| PoseFilter::from_config(&config.filter));
     let extrapolators: [Extrapolator; TRACKER_COUNT] =
@@ -278,10 +304,14 @@ fn main() -> Result<()> {
     let vmt = VmtClient::new(&config.vmt.addr)?;
     println!("VMT client ready");
 
-    // コンソール入力
+    // キャリブレーショントリガー: SIGUSR1シグナルまたはコンソール入力 "c"
     let console_flag = Arc::new(AtomicBool::new(false));
     {
         let flag = console_flag.clone();
+        // SIGUSR1でキャリブレーション発動
+        signal_hook::flag::register(signal_hook::consts::SIGUSR1, flag.clone())
+            .expect("failed to register SIGUSR1 handler");
+        // コンソール入力も残す（直接実行時用）
         std::thread::spawn(move || {
             let stdin = std::io::stdin();
             let mut line = String::new();
@@ -294,20 +324,37 @@ fn main() -> Result<()> {
         });
     }
 
+    // デバッグビュー
+    let debug_view = if config.debug.view {
+        let view_w = 640;
+        let view_h = 360;
+        let total_w = view_w * num_cameras;
+        match MinifbRenderer::new("tracker_bevy debug", total_w, view_h) {
+            Ok(renderer) => {
+                println!("Debug view: {}x{} ({}cameras)", total_w, view_h, num_cameras);
+                Some(DebugView { renderer, view_w, view_h, num_cameras })
+            }
+            Err(e) => { eprintln!("Debug view failed: {}", e); None }
+        }
+    } else {
+        None
+    };
+
     println!();
     println!("操作: [C + Enter] キャリブレーション  [Ctrl+C] 終了");
     println!();
 
     let frame_duration = Duration::from_secs_f64(1.0 / config.app.target_fps as f64);
 
-    App::new()
-        .add_plugins(ScheduleRunnerPlugin::run_loop(frame_duration))
+    let mut app = App::new();
+    app.add_plugins(ScheduleRunnerPlugin::run_loop(frame_duration))
         .insert_resource(CameraInputs {
             cameras,
             params,
             last_frame_ids: vec![0; num_cameras],
             widths,
             heights,
+            in_flight: vec![false; num_cameras],
         })
         .insert_resource(InferenceTx(frame_tx))
         .insert_resource(InferenceRx(Mutex::new(result_rx)))
@@ -324,6 +371,7 @@ fn main() -> Result<()> {
             lerpers,
             last_poses: [None; TRACKER_COUNT],
             last_update_times: [Instant::now(); TRACKER_COUNT],
+            stale: [false; TRACKER_COUNT],
             last_inference_time: Instant::now(),
             interp_mode: config.interpolation.mode.clone(),
         })
@@ -331,17 +379,31 @@ fn main() -> Result<()> {
         .insert_resource(CalibrationState {
             deadline: None,
             console_flag,
+            auto_cal_triggered: false,
+            first_hip_time: None,
+            last_hip_time: None,
+            recent_hip_z: Vec::new(),
         })
         .insert_resource(FpsCounter {
             frame_count: 0,
             inference_count: 0,
             timer: Instant::now(),
-        })
-        .add_systems(Update, (
+        });
+
+    if let Some(dv) = debug_view {
+        app.insert_non_send_resource(dv)
+            .add_systems(Update, (
+                (send_frames_system, receive_results_system, triangulate_system).chain(),
+                (calibration_system, compute_trackers_system, send_vmt_system, fps_system, debug_view_system).chain(),
+            ).chain());
+    } else {
+        app.add_systems(Update, (
             (send_frames_system, receive_results_system, triangulate_system).chain(),
             (calibration_system, compute_trackers_system, send_vmt_system, fps_system).chain(),
-        ).chain())
-        .run();
+        ).chain());
+    }
+
+    app.run();
 
     println!("Shutting down...");
     Ok(())
@@ -355,6 +417,7 @@ fn send_frames_system(
     pose_state: Res<PoseState>,
 ) {
     for i in 0..cam_inputs.cameras.len() {
+        if cam_inputs.in_flight[i] { continue; }
         let fid = cam_inputs.cameras[i].frame_id();
         if fid != cam_inputs.last_frame_ids[i] {
             if let Some(frame) = cam_inputs.cameras[i].get_frame() {
@@ -366,7 +429,10 @@ fn send_frames_system(
                     height: cam_inputs.heights[i],
                 };
                 match tx.0.try_send(req) {
-                    Ok(()) => { cam_inputs.last_frame_ids[i] = fid; }
+                    Ok(()) => {
+                        cam_inputs.last_frame_ids[i] = fid;
+                        cam_inputs.in_flight[i] = true;
+                    }
                     Err(mpsc::TrySendError::Full(_)) => {}
                     Err(mpsc::TrySendError::Disconnected(_)) => {
                         eprintln!("Inference thread disconnected");
@@ -379,6 +445,7 @@ fn send_frames_system(
 
 fn receive_results_system(
     mut pose_state: ResMut<PoseState>,
+    mut cam_inputs: ResMut<CameraInputs>,
     rx: Res<InferenceRx>,
     mut fps: ResMut<FpsCounter>,
 ) {
@@ -389,6 +456,9 @@ fn receive_results_system(
             pose_state.prev_poses[idx] = Some(result.pose.clone());
             pose_state.poses_2d[idx] = Some(result.pose);
             fps.inference_count += 1;
+            if idx < cam_inputs.in_flight.len() {
+                cam_inputs.in_flight[idx] = false;
+            }
         }
     }
 }
@@ -416,7 +486,17 @@ fn triangulate_system(
         .collect();
     let cam_params: Vec<&CameraParams> = cam_inputs.params.iter().collect();
 
-    let pose_3d = triangulate_poses(&cam_params, &poses, CONFIDENCE_THRESHOLD);
+    let mut pose_3d = triangulate_poses(&cam_params, &poses, CONFIDENCE_THRESHOLD);
+
+    // 三角測量の各キーポイントの境界チェック: カメラ座標系で妥当な範囲外を除去
+    for kp in pose_3d.keypoints.iter_mut() {
+        if kp.confidence > 0.0
+            && (kp.x.abs() > 10.0 || kp.y.abs() > 10.0 || kp.z.abs() > 10.0 || kp.z < 0.0)
+        {
+            kp.confidence = 0.0;
+        }
+    }
+
     pose_state.pose_3d = Some(pose_3d);
 
     // 消費: 次の三角測量まで待機
@@ -430,9 +510,61 @@ fn calibration_system(
     mut tracker_state: ResMut<TrackerState>,
     pose_state: Res<PoseState>,
 ) {
+    // 手動キャリブレーション（コンソール入力 or SIGUSR1）
     if cal.console_flag.swap(false, Ordering::AcqRel) && cal.deadline.is_none() {
         cal.deadline = Some(Instant::now() + Duration::from_secs(5));
         println!("Calibration in 5s... 基準位置に立ってください");
+    }
+
+    // 自動キャリブレーション: 未キャリブ時、hipを3秒間安定検出したら自動発動
+    if !cal.auto_cal_triggered && !tracker_state.body_tracker.is_calibrated() && cal.deadline.is_none() {
+        use talava_tracker::pose::KeypointIndex;
+        let hip_z = pose_state.pose_3d.as_ref().and_then(|p| {
+            let lh = p.get(KeypointIndex::LeftHip);
+            let rh = p.get(KeypointIndex::RightHip);
+            if lh.is_valid(0.2) && rh.is_valid(0.2) {
+                Some((lh.z + rh.z) / 2.0)
+            } else {
+                None
+            }
+        });
+        if let Some(z) = hip_z {
+            let now = Instant::now();
+            if cal.first_hip_time.is_none() {
+                cal.first_hip_time = Some(now);
+                cal.recent_hip_z.clear();
+            }
+            cal.last_hip_time = Some(now);
+            cal.recent_hip_z.push(z);
+            if now.duration_since(cal.first_hip_time.unwrap()).as_secs_f32() > 3.0 {
+                // z値の安定性チェック: 標準偏差が0.3m未満なら安定とみなす
+                let n = cal.recent_hip_z.len() as f32;
+                let mean = cal.recent_hip_z.iter().sum::<f32>() / n;
+                let variance = cal.recent_hip_z.iter()
+                    .map(|z| (z - mean).powi(2))
+                    .sum::<f32>() / n;
+                let std_dev = variance.sqrt();
+                if std_dev < 0.3 {
+                    cal.auto_cal_triggered = true;
+                    cal.deadline = Some(now);
+                    println!("Auto-calibration triggered (hip z stable: mean={:.2}, std={:.2}, n={})",
+                        mean, std_dev, cal.recent_hip_z.len());
+                } else {
+                    println!("Auto-cal rejected: hip z unstable (mean={:.2}, std={:.2}, n={})",
+                        mean, std_dev, cal.recent_hip_z.len());
+                    cal.first_hip_time = None;
+                    cal.recent_hip_z.clear();
+                }
+            }
+        } else {
+            // hip未検出でも0.5秒以内なら蓄積を維持（no poseの散発的挿入を許容）
+            let gap = cal.last_hip_time.map_or(f32::MAX, |t| Instant::now().duration_since(t).as_secs_f32());
+            if gap > 0.5 {
+                cal.first_hip_time = None;
+                cal.last_hip_time = None;
+                cal.recent_hip_z.clear();
+            }
+        }
     }
 
     if let Some(deadline) = cal.deadline {
@@ -464,6 +596,21 @@ fn compute_trackers_system(
         None => return,
     };
 
+    // 三角測量の出力が妥当な範囲か検証（カメラから±10m以内）
+    if pose_state.multi_camera {
+        use talava_tracker::pose::KeypointIndex;
+        let lh = pose.get(KeypointIndex::LeftHip);
+        let rh = pose.get(KeypointIndex::RightHip);
+        if lh.is_valid(0.2) && rh.is_valid(0.2) {
+            let hip_x = (lh.x + rh.x) / 2.0;
+            let hip_y = (lh.y + rh.y) / 2.0;
+            let hip_z = (lh.z + rh.z) / 2.0;
+            if hip_x.abs() > 10.0 || hip_y.abs() > 10.0 || hip_z.abs() > 10.0 || hip_z < 0.0 {
+                return; // カメラ座標系で妥当な範囲外 → スキップ
+            }
+        }
+    }
+
     let body_poses = tracker_state.body_tracker.compute(pose);
     let poses = [
         body_poses.hip, body_poses.left_foot, body_poses.right_foot,
@@ -474,12 +621,16 @@ fn compute_trackers_system(
     let lerp_t = (dt / (1.0 / 30.0)).min(1.0);
 
     let now = Instant::now();
-    // 1フレームあたりの最大移動距離（VR空間単位）
-    // 人間の最大移動速度 ~5m/s × scale ~3.4 ÷ 25Hz ≈ 0.68 → 余裕を持って1.0
-    const MAX_DISPLACEMENT: f32 = 1.0;
-    // 四肢からhipまでの最大距離（VR空間単位）
-    // 安定期の実測値: 足0.7, 膝0.5-0.8, 胸0.4 → 余裕を持って1.5
-    const MAX_LIMB_DIST: f32 = 1.5;
+    // VR空間スケールに応じた閾値
+    // 単眼モード(scale~1): 1.0/1.5、複眼モード(scale~3.4): スケール比例
+    let scale_factor = if pose_state.multi_camera {
+        let cfg = &tracker_state.body_tracker;
+        cfg.max_scale()
+    } else {
+        1.0
+    };
+    let max_displacement = 1.0 * scale_factor;
+    let max_limb_dist = 1.5 * scale_factor;
 
     for i in 0..TRACKER_COUNT {
         let mut accepted = false;
@@ -490,7 +641,7 @@ fn compute_trackers_system(
                     let dx = p.position[0] - last.position[0];
                     let dy = p.position[1] - last.position[1];
                     let dz = p.position[2] - last.position[2];
-                    (dx * dx + dy * dy + dz * dz).sqrt() <= MAX_DISPLACEMENT
+                    (dx * dx + dy * dy + dz * dz).sqrt() <= max_displacement
                 }
                 None => true,
             };
@@ -500,9 +651,9 @@ fn compute_trackers_system(
                     Some(hip) => {
                         let dx = p.position[0] - hip.position[0];
                         let dy = p.position[1] - hip.position[1];
-                        (dx * dx + dy * dy).sqrt() <= MAX_LIMB_DIST
+                        (dx * dx + dy * dy).sqrt() <= max_limb_dist
                     }
-                    None => true,
+                    None => false, // hip基準がない場合は四肢を受け入れない
                 }
             } else {
                 true
@@ -513,20 +664,24 @@ fn compute_trackers_system(
                 tracker_state.lerpers[i].update(smoothed, lerp_t);
                 tracker_state.last_poses[i] = Some(smoothed);
                 tracker_state.last_update_times[i] = now;
+                tracker_state.stale[i] = false;
                 accepted = true;
             }
         }
-        // 0.3秒以上更新なし → ステールデータをクリア
-        // velocity/limb checkで拒否された場合もタイムアウトが発動し、
-        // 次の検出で参照なしからリスタートできる
-        if !accepted
-            && tracker_state.last_poses[i].is_some()
-            && now.duration_since(tracker_state.last_update_times[i]).as_secs_f32() > 0.3
-        {
-            tracker_state.last_poses[i] = None;
-            tracker_state.filters[i].reset();
-            tracker_state.extrapolators[i] = Extrapolator::new();
-            tracker_state.lerpers[i] = Lerper::new();
+        // ステールタイムアウト: 2段階
+        // Phase 1 (0.3s): 送信停止・フィルタリセット（速度参照は維持してゴースト除去）
+        // Phase 2 (3.0s): 速度参照もクリア（人が移動した場合に再検出を許可）
+        if !accepted && tracker_state.last_poses[i].is_some() {
+            let stale_time = now.duration_since(tracker_state.last_update_times[i]).as_secs_f32();
+            if stale_time > 3.0 {
+                tracker_state.last_poses[i] = None;
+                tracker_state.stale[i] = false;
+            } else if stale_time > 0.3 && !tracker_state.stale[i] {
+                tracker_state.stale[i] = true;
+                tracker_state.filters[i].reset();
+                tracker_state.extrapolators[i] = Extrapolator::new();
+                tracker_state.lerpers[i] = Lerper::new();
+            }
         }
     }
 
@@ -540,8 +695,10 @@ fn send_vmt_system(
 ) {
     if pose_state.pose_3d.is_some() {
         for i in 0..TRACKER_COUNT {
-            if let Some(ref p) = tracker_state.last_poses[i] {
-                let _ = vmt.0.send(TRACKER_INDICES[i], 1, p);
+            if !tracker_state.stale[i] {
+                if let Some(ref p) = tracker_state.last_poses[i] {
+                    let _ = vmt.0.send(TRACKER_INDICES[i], 1, p);
+                }
             }
         }
     } else {
@@ -573,6 +730,67 @@ fn send_vmt_system(
     }
 }
 
+fn debug_view_system(
+    cam_inputs: Res<CameraInputs>,
+    pose_state: Res<PoseState>,
+    mut debug_view: NonSendMut<DebugView>,
+) {
+    use opencv::imgproc;
+    use opencv::core::Size;
+    use opencv::prelude::*;
+
+    let vw = debug_view.view_w;
+    let vh = debug_view.view_h;
+    let nc = debug_view.num_cameras;
+
+    for cam_idx in 0..nc {
+        if let Some(frame) = cam_inputs.cameras[cam_idx].get_frame() {
+            // フレームをview_w x view_hにリサイズ
+            let mut resized = Mat::default();
+            let _ = imgproc::resize(&frame, &mut resized, Size::new(vw as i32, vh as i32), 0.0, 0.0, imgproc::INTER_LINEAR);
+
+            // ポーズのキーポイントを描画
+            if let Some(ref pose) = pose_state.prev_poses[cam_idx] {
+                for kp in pose.keypoints.iter() {
+                    if kp.confidence >= 0.2 {
+                        let px = (kp.x * vw as f32) as i32;
+                        let py = (kp.y * vh as f32) as i32;
+                        let _ = imgproc::circle(
+                            &mut resized,
+                            opencv::core::Point::new(px, py),
+                            3,
+                            opencv::core::Scalar::new(0.0, 255.0, 0.0, 0.0),
+                            -1, imgproc::LINE_8, 0,
+                        );
+                    }
+                }
+            }
+
+            // バッファに描画（カメラ毎にオフセット）
+            let x_offset = cam_idx * vw;
+            if let Ok(data) = resized.data_bytes() {
+                let channels = resized.channels() as usize;
+                let step = resized.mat_step().get(0) as usize;
+                let buf = &mut debug_view.renderer;
+                for y in 0..vh {
+                    for x in 0..vw {
+                        let px = y * step + x * channels;
+                        if px + 2 < data.len() {
+                            let b = data[px] as u32;
+                            let g = data[px + 1] as u32;
+                            let r = data[px + 2] as u32;
+                            let buf_idx = y * (vw * nc) + x_offset + x;
+                            buf.set_pixel_raw(buf_idx, (r << 16) | (g << 8) | b);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = debug_view.renderer.update();
+}
+
 fn fps_system(mut fps: ResMut<FpsCounter>, tracker_state: Res<TrackerState>) {
     fps.frame_count += 1;
     let elapsed = fps.timer.elapsed().as_secs_f32();
@@ -580,11 +798,13 @@ fn fps_system(mut fps: ResMut<FpsCounter>, tracker_state: Res<TrackerState>) {
         let names = ["hip", "L_foot", "R_foot", "chest", "L_knee", "R_knee"];
         let mut parts = Vec::new();
         for i in 0..TRACKER_COUNT {
-            if let Some(ref p) = tracker_state.last_poses[i] {
-                parts.push(format!(
-                    "{}({:.2},{:.2},{:.2})",
-                    names[i], p.position[0], p.position[1], p.position[2]
-                ));
+            if !tracker_state.stale[i] {
+                if let Some(ref p) = tracker_state.last_poses[i] {
+                    parts.push(format!(
+                        "{}({:.2},{:.2},{:.2})",
+                        names[i], p.position[0], p.position[1], p.position[2]
+                    ));
+                }
             }
         }
         println!(
