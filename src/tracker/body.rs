@@ -532,19 +532,27 @@ impl BodyTracker {
         let (hip_x, hip_y) = hip_center?;
         let left_shoulder = pose.get(KeypointIndex::LeftShoulder);
         let right_shoulder = pose.get(KeypointIndex::RightShoulder);
+        let ls_valid = left_shoulder.is_valid(self.confidence_threshold);
+        let rs_valid = right_shoulder.is_valid(self.confidence_threshold);
 
-        if !left_shoulder.is_valid(self.confidence_threshold)
-            || !right_shoulder.is_valid(self.confidence_threshold)
-        {
+        if !ls_valid && !rs_valid {
             return None;
         }
 
-        // 胸トラッカーのX座標は肩中点
-        let x = (left_shoulder.x + right_shoulder.x) / 2.0;
-        // Y座標: 肩中点と腰中点を内挿して胸骨付近を推定
-        // Spine03キーポイントは不安定なため、肩・腰の安定したキーポイントから計算
-        let shoulder_mid_y = (left_shoulder.y + right_shoulder.y) / 2.0;
-        let y = shoulder_mid_y + (hip_y - shoulder_mid_y) * 0.35;
+        // 肩のY座標: 片肩のみ有効な場合はその肩を使用
+        let shoulder_y = match (ls_valid, rs_valid) {
+            (true, true) => (left_shoulder.y + right_shoulder.y) / 2.0,
+            (true, false) => left_shoulder.y,
+            (false, true) => right_shoulder.y,
+            _ => unreachable!(),
+        };
+        // X座標: 両肩検出時は肩中点（傾き追従）、片肩のみはhip_x（片肩xは偏るため）
+        let x = match (ls_valid, rs_valid) {
+            (true, true) => (left_shoulder.x + right_shoulder.x) / 2.0,
+            _ => hip_x,
+        };
+        // Y座標: 肩と腰中点を内挿して胸骨付近を推定
+        let y = shoulder_y + (hip_y - shoulder_y) * 0.35;
 
         let position = self.convert_position(x, y, hip_x, hip_y, self.body_scale, pos_z, body_ratio);
 
