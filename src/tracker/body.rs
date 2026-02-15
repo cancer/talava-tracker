@@ -350,7 +350,8 @@ impl BodyTracker {
     fn keypoint_depth(&self, kp_z: f32, hip_z_raw: f32) -> f32 {
         let clamped = kp_z.clamp(hip_z_raw - 1.0, hip_z_raw + 1.0);
         let ref_z = self.calibration.as_ref().map_or(0.0, |c| c.hip_z);
-        (clamped - ref_z) * self.depth_scale
+        // カメラ座標系(z=奥)→VR座標系(z=前)の変換: 符号反転
+        (ref_z - clamped) * self.depth_scale
     }
 
     fn estimate_depth(&self, pose: &Pose) -> f32 {
@@ -363,8 +364,9 @@ impl BodyTracker {
         {
             let hip_z = (left_hip.z + right_hip.z) / 2.0;
             // キャリブレーション済みなら基準z値からの差分を使用
+            // カメラ座標系(z=奥)→VR座標系(z=前)の変換: 符号反転
             let ref_z = self.calibration.as_ref().map_or(0.0, |c| c.hip_z);
-            return (hip_z - ref_z) * self.depth_scale;
+            return (ref_z - hip_z) * self.depth_scale;
         }
 
         // フォールバック: 胴体高さ比率ベース推定
@@ -1023,9 +1025,9 @@ mod tests {
         );
         let result = tracker.compute(&closer_pose);
         let hip = result.hip.unwrap();
-        // z変化: (1.5 - 2.0) * depth_scale(1.0) = -0.5
-        assert!(hip.position[2] != 0.0,
-            "hip.z should reflect depth movement, got {}", hip.position[2]);
+        // カメラに近づく→VR前方=正のz: (2.0 - 1.5) * 1.0 = 0.5
+        assert!(hip.position[2] > 0.0,
+            "closer to camera should give positive z (forward in VR), got {}", hip.position[2]);
     }
 
     #[test]
