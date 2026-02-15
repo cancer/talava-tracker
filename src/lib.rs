@@ -1,3 +1,4 @@
+pub mod calibration;
 pub mod camera;
 pub mod config;
 pub mod pose;

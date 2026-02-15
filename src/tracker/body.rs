@@ -50,7 +50,7 @@ impl BodyTracker {
 
     pub fn new(config: &TrackerConfig, fov_v_deg: f32) -> Self {
         Self {
-            confidence_threshold: 0.1,
+            confidence_threshold: 0.2,
             scale_x: config.scale_x,
             scale_y: config.scale_y,
             body_scale: config.body_scale,
@@ -63,7 +63,40 @@ impl BodyTracker {
         }
     }
 
+    /// フレーム境界の四肢キーポイントを無効化したPoseを返す
+    /// 画像端のキーポイントはモデルの受容野が切れるため位置が不正確
+    /// 体幹（腰・肩）は画像端でもゴーストになりにくいため対象外
+    fn sanitize_pose(pose: &Pose) -> Pose {
+        use KeypointIndex::*;
+        // 四肢・肩: X/Y両方の境界チェック
+        let full_boundary: &[KeypointIndex] = &[
+            LeftShoulder, RightShoulder,
+            LeftKnee, RightKnee, LeftAnkle, RightAnkle,
+            LeftBigToe, RightBigToe, LeftSmallToe, RightSmallToe,
+            LeftHeel, RightHeel,
+        ];
+        // 腰: X方向のみ境界チェック（Y方向は下半身がフレーム外でも許容）
+        let x_only_boundary: &[KeypointIndex] = &[
+            LeftHip, RightHip,
+        ];
+        let mut sanitized = pose.clone();
+        for &idx in full_boundary {
+            let kp = &mut sanitized.keypoints[idx as usize];
+            if kp.x <= 0.02 || kp.x >= 0.98 || kp.y <= 0.02 || kp.y >= 0.98 {
+                kp.confidence = 0.0;
+            }
+        }
+        for &idx in x_only_boundary {
+            let kp = &mut sanitized.keypoints[idx as usize];
+            if kp.x <= 0.02 || kp.x >= 0.98 {
+                kp.confidence = 0.0;
+            }
+        }
+        sanitized
+    }
+
     pub fn calibrate(&mut self, pose: &Pose) -> bool {
+        let pose = &Self::sanitize_pose(pose);
         let left_hip = pose.get(KeypointIndex::LeftHip);
         let right_hip = pose.get(KeypointIndex::RightHip);
 
@@ -152,6 +185,7 @@ impl BodyTracker {
     }
 
     pub fn compute(&self, pose: &Pose) -> BodyPoses {
+        let pose = &Self::sanitize_pose(pose);
         let left_hip = pose.get(KeypointIndex::LeftHip);
         let right_hip = pose.get(KeypointIndex::RightHip);
         let hip_center = if left_hip.is_valid(self.confidence_threshold)
@@ -165,13 +199,22 @@ impl BodyTracker {
         let pos_z = self.estimate_depth(pose);
         let body_ratio = self.compute_body_ratio(pose);
 
+        let mut left_foot = self.compute_left_foot(pose, hip_center, pos_z, body_ratio);
+        let mut right_foot = self.compute_right_foot(pose, hip_center, pos_z, body_ratio);
+        let mut left_knee = self.compute_left_knee(pose, hip_center, pos_z, body_ratio);
+        let mut right_knee = self.compute_right_knee(pose, hip_center, pos_z, body_ratio);
+
+        // 左右同一位置の検出: モデルが片側のみ検出時にもう片方を複製するアーティファクト
+        Self::reject_duplicate_pair(&mut left_foot, &mut right_foot);
+        Self::reject_duplicate_pair(&mut left_knee, &mut right_knee);
+
         BodyPoses {
             hip: self.compute_hip(pose, hip_center, pos_z, body_ratio),
-            left_foot: self.compute_left_foot(pose, hip_center, pos_z, body_ratio),
-            right_foot: self.compute_right_foot(pose, hip_center, pos_z, body_ratio),
+            left_foot,
+            right_foot,
             chest: self.compute_chest(pose, hip_center, pos_z, body_ratio),
-            left_knee: self.compute_left_knee(pose, hip_center, pos_z, body_ratio),
-            right_knee: self.compute_right_knee(pose, hip_center, pos_z, body_ratio),
+            left_knee,
+            right_knee,
         }
     }
 
@@ -320,6 +363,19 @@ impl BodyTracker {
         }
     }
 
+    /// 左右の同一位置検出: 距離が0.05未満の場合、両方をNoneにする
+    fn reject_duplicate_pair(left: &mut Option<TrackerPose>, right: &mut Option<TrackerPose>) {
+        if let (Some(l), Some(r)) = (left.as_ref(), right.as_ref()) {
+            let dx = l.position[0] - r.position[0];
+            let dy = l.position[1] - r.position[1];
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist < 0.05 {
+                *left = None;
+                *right = None;
+            }
+        }
+    }
+
     fn yaw_to_quaternion(yaw: f32) -> [f32; 4] {
         let half = yaw / 2.0;
         [0.0, half.sin(), 0.0, half.cos()]
@@ -411,16 +467,12 @@ impl BodyTracker {
             return None;
         }
 
-        // X座標は肩中点
+        // 胸トラッカーのX座標は肩中点
         let x = (left_shoulder.x + right_shoulder.x) / 2.0;
-
-        // Y座標: Spine03があればそれを使用、なければ肩中点
-        let spine03 = pose.get(KeypointIndex::Spine03);
-        let y = if spine03.is_valid(self.confidence_threshold) {
-            spine03.y
-        } else {
-            (left_shoulder.y + right_shoulder.y) / 2.0
-        };
+        // Y座標: 肩中点と腰中点を内挿して胸骨付近を推定
+        // Spine03キーポイントは不安定なため、肩・腰の安定したキーポイントから計算
+        let shoulder_mid_y = (left_shoulder.y + right_shoulder.y) / 2.0;
+        let y = shoulder_mid_y + (hip_y - shoulder_mid_y) * 0.35;
 
         let position = self.convert_position(x, y, hip_x, hip_y, self.body_scale, pos_z, body_ratio);
 

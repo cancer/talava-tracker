@@ -2,17 +2,18 @@
 name = "talava-tracker"
 version = "0.1.0"
 edition = "2021"
-default-run = "tracker_sender"
+default-run = "tracker_bevy"
 
 [dependencies]
 rosc = "0.10"      # OSCプロトコル（VMT連携）
 anyhow = "1.0"     # エラーハンドリング
 ort = { version = "2.0.0-rc.9", features = ["coreml"] } # ONNX Runtime
 ndarray = "0.17"   # テンソル操作
-opencv = { version = "0.93", default-features = false, features = ["videoio", "imgproc"] }
+opencv = { version = "0.93", default-features = false, features = ["videoio", "imgproc", "imgcodecs", "aruco", "calib3d", "objdetect"] }
 minifb = "0.27"    # シンプルなウィンドウ描画
 toml = "0.9.11"
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
 bevy = { version = "0.15", default-features = false }
 nalgebra = "0.33"  # 三角測量の線形代数
 
@@ -23,3 +24,15 @@ path = "src/bin/bench_inference.rs"
 [[bin]]
 name = "tracker_bevy"
 path = "src/bin/tracker_bevy.rs"
+
+[[bin]]
+name = "calibrate"
+path = "src/bin/calibrate.rs"
+
+[[bin]]
+name = "generate_board"
+path = "src/bin/generate_board.rs"
+
+[[bin]]
+name = "camera_probe"
+path = "src/bin/camera_probe.rs"

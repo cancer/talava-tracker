@@ -8,6 +8,27 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+/// 利用可能なカメラを検出する
+///
+/// index 0から順に試し、開けなくなったら停止する。
+/// AVFoundationではindexが連続しているため、最初の失敗で打ち切り。
+pub fn detect_cameras(max_probe: i32) -> Vec<i32> {
+    let mut found = Vec::new();
+    for i in 0..max_probe {
+        match VideoCapture::new(i, VideoCaptureAPIs::CAP_AVFOUNDATION as i32) {
+            Ok(cap) => {
+                if cap.is_opened().unwrap_or(false) {
+                    found.push(i);
+                } else {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    found
+}
+
 /// OpenCVを使用したカメラキャプチャ
 pub struct OpenCvCamera {
     capture: VideoCapture,
@@ -29,7 +50,7 @@ impl OpenCvCamera {
     /// 解像度とFPSを指定してカメラを開く
     pub fn open_with_config(index: i32, width: Option<u32>, height: Option<u32>, fps: Option<u32>) -> Result<Self> {
         let mut capture =
-            VideoCapture::new(index, VideoCaptureAPIs::CAP_ANY as i32).context("Failed to open camera")?;
+            VideoCapture::new(index, VideoCaptureAPIs::CAP_AVFOUNDATION as i32).context("Failed to open camera")?;
 
         if !capture.is_opened()? {
             anyhow::bail!("Camera {} is not available", index);

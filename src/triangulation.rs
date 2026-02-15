@@ -89,6 +89,54 @@ impl CameraParams {
         let projection = k * rt;
         Self { projection }
     }
+
+    /// キャリブレーション結果から射影行列を構築
+    ///
+    /// - intrinsic: 内部パラメータ行列 K (row-major 3x3, f64)
+    /// - rvec: 回転ベクトル (Rodrigues, f64)
+    /// - tvec: 並進ベクトル (f64)
+    pub fn from_calibration(intrinsic: &[f64; 9], rvec: &[f64; 3], tvec: &[f64; 3]) -> Self {
+        // K行列 (row-major → nalgebra column-major)
+        let k = Matrix3::new(
+            intrinsic[0] as f32, intrinsic[1] as f32, intrinsic[2] as f32,
+            intrinsic[3] as f32, intrinsic[4] as f32, intrinsic[5] as f32,
+            intrinsic[6] as f32, intrinsic[7] as f32, intrinsic[8] as f32,
+        );
+
+        // Rodrigues → 回転行列
+        let theta = (rvec[0] * rvec[0] + rvec[1] * rvec[1] + rvec[2] * rvec[2]).sqrt();
+        let r = if theta < 1e-10 {
+            Matrix3::<f32>::identity()
+        } else {
+            let kx = rvec[0] / theta;
+            let ky = rvec[1] / theta;
+            let kz = rvec[2] / theta;
+            let ct = theta.cos() as f32;
+            let st = theta.sin() as f32;
+            let vt = 1.0 - ct;
+            let (kx, ky, kz) = (kx as f32, ky as f32, kz as f32);
+
+            Matrix3::new(
+                ct + kx * kx * vt,      kx * ky * vt - kz * st, kx * kz * vt + ky * st,
+                ky * kx * vt + kz * st, ct + ky * ky * vt,      ky * kz * vt - kx * st,
+                kz * kx * vt - ky * st, kz * ky * vt + kx * st, ct + kz * kz * vt,
+            )
+        };
+
+        let t = Vector3::new(tvec[0] as f32, tvec[1] as f32, tvec[2] as f32);
+
+        // P = K * [R | t]
+        let mut rt = Matrix3x4::zeros();
+        for i in 0..3 {
+            for j in 0..3 {
+                rt[(i, j)] = r[(i, j)];
+            }
+            rt[(i, 3)] = t[i];
+        }
+
+        let projection = k * rt;
+        Self { projection }
+    }
 }
 
 /// 単一3D点のDLT三角測量

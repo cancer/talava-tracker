@@ -47,20 +47,25 @@ impl MinifbRenderer {
         self.window.is_key_pressed(key, minifb::KeyRepeat::No)
     }
 
-    /// BGR Mat をバッファにコピー
+    /// BGR/BGRA Mat をバッファにコピー
     pub fn draw_frame(&mut self, frame: &Mat) -> Result<()> {
         let frame_width = frame.cols() as usize;
         let frame_height = frame.rows() as usize;
+        let channels = frame.channels() as usize;
+        let data = frame.data_bytes()?;
+        let step = frame.mat_step().get(0) as usize;
+        let copy_w = self.width.min(frame_width);
+        let copy_h = self.height.min(frame_height);
 
-        // サイズが異なる場合はリサイズが必要だが、ここではシンプルにクロップ/パディング
-        for y in 0..self.height.min(frame_height) {
-            for x in 0..self.width.min(frame_width) {
-                let pixel = frame.at_2d::<opencv::core::Vec3b>(y as i32, x as i32)?;
-                // BGR -> RGB -> u32
-                let r = pixel[2] as u32;
-                let g = pixel[1] as u32;
-                let b = pixel[0] as u32;
-                self.buffer[y * self.width + x] = (r << 16) | (g << 8) | b;
+        for y in 0..copy_h {
+            let row_start = y * step;
+            let buf_start = y * self.width;
+            for x in 0..copy_w {
+                let px = row_start + x * channels;
+                let b = data[px] as u32;
+                let g = data[px + 1] as u32;
+                let r = data[px + 2] as u32;
+                self.buffer[buf_start + x] = (r << 16) | (g << 8) | b;
             }
         }
 

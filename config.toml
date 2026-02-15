@@ -1,3 +1,5 @@
+calibration_file = "calibration.json"  # 設定するとtracker_bevyがこのファイルからカメラパラメータを読み込む
+
 # VMT設定
 [vmt]
 addr = "192.168.10.35:39570"
@@ -43,7 +45,7 @@ view = false
 # アプリ設定
 [app]
 target_fps = 90
-model = "rtmw3d"  # "movenet" | "spinepose_small" | "spinepose_medium" | "rtmw3d"
+model = "spinepose_medium"  # "movenet" | "spinepose_small" | "spinepose_medium" | "rtmw3d"
 detector = "keypoint"  # "keypoint" | "yolo" | "none"
 
 # One Euro Filter設定
@@ -57,3 +59,13 @@ rotation_beta = 0.01
 # 補間設定 (none / extrapolate / lerp)
 [interpolation]
 mode = "extrapolate"
+
+# キャリブレーション設定
+[calibration]
+dictionary = "DICT_4X4_50"
+squares_x = 5
+squares_y = 4
+square_length = 0.035  # マス辺長（メートル）。印刷したボードの実寸に合わせる
+marker_length = 0.025  # マーカー辺長（メートル）
+output_path = "calibration.json"
+intrinsic_frames = 15  # 内部パラメータ用キャプチャ枚数
