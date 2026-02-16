@@ -22,8 +22,6 @@ struct Calibration {
     yaw_left_foot: f32,
     yaw_right_foot: f32,
     // 腰からの相対オフセット（画像座標）
-    left_ankle_offset: Option<(f32, f32)>,
-    right_ankle_offset: Option<(f32, f32)>,
     left_knee_offset: Option<(f32, f32)>,
     right_knee_offset: Option<(f32, f32)>,
     yaw_left_knee: f32,
@@ -144,19 +142,6 @@ impl BodyTracker {
         let yaw_right_foot =
             self.compute_foot_yaw(pose, KeypointIndex::RightKnee, KeypointIndex::RightAnkle);
 
-        let left_ankle = pose.get(KeypointIndex::LeftAnkle);
-        let left_ankle_offset = if left_ankle.is_valid(self.confidence_threshold) {
-            Some((left_ankle.x - hip_x, left_ankle.y - hip_y))
-        } else {
-            None
-        };
-        let right_ankle = pose.get(KeypointIndex::RightAnkle);
-        let right_ankle_offset = if right_ankle.is_valid(self.confidence_threshold) {
-            Some((right_ankle.x - hip_x, right_ankle.y - hip_y))
-        } else {
-            None
-        };
-
         let left_knee = pose.get(KeypointIndex::LeftKnee);
         let left_knee_offset = if left_knee.is_valid(self.confidence_threshold) {
             Some((left_knee.x - hip_x, left_knee.y - hip_y))
@@ -184,8 +169,6 @@ impl BodyTracker {
             yaw_shoulder,
             yaw_left_foot,
             yaw_right_foot,
-            left_ankle_offset,
-            right_ankle_offset,
             left_knee_offset,
             right_knee_offset,
             yaw_left_knee,
@@ -471,23 +454,22 @@ impl BodyTracker {
         let knee = pose.get(KeypointIndex::LeftKnee);
         let ankle = pose.get(KeypointIndex::LeftAnkle);
 
-        let (ax, ay, has_keypoints) = if knee.is_valid(self.confidence_threshold)
-            && ankle.is_valid(self.confidence_threshold)
-        {
-            (ankle.x, ankle.y, true)
-        } else if let Some(cal) = &self.calibration {
-            if let Some((ox, oy)) = cal.left_ankle_offset {
-                (hip_x + ox, hip_y + oy, false)
-            } else {
-                return None;
-            }
+        let ankle_valid = ankle.is_valid(self.confidence_threshold);
+        let knee_valid = knee.is_valid(self.confidence_threshold);
+
+        // 足の位置: ankle優先、未検出時はknee代用、両方なしはNone
+        let (ax, ay) = if ankle_valid {
+            (ankle.x, ankle.y)
+        } else if knee_valid {
+            (knee.x, knee.y)
         } else {
             return None;
         };
 
         let position = self.convert_position(ax, ay, hip_x, hip_y, self.leg_scale, pos_z, body_ratio);
 
-        let yaw = if has_keypoints {
+        // yaw: knee+ankle両方有効な場合のみ計算、それ以外は0
+        let yaw = if knee_valid && ankle_valid {
             let ref_yaw = self.calibration.as_ref().map_or(0.0, |c| c.yaw_left_foot);
             self.compute_foot_yaw(pose, KeypointIndex::LeftKnee, KeypointIndex::LeftAnkle) - ref_yaw
         } else {
@@ -503,23 +485,22 @@ impl BodyTracker {
         let knee = pose.get(KeypointIndex::RightKnee);
         let ankle = pose.get(KeypointIndex::RightAnkle);
 
-        let (ax, ay, has_keypoints) = if knee.is_valid(self.confidence_threshold)
-            && ankle.is_valid(self.confidence_threshold)
-        {
-            (ankle.x, ankle.y, true)
-        } else if let Some(cal) = &self.calibration {
-            if let Some((ox, oy)) = cal.right_ankle_offset {
-                (hip_x + ox, hip_y + oy, false)
-            } else {
-                return None;
-            }
+        let ankle_valid = ankle.is_valid(self.confidence_threshold);
+        let knee_valid = knee.is_valid(self.confidence_threshold);
+
+        // 足の位置: ankle優先、未検出時はknee代用、両方なしはNone
+        let (ax, ay) = if ankle_valid {
+            (ankle.x, ankle.y)
+        } else if knee_valid {
+            (knee.x, knee.y)
         } else {
             return None;
         };
 
         let position = self.convert_position(ax, ay, hip_x, hip_y, self.leg_scale, pos_z, body_ratio);
 
-        let yaw = if has_keypoints {
+        // yaw: knee+ankle両方有効な場合のみ計算、それ以外は0
+        let yaw = if knee_valid && ankle_valid {
             let ref_yaw = self.calibration.as_ref().map_or(0.0, |c| c.yaw_right_foot);
             self.compute_foot_yaw(pose, KeypointIndex::RightKnee, KeypointIndex::RightAnkle) - ref_yaw
         } else {
