@@ -51,6 +51,9 @@ pub struct TrackerConfig {
     pub mirror_x: bool,
     #[serde(default = "default_offset_y")]
     pub offset_y: f32,
+    /// 足トラッカーのY方向オフセット（メートル）。負値で足を下げる
+    #[serde(default)]
+    pub foot_y_offset: f32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -254,6 +257,7 @@ impl Default for TrackerConfig {
             depth_scale: default_depth_scale(),
             mirror_x: false,
             offset_y: default_offset_y(),
+            foot_y_offset: 0.0,
         }
     }
 }

@@ -15,7 +15,8 @@ use talava_tracker::camera::ThreadedCamera;
 use talava_tracker::config::Config;
 use talava_tracker::pose::{
     bbox_from_keypoints, crop_for_pose, preprocess_for_movenet, preprocess_for_spinepose,
-    preprocess_for_rtmw3d, remap_pose, CropRegion, ModelType, PersonDetector, PoseDetector, Pose,
+    preprocess_for_rtmw3d, remap_pose, unletterbox_pose, CropRegion, LetterboxInfo, ModelType,
+    PersonDetector, PoseDetector, Pose,
 };
 use talava_tracker::render::MinifbRenderer;
 use talava_tracker::tracker::{BodyTracker, Extrapolator, Lerper, PoseFilter};
@@ -77,6 +78,7 @@ struct TrackerState {
     last_poses: [Option<TrackerPose>; TRACKER_COUNT],
     last_update_times: [Instant; TRACKER_COUNT],
     stale: [bool; TRACKER_COUNT],
+    reject_count: [u32; TRACKER_COUNT], // velocity_ok連続拒否回数
     last_inference_time: Instant,
     interp_mode: String,
 }
@@ -169,13 +171,10 @@ fn main() -> Result<()> {
                     )?;
                     let (w, h) = cam.resolution();
                     log!(logfile, "Camera {}: {}x{}", cam_cal.camera_index, w, h);
-                    let dc: [f64; 5] = [
-                        cam_cal.dist_coeffs.get(0).copied().unwrap_or(0.0),
-                        cam_cal.dist_coeffs.get(1).copied().unwrap_or(0.0),
-                        cam_cal.dist_coeffs.get(2).copied().unwrap_or(0.0),
-                        cam_cal.dist_coeffs.get(3).copied().unwrap_or(0.0),
-                        cam_cal.dist_coeffs.get(4).copied().unwrap_or(0.0),
-                    ];
+                    // 歪み係数は無効化: キャリブレーションの歪み係数が異常に大きい場合
+                    // (k2=-100等)、undistort_point()が収束せずリプロジェクション比較が破綻する。
+                    // 歪み補正なしでも内部/外部パラメータによる三角測量は機能する。
+                    let dc: [f64; 5] = [0.0; 5];
                     params.push(CameraParams::from_calibration(
                         &cam_cal.intrinsic_matrix,
                         &dc,
@@ -184,6 +183,17 @@ fn main() -> Result<()> {
                         cam_cal.width,
                         cam_cal.height,
                     ));
+                    // 実際の解像度がキャリブレーション解像度と異なる場合、
+                    // 内部パラメータをリスケール
+                    if w != cam_cal.width || h != cam_cal.height {
+                        let last = params.last_mut().unwrap();
+                        if last.rescale_to(w, h) {
+                            log!(logfile, "  -> Rescaled intrinsics: {}x{} -> {}x{}", cam_cal.width, cam_cal.height, w, h);
+                        } else {
+                            log!(logfile, "  WARNING: Aspect ratio mismatch! cal={}x{} actual={}x{}. Triangulation may be inaccurate.",
+                                cam_cal.width, cam_cal.height, w, h);
+                        }
+                    }
                     widths.push(w);
                     heights.push(h);
                     cameras.push(cam);
@@ -298,14 +308,25 @@ fn main() -> Result<()> {
             };
 
             // 前処理
-            let input = match model_type {
-                ModelType::MoveNet => preprocess_for_movenet(&input_frame),
-                ModelType::SpinePose => preprocess_for_spinepose(&input_frame),
-                ModelType::RTMW3D => preprocess_for_rtmw3d(&input_frame),
-            };
-            let input = match input {
-                Ok(v) => v,
-                Err(e) => { log!(logfile_infer, "preprocess error: {}", e); continue; }
+            let (input, letterbox) = match model_type {
+                ModelType::MoveNet => {
+                    match preprocess_for_movenet(&input_frame) {
+                        Ok(v) => (v, LetterboxInfo::identity()),
+                        Err(e) => { log!(logfile_infer, "preprocess error: {}", e); continue; }
+                    }
+                }
+                ModelType::SpinePose => {
+                    match preprocess_for_spinepose(&input_frame) {
+                        Ok(v) => v,
+                        Err(e) => { log!(logfile_infer, "preprocess error: {}", e); continue; }
+                    }
+                }
+                ModelType::RTMW3D => {
+                    match preprocess_for_rtmw3d(&input_frame) {
+                        Ok(v) => v,
+                        Err(e) => { log!(logfile_infer, "preprocess error: {}", e); continue; }
+                    }
+                }
             };
 
             // 推論
@@ -313,6 +334,9 @@ fn main() -> Result<()> {
                 Ok(v) => v,
                 Err(e) => { log!(logfile_infer, "inference error: {}", e); continue; }
             };
+
+            // レターボックス座標を元の画像座標に変換
+            pose = unletterbox_pose(&pose, &letterbox);
 
             if !crop_region.is_full() {
                 pose = remap_pose(&pose, &crop_region);
@@ -406,6 +430,7 @@ fn main() -> Result<()> {
             last_poses: [None; TRACKER_COUNT],
             last_update_times: [Instant::now(); TRACKER_COUNT],
             stale: [false; TRACKER_COUNT],
+            reject_count: [0; TRACKER_COUNT],
             last_inference_time: Instant::now(),
             interp_mode: config.interpolation.mode.clone(),
         })
@@ -664,13 +689,15 @@ fn compute_trackers_system(
     } else {
         1.0
     };
-    let max_displacement = 1.0 * scale_factor;
+    let max_displacement = 0.4 * scale_factor;
     let max_limb_dist = 1.5 * scale_factor;
 
     for i in 0..TRACKER_COUNT {
         let mut accepted = false;
         if let Some(p) = poses[i] {
             // 速度ベースの外れ値除去: 前フレームから離れすぎた検出はスキップ
+            // ただし連続5回拒否（≈0.2s）されたらlast_posesをクリアして受け入れ
+            // （正当な急速移動が速度チェックで引っかかった場合の復帰用）
             let velocity_ok = match tracker_state.last_poses[i].as_ref() {
                 Some(last) => {
                     let dx = p.position[0] - last.position[0];
@@ -686,7 +713,14 @@ fn compute_trackers_system(
                     Some(hip) => {
                         let dx = p.position[0] - hip.position[0];
                         let dy = p.position[1] - hip.position[1];
-                        (dx * dx + dy * dy).sqrt() <= max_limb_dist
+                        let dz = p.position[2] - hip.position[2];
+                        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+                        // 解剖学的制約: 足・膝はhipより下(y < hip.y)
+                        let anatomy_ok = match i {
+                            1 | 2 | 4 | 5 => p.position[1] < hip.position[1],
+                            _ => true,
+                        };
+                        dist <= max_limb_dist && anatomy_ok
                     }
                     None => false, // hip基準がない場合は四肢を受け入れない
                 }
@@ -700,7 +734,26 @@ fn compute_trackers_system(
                 tracker_state.last_poses[i] = Some(smoothed);
                 tracker_state.last_update_times[i] = now;
                 tracker_state.stale[i] = false;
+                tracker_state.reject_count[i] = 0;
                 accepted = true;
+            } else if !velocity_ok && limb_ok {
+                // velocity_ok失敗: 連続拒否をカウント
+                tracker_state.reject_count[i] += 1;
+                if tracker_state.reject_count[i] >= 5 {
+                    // 連続5回拒否 → 正当な急速移動と判断
+                    // フィルタリセットして新位置を受け入れ
+                    tracker_state.filters[i].reset();
+                    tracker_state.extrapolators[i] = Extrapolator::new();
+                    tracker_state.lerpers[i] = Lerper::new();
+                    let smoothed = tracker_state.filters[i].apply(p);
+                    tracker_state.extrapolators[i].update(smoothed);
+                    tracker_state.lerpers[i].update(smoothed, lerp_t);
+                    tracker_state.last_poses[i] = Some(smoothed);
+                    tracker_state.last_update_times[i] = now;
+                    tracker_state.stale[i] = false;
+                    tracker_state.reject_count[i] = 0;
+                    accepted = true;
+                }
             }
         }
         // ステールタイムアウト: 2段階
@@ -826,7 +879,7 @@ fn debug_view_system(
     let _ = debug_view.renderer.update();
 }
 
-fn fps_system(mut fps: ResMut<FpsCounter>, tracker_state: Res<TrackerState>, lf: Res<LogFileRes>) {
+fn fps_system(mut fps: ResMut<FpsCounter>, tracker_state: Res<TrackerState>, pose_state: Res<PoseState>, lf: Res<LogFileRes>) {
     fps.frame_count += 1;
     let elapsed = fps.timer.elapsed().as_secs_f32();
     if elapsed >= 1.0 {
@@ -842,11 +895,29 @@ fn fps_system(mut fps: ResMut<FpsCounter>, tracker_state: Res<TrackerState>, lf:
                 }
             }
         }
+        // 各カメラの下半身キーポイントconfidence（消失原因の診断用）
+        use talava_tracker::pose::KeypointIndex;
+        let diag_kps = [
+            ("LA", KeypointIndex::LeftAnkle),
+            ("RA", KeypointIndex::RightAnkle),
+            ("LK", KeypointIndex::LeftKnee),
+            ("RK", KeypointIndex::RightKnee),
+        ];
+        let mut cam_diag = String::new();
+        for (cam_idx, prev) in pose_state.prev_poses.iter().enumerate() {
+            if let Some(ref p) = prev {
+                let confs: Vec<String> = diag_kps.iter().map(|(name, idx)| {
+                    format!("{}={:.2}", name, p.get(*idx).confidence)
+                }).collect();
+                cam_diag.push_str(&format!(" cam{}[{}]", cam_idx, confs.join(",")));
+            }
+        }
         log!(lf.0,
-            "FPS: {:.1} (infer: {}) | {}",
+            "FPS: {:.1} (infer: {}) | {}{}",
             fps.frame_count as f32 / elapsed,
             fps.inference_count,
             if parts.is_empty() { "no pose".to_string() } else { parts.join(" ") },
+            cam_diag,
         );
         fps.frame_count = 0;
         fps.inference_count = 0;

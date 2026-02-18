@@ -8,11 +8,12 @@ addr = "192.168.10.35:39570"
 [tracker]
 scale_x = 3.0
 scale_y = 3.4
-body_scale = 3.0
-leg_scale = 2.2
+body_scale = 0.8
+leg_scale = 0.55
 depth_scale = 3.0
 mirror_x = false
-offset_y = 1.2
+offset_y = 1.1
+foot_y_offset = -0.15  # 足トラッカーのY方向オフセット（メートル）。負値で足を下げる
 
 # カメラ設定 (tracker_sender用、単一カメラ)
 [camera]
@@ -52,7 +53,7 @@ detector = "keypoint"  # "keypoint" | "yolo" | "none"
 # min_cutoff: 低い=ジッタ少ない(静止時安定), beta: 高い=速い動きに追従
 [filter]
 position_min_cutoff = 1.5
-position_beta = 0.01
+position_beta = 0.3
 rotation_min_cutoff = 1.0
 rotation_beta = 0.01
 

@@ -26,6 +26,8 @@ struct Calibration {
     right_knee_offset: Option<(f32, f32)>,
     yaw_left_knee: f32,
     yaw_right_knee: f32,
+    pitch_left_knee: f32,
+    pitch_right_knee: f32,
 }
 
 pub struct BodyTracker {
@@ -37,6 +39,7 @@ pub struct BodyTracker {
     depth_scale: f32,
     mirror_x: bool,
     offset_y: f32,
+    foot_y_offset: f32,
     fov_v_rad: f32,
     world_coords: bool, // 三角測量モード: キーポイントがワールド座標（メートル）
     calibration: Option<Calibration>,
@@ -63,6 +66,7 @@ impl BodyTracker {
             depth_scale,
             mirror_x: config.mirror_x,
             offset_y: config.offset_y,
+            foot_y_offset: config.foot_y_offset,
             fov_v_rad: fov_v_deg.to_radians(),
             world_coords,
             calibration: None,
@@ -159,6 +163,10 @@ impl BodyTracker {
             self.compute_knee_yaw(pose, KeypointIndex::LeftHip, KeypointIndex::LeftKnee);
         let yaw_right_knee =
             self.compute_knee_yaw(pose, KeypointIndex::RightHip, KeypointIndex::RightKnee);
+        let pitch_left_knee =
+            self.compute_knee_pitch(pose, KeypointIndex::LeftKnee, KeypointIndex::LeftAnkle);
+        let pitch_right_knee =
+            self.compute_knee_pitch(pose, KeypointIndex::RightKnee, KeypointIndex::RightAnkle);
 
         self.calibration = Some(Calibration {
             hip_x,
@@ -173,6 +181,8 @@ impl BodyTracker {
             right_knee_offset,
             yaw_left_knee,
             yaw_right_knee,
+            pitch_left_knee,
+            pitch_right_knee,
         });
         true
     }
@@ -211,30 +221,16 @@ impl BodyTracker {
         let hip_z = self.estimate_depth(pose);
         let body_ratio = if self.world_coords { 1.0 } else { self.compute_body_ratio(pose) };
 
-        // world_coordsモード: 各キーポイントの三角測量z座標を使用（hip z ±1mにクランプ）
-        // 単眼モード: 全トラッカーにhip推定深度を使用
+        // Per-keypoint z: world_coordsモードでは各キーポイントの三角測量z値を使用
+        // 三角測量で同一カメラペア（hip基準）が強制されるため、z値の一貫性が保証される
+        // 非world_coordsモードではhip推定深度を全部位に使用（2Dポーズにはz情報なし）
         let (lf_z, rf_z, ch_z, lk_z, rk_z) = if self.world_coords {
-            let ct = self.confidence_threshold;
-            // クランプ用にhipの生z値を取得
-            let hip_z_raw = {
-                let lh = pose.get(KeypointIndex::LeftHip);
-                let rh = pose.get(KeypointIndex::RightHip);
-                (lh.z + rh.z) / 2.0
-            };
-            let la = pose.get(KeypointIndex::LeftAnkle);
-            let ra = pose.get(KeypointIndex::RightAnkle);
-            let ls = pose.get(KeypointIndex::LeftShoulder);
-            let rs = pose.get(KeypointIndex::RightShoulder);
-            let lk = pose.get(KeypointIndex::LeftKnee);
-            let rk = pose.get(KeypointIndex::RightKnee);
             (
-                if la.is_valid(ct) { self.keypoint_depth(la.z, hip_z_raw) } else { hip_z },
-                if ra.is_valid(ct) { self.keypoint_depth(ra.z, hip_z_raw) } else { hip_z },
-                if ls.is_valid(ct) && rs.is_valid(ct) {
-                    self.keypoint_depth((ls.z + rs.z) / 2.0, hip_z_raw)
-                } else { hip_z },
-                if lk.is_valid(ct) { self.keypoint_depth(lk.z, hip_z_raw) } else { hip_z },
-                if rk.is_valid(ct) { self.keypoint_depth(rk.z, hip_z_raw) } else { hip_z },
+                self.keypoint_depth(pose, KeypointIndex::LeftAnkle, hip_z),
+                self.keypoint_depth(pose, KeypointIndex::RightAnkle, hip_z),
+                hip_z, // 胸は肩-腰間の内挿位置、直接のキーポイントなし
+                self.keypoint_depth(pose, KeypointIndex::LeftKnee, hip_z),
+                self.keypoint_depth(pose, KeypointIndex::RightKnee, hip_z),
             )
         } else {
             (hip_z, hip_z, hip_z, hip_z, hip_z)
@@ -327,16 +323,6 @@ impl BodyTracker {
         Some((hip_y - shoulder_y).abs())
     }
 
-    /// 奥行きを推定
-    /// 3Dモデルのz座標がある場合はそれを使用、なければ胴体高さ比率から推定
-    /// 単一キーポイントのzをVR深度に変換（hip_z_rawの±1m以内にクランプ）
-    fn keypoint_depth(&self, kp_z: f32, hip_z_raw: f32) -> f32 {
-        let clamped = kp_z.clamp(hip_z_raw - 1.0, hip_z_raw + 1.0);
-        let ref_z = self.calibration.as_ref().map_or(0.0, |c| c.hip_z);
-        // カメラ座標系(z=奥)→VR座標系(z=前)の変換: 符号反転
-        (ref_z - clamped) * self.depth_scale
-    }
-
     fn estimate_depth(&self, pose: &Pose) -> f32 {
         // 3Dモデルのz座標がある場合
         let left_hip = pose.get(KeypointIndex::LeftHip);
@@ -364,6 +350,19 @@ impl BodyTracker {
         };
 
         (1.0 - cal.torso_height / current) * self.depth_scale
+    }
+
+    /// 個別キーポイントの奥行き（VR z座標）
+    /// 三角測量のz値からキャリブレーション基準z値を引いてVR座標に変換
+    /// キーポイントが無効な場合はfallback（通常はhip_z）を返す
+    fn keypoint_depth(&self, pose: &Pose, kp_idx: KeypointIndex, fallback: f32) -> f32 {
+        let kp = pose.get(kp_idx);
+        if kp.is_valid(self.confidence_threshold) && kp.z.abs() > 0.001 {
+            let ref_z = self.calibration.as_ref().map_or(0.0, |c| c.hip_z);
+            (ref_z - kp.z) * self.depth_scale
+        } else {
+            fallback
+        }
     }
 
     /// 奥行き変化による見かけの体型変化を補正する比率
@@ -438,6 +437,19 @@ impl BodyTracker {
         [0.0, half.sin(), 0.0, half.cos()]
     }
 
+    /// yaw(Y軸回転) + pitch(X軸回転) から quaternion を生成
+    /// q = q_yaw * q_pitch
+    fn yaw_pitch_to_quaternion(yaw: f32, pitch: f32) -> [f32; 4] {
+        let (sy, cy) = (yaw / 2.0).sin_cos();
+        let (sp, cp) = (pitch / 2.0).sin_cos();
+        [
+            cy * sp,       // x
+            sy * cp,       // y
+            -sy * sp,      // z
+            cy * cp,       // w
+        ]
+    }
+
     fn compute_hip(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32, body_ratio: f32) -> Option<TrackerPose> {
         let (hip_x, hip_y) = hip_center?;
         let position = self.convert_position(hip_x, hip_y, hip_x, hip_y, self.body_scale, pos_z, body_ratio);
@@ -466,7 +478,8 @@ impl BodyTracker {
             return None;
         };
 
-        let position = self.convert_position(ax, ay, hip_x, hip_y, self.leg_scale, pos_z, body_ratio);
+        let mut position = self.convert_position(ax, ay, hip_x, hip_y, self.leg_scale, pos_z, body_ratio);
+        position[1] += self.foot_y_offset;
 
         // yaw: knee+ankle両方有効な場合のみ計算、それ以外は0
         let yaw = if knee_valid && ankle_valid {
@@ -497,7 +510,8 @@ impl BodyTracker {
             return None;
         };
 
-        let position = self.convert_position(ax, ay, hip_x, hip_y, self.leg_scale, pos_z, body_ratio);
+        let mut position = self.convert_position(ax, ay, hip_x, hip_y, self.leg_scale, pos_z, body_ratio);
+        position[1] += self.foot_y_offset;
 
         // yaw: knee+ankle両方有効な場合のみ計算、それ以外は0
         let yaw = if knee_valid && ankle_valid {
@@ -546,6 +560,13 @@ impl BodyTracker {
         Some(TrackerPose::new(position, rotation))
     }
 
+    /// 膝のpitch: 膝→足首ベクトルの鉛直方向からの傾き
+    /// 現在はz値が歪み補正なしで不正確なため無効化（常に0を返す）
+    /// TODO: カメラキャリブレーションのdist_coeffs問題を解決後に再有効化
+    fn compute_knee_pitch(&self, _pose: &Pose, _knee_idx: KeypointIndex, _ankle_idx: KeypointIndex) -> f32 {
+        0.0
+    }
+
     /// 膝のyaw: 腰→膝方向
     fn compute_knee_yaw(&self, pose: &Pose, hip_idx: KeypointIndex, knee_idx: KeypointIndex) -> f32 {
         let hip = pose.get(hip_idx);
@@ -585,7 +606,13 @@ impl BodyTracker {
         } else {
             0.0
         };
-        let rotation = Self::yaw_to_quaternion(yaw);
+        let pitch = if has_keypoint {
+            let ref_pitch = self.calibration.as_ref().map_or(0.0, |c| c.pitch_left_knee);
+            self.compute_knee_pitch(pose, KeypointIndex::LeftKnee, KeypointIndex::LeftAnkle) - ref_pitch
+        } else {
+            0.0
+        };
+        let rotation = Self::yaw_pitch_to_quaternion(yaw, pitch);
 
         Some(TrackerPose::new(position, rotation))
     }
@@ -614,7 +641,13 @@ impl BodyTracker {
         } else {
             0.0
         };
-        let rotation = Self::yaw_to_quaternion(yaw);
+        let pitch = if has_keypoint {
+            let ref_pitch = self.calibration.as_ref().map_or(0.0, |c| c.pitch_right_knee);
+            self.compute_knee_pitch(pose, KeypointIndex::RightKnee, KeypointIndex::RightAnkle) - ref_pitch
+        } else {
+            0.0
+        };
+        let rotation = Self::yaw_pitch_to_quaternion(yaw, pitch);
 
         Some(TrackerPose::new(position, rotation))
     }
@@ -1034,4 +1067,5 @@ mod tests {
         assert!(squat_hip_y < cal_hip_y,
             "squat hip.y({:.3}) should be lower than standing({:.3})", squat_hip_y, cal_hip_y);
     }
+
 }
