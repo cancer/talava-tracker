@@ -26,9 +26,13 @@ fn main() {
         let prop_fmt = cap.get(videoio::CAP_PROP_FORMAT).unwrap_or(-1.0);
         let prop_mode = cap.get(videoio::CAP_PROP_MODE).unwrap_or(-1.0);
         let backend = cap.get_backend_name().unwrap_or_default();
+        let zoom = cap.get(videoio::CAP_PROP_ZOOM).unwrap_or(-1.0);
+        let focus = cap.get(videoio::CAP_PROP_FOCUS).unwrap_or(-1.0);
+        let autofocus = cap.get(videoio::CAP_PROP_AUTOFOCUS).unwrap_or(-1.0);
 
         println!("prop: {}x{} fps={} fmt={} mode={} backend={}",
             prop_w, prop_h, prop_fps, prop_fmt, prop_mode, backend);
+        println!("       zoom={} focus={} autofocus={}", zoom, focus, autofocus);
 
         // フレーム読み取り
         thread::sleep(Duration::from_millis(500));

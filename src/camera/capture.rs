@@ -4,7 +4,7 @@ use opencv::{
     prelude::*,
     videoio::{self, VideoCapture, VideoCaptureAPIs, VideoCaptureTrait},
 };
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -104,9 +104,19 @@ impl OpenCvCamera {
 pub struct ThreadedCamera {
     latest: Arc<Mutex<Option<Mat>>>,
     frame_id: Arc<AtomicU64>,
+    running: Arc<AtomicBool>,
     width: u32,
     height: u32,
-    _handle: thread::JoinHandle<()>,
+    _handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for ThreadedCamera {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
+        if let Some(handle) = self._handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl ThreadedCamera {
@@ -117,9 +127,11 @@ impl ThreadedCamera {
         let latest_ref = latest.clone();
         let frame_id = Arc::new(AtomicU64::new(0));
         let frame_id_ref = frame_id.clone();
+        let running = Arc::new(AtomicBool::new(true));
+        let running_ref = running.clone();
 
         let handle = thread::spawn(move || {
-            loop {
+            while running_ref.load(Ordering::Acquire) {
                 match camera.read_frame() {
                     Ok(frame) => {
                         *latest_ref.lock().unwrap() = Some(frame);
@@ -133,9 +145,10 @@ impl ThreadedCamera {
         Ok(Self {
             latest,
             frame_id,
+            running,
             width: w,
             height: h,
-            _handle: handle,
+            _handle: Some(handle),
         })
     }
 

@@ -12,3 +12,4 @@ pub use person_detector::PersonDetector;
 pub use preprocess::preprocess_for_movenet;
 pub use preprocess::preprocess_for_rtmw3d;
 pub use preprocess::preprocess_for_spinepose;
+pub use preprocess::{unletterbox_pose, LetterboxInfo};
