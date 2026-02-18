@@ -94,9 +94,23 @@ pub fn create_board(config: &CalibrationConfig) -> Result<CharucoBoard> {
         .context("Failed to create CharucoBoard")
 }
 
-/// ChArUcoDetectorを作成
+/// ChArUcoDetectorを作成（広角・斜め検出対応）
 pub fn create_detector(board: &CharucoBoard) -> Result<CharucoDetector> {
-    CharucoDetector::new_def(board).context("Failed to create CharucoDetector")
+    use objdetect::{CharucoParameters, DetectorParameters, DetectorParametersTrait, RefineParameters};
+
+    let mut det_params = DetectorParameters::default()?;
+    // 歪んだ四角形をより寛容に受け入れる（デフォルト0.03）
+    det_params.set_polygonal_approx_accuracy_rate(0.08);
+    // パースペクティブ補正の解像度を上げる（デフォルト4）
+    det_params.set_perspective_remove_pixel_per_cell(8);
+    // 適応的閾値の探索範囲を広げる（デフォルト max=23）
+    det_params.set_adaptive_thresh_win_size_max(53);
+
+    let charuco_params = CharucoParameters::default()?;
+    let refine_params = RefineParameters::new(10.0, 3.0, true)?;
+
+    CharucoDetector::new(board, &charuco_params, &det_params, refine_params)
+        .context("Failed to create CharucoDetector")
 }
 
 // --- 内部パラメータキャリブレーション ---

@@ -49,17 +49,22 @@ impl MinifbRenderer {
 
     /// BGR/BGRA Mat をバッファにコピー
     pub fn draw_frame(&mut self, frame: &Mat) -> Result<()> {
+        self.draw_frame_at(frame, 0, 0)
+    }
+
+    /// BGR/BGRA Mat をバッファの指定オフセットにコピー
+    pub fn draw_frame_at(&mut self, frame: &Mat, x_offset: usize, y_offset: usize) -> Result<()> {
         let frame_width = frame.cols() as usize;
         let frame_height = frame.rows() as usize;
         let channels = frame.channels() as usize;
         let data = frame.data_bytes()?;
         let step = frame.mat_step().get(0) as usize;
-        let copy_w = self.width.min(frame_width);
-        let copy_h = self.height.min(frame_height);
+        let copy_w = if x_offset < self.width { (self.width - x_offset).min(frame_width) } else { 0 };
+        let copy_h = if y_offset < self.height { (self.height - y_offset).min(frame_height) } else { 0 };
 
         for y in 0..copy_h {
             let row_start = y * step;
-            let buf_start = y * self.width;
+            let buf_start = (y + y_offset) * self.width + x_offset;
             for x in 0..copy_w {
                 let px = row_start + x * channels;
                 let b = data[px] as u32;

@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use minifb::Key;
 use opencv::core::{Mat, Size, Scalar};
-use opencv::prelude::*;
+use opencv::{calib3d, prelude::*};
 use std::time::Instant;
 
 use talava_tracker::calibration::{
@@ -298,24 +298,44 @@ fn main() -> Result<()> {
         println!("  [Q] 中止");
         println!();
 
-        // 全カメラを開く + ウィンドウ作成
+        // 全カメラを開く + 1ウィンドウにタイル表示
         let mut cameras: Vec<ThreadedCamera> = Vec::new();
-        let mut renderers: Vec<MinifbRenderer> = Vec::new();
+        let mut cam_sizes: Vec<(usize, usize)> = Vec::new();
         for &cam_id in &camera_indices {
             let cam = ThreadedCamera::start(cam_id, None, None)?;
             let (w, h) = cam.resolution();
-            renderers.push(MinifbRenderer::new(
-                &format!("Camera {}", cam_id),
-                w as usize,
-                h as usize,
-            )?);
+            cam_sizes.push((w as usize, h as usize));
             cameras.push(cam);
         }
+
+        // タイルレイアウト: 合計幅1280px以内に収める
+        let cols = if num_cameras <= 3 { num_cameras } else { 2 };
+        let rows = (num_cameras + cols - 1) / cols;
+        let max_window_w: usize = 1280;
+        let raw_w = cam_sizes[0].0 * cols;
+        let scale = if raw_w > max_window_w {
+            max_window_w as f64 / raw_w as f64
+        } else {
+            1.0
+        };
+        let tile_w = (cam_sizes[0].0 as f64 * scale) as usize;
+        let tile_h = (cam_sizes[0].1 as f64 * scale) as usize;
+        let combined_w = tile_w * cols;
+        let combined_h = tile_h * rows;
+
+        let mut renderer = MinifbRenderer::new(
+            "Calibrate - All Cameras",
+            combined_w,
+            combined_h,
+        )?;
+
+        // 歪み補正済み画像で検出するため、solvePnPには歪み=0を渡す
+        let zero_dist = Mat::zeros(5, 1, opencv::core::CV_64F)?.to_mat()?;
 
         let mut extrinsic_done = false;
         let mut all_poses: Vec<(Mat, Mat)> = Vec::new();
 
-        while !extrinsic_done && renderers.iter().all(|r| r.is_open()) {
+        while !extrinsic_done && renderer.is_open() {
             // 全カメラからフレーム取得・検出・表示
             let mut frames: Vec<Mat> = Vec::new();
             let mut corner_data: Vec<(Mat, Mat, i32)> = Vec::new();
@@ -330,9 +350,17 @@ fn main() -> Result<()> {
                     }
                 };
 
-                let (corners, ids, n) = detect_charuco_corners(&detector, &frame)?;
+                // 歪み補正してから検出（広角カメラ対応）
+                let mut undistorted = Mat::default();
+                calib3d::undistort(
+                    &frame, &mut undistorted,
+                    &camera_matrices[i], &dist_coeffs_vec[i],
+                    &camera_matrices[i],
+                )?;
 
-                // 検出後に最新フレームを取得して表示
+                let (corners, ids, n) = detect_charuco_corners(&detector, &undistorted)?;
+
+                // 表示は生画像（検出のみundistort）
                 let mut display = cam.get_frame().unwrap_or(frame.clone());
 
                 if n > 0 {
@@ -368,12 +396,28 @@ fn main() -> Result<()> {
                     color, 2, opencv::imgproc::LINE_8, false,
                 )?;
 
-                renderers[i].draw_frame(&display)?;
-                renderers[i].update()?;
+                // カメラ解像度がタイルサイズと異なる場合はリサイズ
+                let display_final = if display.cols() as usize != tile_w || display.rows() as usize != tile_h {
+                    let mut resized = Mat::default();
+                    opencv::imgproc::resize(
+                        &display, &mut resized,
+                        Size::new(tile_w as i32, tile_h as i32),
+                        0.0, 0.0, opencv::imgproc::INTER_LINEAR,
+                    )?;
+                    resized
+                } else {
+                    display
+                };
+
+                let col = i % cols;
+                let row = i / cols;
+                renderer.draw_frame_at(&display_final, col * tile_w, row * tile_h)?;
 
                 frames.push(frame);
                 corner_data.push((corners, ids, n));
             }
+
+            renderer.update()?;
 
             // 全カメラでコーナーが十分なら自動キャプチャ
             let all_have_enough = corner_data.iter().all(|(_, _, n)| *n >= 6);
@@ -385,7 +429,7 @@ fn main() -> Result<()> {
                 for (i, (corners, ids, _)) in corner_data.iter().enumerate() {
                     match estimate_pose(
                         corners, ids, &board,
-                        &camera_matrices[i], &dist_coeffs_vec[i],
+                        &camera_matrices[i], &zero_dist,
                     )? {
                         Some((rvec, tvec)) => {
                             all_poses.push((rvec, tvec));
@@ -404,7 +448,7 @@ fn main() -> Result<()> {
                 }
             }
 
-            if renderers.iter().any(|r| r.is_key_pressed(Key::Q)) {
+            if renderer.is_key_pressed(Key::Q) {
                 bail!("ユーザーにより中止されました");
             }
         }
