@@ -36,11 +36,13 @@ struct InferenceRequest {
     prev_pose: Option<Pose>,
     width: u32,
     height: u32,
+    timestamp: Instant,
 }
 
 struct InferenceResult {
     camera_index: usize,
     pose: Pose,
+    timestamp: Instant,
 }
 
 // --- Bevy Resources ---
@@ -65,6 +67,7 @@ struct InferenceRx(Mutex<mpsc::Receiver<InferenceResult>>);
 struct PoseState {
     poses_2d: Vec<Option<Pose>>,
     prev_poses: Vec<Option<Pose>>,
+    pose_timestamps: Vec<Option<Instant>>,
     pose_3d: Option<Pose>,
     multi_camera: bool,
 }
@@ -282,6 +285,25 @@ fn main() -> Result<()> {
         };
 
         while let Ok(req) = frame_rx.recv() {
+            // キューに溜まったリクエストをドレインし、カメラ毎に最新のみ保持
+            let mut latest: std::collections::HashMap<usize, InferenceRequest> = std::collections::HashMap::new();
+            latest.insert(req.camera_index, req);
+            while let Ok(queued) = frame_rx.try_recv() {
+                latest.insert(queued.camera_index, queued);
+            }
+
+            // カメラインデックス順に処理（安定した処理順序）
+            let mut cam_indices: Vec<usize> = latest.keys().copied().collect();
+            cam_indices.sort();
+
+            for cam_idx in cam_indices {
+                let req = latest.remove(&cam_idx).unwrap();
+
+                // タイムスタンプが古すぎるリクエストはスキップ（500ms以上前）
+                if req.timestamp.elapsed().as_secs_f32() > 0.5 {
+                    continue;
+                }
+
             // 人物検出 → クロップ
             let (input_frame, crop_region) = match detector_mode.as_str() {
                 "keypoint" => {
@@ -345,7 +367,9 @@ fn main() -> Result<()> {
             let _ = result_tx.send(InferenceResult {
                 camera_index: req.camera_index,
                 pose,
+                timestamp: req.timestamp,
             });
+            } // for cam_idx
         }
     });
 
@@ -419,6 +443,7 @@ fn main() -> Result<()> {
         .insert_resource(PoseState {
             poses_2d: vec![None; num_cameras],
             prev_poses: vec![None; num_cameras],
+            pose_timestamps: vec![None; num_cameras],
             pose_3d: None,
             multi_camera,
         })
@@ -487,6 +512,7 @@ fn send_frames_system(
                     prev_pose: pose_state.prev_poses[i].clone(),
                     width: cam_inputs.widths[i],
                     height: cam_inputs.heights[i],
+                    timestamp: Instant::now(),
                 };
                 match tx.0.try_send(req) {
                     Ok(()) => {
@@ -511,16 +537,24 @@ fn receive_results_system(
     let rx = rx.0.lock().unwrap();
     while let Ok(result) = rx.try_recv() {
         let idx = result.camera_index;
+        if idx < cam_inputs.in_flight.len() {
+            cam_inputs.in_flight[idx] = false;
+        }
         if idx < pose_state.poses_2d.len() {
+            // 古すぎる推論結果は破棄（300ms以上前のフレーム）
+            if result.timestamp.elapsed().as_secs_f32() > 0.3 {
+                continue;
+            }
             pose_state.prev_poses[idx] = Some(result.pose.clone());
             pose_state.poses_2d[idx] = Some(result.pose);
+            pose_state.pose_timestamps[idx] = Some(result.timestamp);
             fps.inference_count += 1;
-            if idx < cam_inputs.in_flight.len() {
-                cam_inputs.in_flight[idx] = false;
-            }
         }
     }
 }
+
+/// 三角測量の最大待機時間: これを超えたら揃ったカメラのみで三角測量する
+const TRIANGULATION_TIMEOUT_MS: f32 = 100.0;
 
 fn triangulate_system(
     cam_inputs: Res<CameraInputs>,
@@ -534,18 +568,41 @@ fn triangulate_system(
         return;
     }
 
-    // 複数カメラ: 全カメラのPoseが揃っているか確認
+    // 複数カメラ: 全カメラのPoseが揃っているか、またはタイムアウトで部分更新
     let all_ready = pose_state.poses_2d.iter().all(|p| p.is_some());
-    if !all_ready {
+    let ready_count = pose_state.poses_2d.iter().filter(|p| p.is_some()).count();
+
+    if !all_ready && ready_count >= 2 {
+        // 2台以上揃っている場合、最古のポーズのタイムスタンプからの経過時間を確認
+        let oldest_ts = pose_state.pose_timestamps.iter()
+            .filter_map(|t| *t)
+            .min();
+        let timed_out = oldest_ts
+            .map(|ts| ts.elapsed().as_secs_f32() * 1000.0 > TRIANGULATION_TIMEOUT_MS)
+            .unwrap_or(false);
+        if !timed_out {
+            return; // まだ待てる
+        }
+        // タイムアウト: 揃っているカメラだけで三角測量する（フォールスルー）
+    } else if !all_ready {
+        return; // 2台未満 → 待機
+    }
+
+    // 利用可能なカメラのみでインデックスを収集
+    let mut available_poses: Vec<&Pose> = Vec::new();
+    let mut available_params: Vec<&CameraParams> = Vec::new();
+    for i in 0..pose_state.poses_2d.len() {
+        if let Some(ref pose) = pose_state.poses_2d[i] {
+            available_poses.push(pose);
+            available_params.push(&cam_inputs.params[i]);
+        }
+    }
+
+    if available_poses.len() < 2 {
         return;
     }
 
-    let poses: Vec<&Pose> = pose_state.poses_2d.iter()
-        .filter_map(|p| p.as_ref())
-        .collect();
-    let cam_params: Vec<&CameraParams> = cam_inputs.params.iter().collect();
-
-    let mut pose_3d = triangulate_poses(&cam_params, &poses, CONFIDENCE_THRESHOLD);
+    let mut pose_3d = triangulate_poses(&available_params, &available_poses, CONFIDENCE_THRESHOLD);
 
     // 三角測量の各キーポイントの境界チェック: カメラ座標系で妥当な範囲外を除去
     for kp in pose_3d.keypoints.iter_mut() {
@@ -561,6 +618,9 @@ fn triangulate_system(
     // 消費: 次の三角測量まで待機
     for p in pose_state.poses_2d.iter_mut() {
         *p = None;
+    }
+    for t in pose_state.pose_timestamps.iter_mut() {
+        *t = None;
     }
 }
 
