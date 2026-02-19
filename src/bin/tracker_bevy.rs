@@ -56,7 +56,7 @@ struct CameraInputs {
 }
 
 #[derive(Resource)]
-struct InferenceTx(mpsc::SyncSender<InferenceRequest>);
+struct InferenceTx(Vec<mpsc::SyncSender<InferenceRequest>>);
 
 #[derive(Resource)]
 struct InferenceRx(Mutex<mpsc::Receiver<InferenceResult>>);
@@ -162,8 +162,12 @@ fn main() -> Result<()> {
         match load_calibration(cal_path) {
             Ok(cal) => {
                 log!(logfile, "Calibration: {}", cal_path);
-                log!(logfile, "Cameras: {}", cal.cameras.len());
+                log!(logfile, "Cameras in file: {}", cal.cameras.len());
                 for cam_cal in &cal.cameras {
+                    if !cam_cal.enabled {
+                        log!(logfile, "Camera {}: DISABLED (skipping)", cam_cal.camera_index);
+                        continue;
+                    }
                     let cam = ThreadedCamera::start(
                         cam_cal.camera_index,
                         Some(cam_cal.width),
@@ -204,6 +208,10 @@ fn main() -> Result<()> {
                 // フォールバック: config.toml
                 let entries = config.camera_entries();
                 for entry in &entries {
+                    if !entry.enabled {
+                        log!(logfile, "Camera {}: DISABLED (skipping)", entry.index);
+                        continue;
+                    }
                     let cam = ThreadedCamera::start(
                         entry.index,
                         Some(entry.width),
@@ -227,6 +235,10 @@ fn main() -> Result<()> {
         let entries = config.camera_entries();
         log!(logfile, "Cameras: {}", entries.len());
         for entry in &entries {
+            if !entry.enabled {
+                log!(logfile, "Camera {}: DISABLED (skipping)", entry.index);
+                continue;
+            }
             let cam = ThreadedCamera::start(
                 entry.index,
                 Some(entry.width),
@@ -250,8 +262,8 @@ fn main() -> Result<()> {
     log!(logfile, "Mode: {}", if multi_camera { "triangulation" } else { "single camera" });
     log!(logfile, "");
 
-    // 推論スレッド
-    let (frame_tx, frame_rx) = mpsc::sync_channel::<InferenceRequest>(num_cameras);
+    // 推論スレッド（カメラごとに並列起動）
+    let mut frame_txs = Vec::new();
     let (result_tx, result_rx) = mpsc::channel::<InferenceResult>();
 
     let (model_path, model_type): (&str, ModelType) = match config.app.model.as_str() {
@@ -264,90 +276,101 @@ fn main() -> Result<()> {
     let detector_mode = config.app.detector.clone();
     log!(logfile, "Model: {}", config.app.model);
     log!(logfile, "Detector: {}", config.app.detector);
+    log!(logfile, "Inference threads: {}", num_cameras);
 
-    let logfile_infer = logfile.clone();
-    std::thread::spawn(move || {
-        let mut detector = PoseDetector::new(model_path, model_type)
-            .expect("Failed to load pose model");
-        log!(logfile_infer, "Inference thread: model loaded");
+    for cam_i in 0..num_cameras {
+        let (frame_tx, frame_rx) = mpsc::sync_channel::<InferenceRequest>(1);
+        frame_txs.push(frame_tx);
+        let result_tx = result_tx.clone();
+        let logfile_infer = logfile.clone();
+        let model_path = model_path.to_string();
+        let detector_mode = detector_mode.clone();
 
-        let mut person_detector = match detector_mode.as_str() {
-            "yolo" => {
-                let pd = PersonDetector::new("models/yolov8n.onnx", 160)
-                    .expect("Failed to load person detector");
-                log!(logfile_infer, "Inference thread: person detector loaded");
-                Some(pd)
-            }
-            _ => None,
-        };
+        std::thread::spawn(move || {
+            let mut detector = PoseDetector::new(&model_path, model_type)
+                .expect("Failed to load pose model");
+            log!(logfile_infer, "Inference thread {}: model loaded", cam_i);
 
-        while let Ok(req) = frame_rx.recv() {
-            // 人物検出 → クロップ
-            let (input_frame, crop_region) = match detector_mode.as_str() {
-                "keypoint" => {
-                    match req.prev_pose.as_ref()
-                        .and_then(|p| bbox_from_keypoints(p, req.width, req.height, CONFIDENCE_THRESHOLD))
-                    {
-                        Some(bbox) => match crop_for_pose(&req.frame, &bbox, req.width, req.height) {
-                            Ok(v) => v,
-                            Err(_) => (req.frame.clone(), CropRegion::full()),
-                        },
-                        None => (req.frame.clone(), CropRegion::full()),
-                    }
-                }
+            let mut person_detector = match detector_mode.as_str() {
                 "yolo" => {
-                    match person_detector.as_mut().unwrap().detect(&req.frame) {
-                        Ok(Some(bbox)) => match crop_for_pose(&req.frame, &bbox, req.width, req.height) {
+                    let pd = PersonDetector::new("models/yolov8n.onnx", 160)
+                        .expect("Failed to load person detector");
+                    log!(logfile_infer, "Inference thread {}: person detector loaded", cam_i);
+                    Some(pd)
+                }
+                _ => None,
+            };
+
+            while let Ok(req) = frame_rx.recv() {
+                // 人物検出 → クロップ
+                let (input_frame, crop_region) = match detector_mode.as_str() {
+                    "keypoint" => {
+                        match req.prev_pose.as_ref()
+                            .and_then(|p| bbox_from_keypoints(p, req.width, req.height, CONFIDENCE_THRESHOLD))
+                        {
+                            Some(bbox) => match crop_for_pose(&req.frame, &bbox, req.width, req.height) {
+                                Ok(v) => v,
+                                Err(_) => (req.frame.clone(), CropRegion::full()),
+                            },
+                            None => (req.frame.clone(), CropRegion::full()),
+                        }
+                    }
+                    "yolo" => {
+                        match person_detector.as_mut().unwrap().detect(&req.frame) {
+                            Ok(Some(bbox)) => match crop_for_pose(&req.frame, &bbox, req.width, req.height) {
+                                Ok(v) => v,
+                                Err(_) => (req.frame.clone(), CropRegion::full()),
+                            },
+                            _ => (req.frame.clone(), CropRegion::full()),
+                        }
+                    }
+                    _ => (req.frame.clone(), CropRegion::full()),
+                };
+
+                // 前処理
+                let (input, letterbox) = match model_type {
+                    ModelType::MoveNet => {
+                        match preprocess_for_movenet(&input_frame) {
+                            Ok(v) => (v, LetterboxInfo::identity()),
+                            Err(e) => { log!(logfile_infer, "preprocess error: {}", e); continue; }
+                        }
+                    }
+                    ModelType::SpinePose => {
+                        match preprocess_for_spinepose(&input_frame) {
                             Ok(v) => v,
-                            Err(_) => (req.frame.clone(), CropRegion::full()),
-                        },
-                        _ => (req.frame.clone(), CropRegion::full()),
+                            Err(e) => { log!(logfile_infer, "preprocess error: {}", e); continue; }
+                        }
                     }
-                }
-                _ => (req.frame.clone(), CropRegion::full()),
-            };
-
-            // 前処理
-            let (input, letterbox) = match model_type {
-                ModelType::MoveNet => {
-                    match preprocess_for_movenet(&input_frame) {
-                        Ok(v) => (v, LetterboxInfo::identity()),
-                        Err(e) => { log!(logfile_infer, "preprocess error: {}", e); continue; }
+                    ModelType::RTMW3D => {
+                        match preprocess_for_rtmw3d(&input_frame) {
+                            Ok(v) => v,
+                            Err(e) => { log!(logfile_infer, "preprocess error: {}", e); continue; }
+                        }
                     }
-                }
-                ModelType::SpinePose => {
-                    match preprocess_for_spinepose(&input_frame) {
-                        Ok(v) => v,
-                        Err(e) => { log!(logfile_infer, "preprocess error: {}", e); continue; }
-                    }
-                }
-                ModelType::RTMW3D => {
-                    match preprocess_for_rtmw3d(&input_frame) {
-                        Ok(v) => v,
-                        Err(e) => { log!(logfile_infer, "preprocess error: {}", e); continue; }
-                    }
-                }
-            };
+                };
 
-            // 推論
-            let mut pose = match detector.detect(input) {
-                Ok(v) => v,
-                Err(e) => { log!(logfile_infer, "inference error: {}", e); continue; }
-            };
+                // 推論
+                let mut pose = match detector.detect(input) {
+                    Ok(v) => v,
+                    Err(e) => { log!(logfile_infer, "inference error: {}", e); continue; }
+                };
 
-            // レターボックス座標を元の画像座標に変換
-            pose = unletterbox_pose(&pose, &letterbox);
+                // レターボックス座標を元の画像座標に変換
+                pose = unletterbox_pose(&pose, &letterbox);
 
-            if !crop_region.is_full() {
-                pose = remap_pose(&pose, &crop_region);
+                if !crop_region.is_full() {
+                    pose = remap_pose(&pose, &crop_region);
+                }
+
+                let _ = result_tx.send(InferenceResult {
+                    camera_index: req.camera_index,
+                    pose,
+                });
             }
-
-            let _ = result_tx.send(InferenceResult {
-                camera_index: req.camera_index,
-                pose,
-            });
-        }
-    });
+        });
+    }
+    // main thread doesn't send results, drop the extra sender
+    drop(result_tx);
 
     // Body tracker
     let fov_v = if multi_camera { 0.0 } else { config.camera.fov_v };
@@ -414,7 +437,7 @@ fn main() -> Result<()> {
             heights,
             in_flight: vec![false; num_cameras],
         })
-        .insert_resource(InferenceTx(frame_tx))
+        .insert_resource(InferenceTx(frame_txs))
         .insert_resource(InferenceRx(Mutex::new(result_rx)))
         .insert_resource(PoseState {
             poses_2d: vec![None; num_cameras],
@@ -488,14 +511,14 @@ fn send_frames_system(
                     width: cam_inputs.widths[i],
                     height: cam_inputs.heights[i],
                 };
-                match tx.0.try_send(req) {
+                // カメラごとの専用推論スレッドに送信
+                match tx.0[i].try_send(req) {
                     Ok(()) => {
                         cam_inputs.last_frame_ids[i] = fid;
                         cam_inputs.in_flight[i] = true;
                     }
                     Err(mpsc::TrySendError::Full(_)) => {}
                     Err(mpsc::TrySendError::Disconnected(_)) => {}
-                    // Inference thread disconnected は無視（終了時に発生）
                 }
             }
         }

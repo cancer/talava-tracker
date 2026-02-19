@@ -14,6 +14,8 @@ use opencv::{
 
 use crate::config::CalibrationConfig;
 
+fn default_enabled() -> bool { true }
+
 // --- データ構造 ---
 
 /// ボードパラメータ（再現用に保存）
@@ -32,6 +34,9 @@ pub struct CameraCalibration {
     pub camera_index: i32,
     pub width: u32,
     pub height: u32,
+    /// カメラの有効/無効（デフォルトtrue）。falseにするとこのカメラの推論をスキップする
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     /// 内部パラメータ行列 K (row-major 3x3)
     pub intrinsic_matrix: [f64; 9],
     /// 歪み係数
