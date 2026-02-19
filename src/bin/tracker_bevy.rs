@@ -12,7 +12,7 @@ use opencv::core::Mat;
 
 use talava_tracker::calibration::load_calibration;
 use talava_tracker::camera::ThreadedCamera;
-use talava_tracker::config::Config;
+use talava_tracker::config::{Config, FilterConfig};
 use talava_tracker::pose::{
     bbox_from_keypoints, crop_for_pose, preprocess_for_movenet, preprocess_for_spinepose,
     preprocess_for_rtmw3d, remap_pose, unletterbox_pose, CropRegion, LetterboxInfo, ModelType,
@@ -81,6 +81,7 @@ struct TrackerState {
     reject_count: [u32; TRACKER_COUNT], // velocity_ok連続拒否回数
     last_inference_time: Instant,
     interp_mode: String,
+    filter_config: FilterConfig,
 }
 
 #[derive(Resource)]
@@ -134,6 +135,16 @@ macro_rules! log {
             let _ = writeln!(f, "{}", msg);
         }
     }};
+}
+
+/// トラッカーIndex別にPoseFilterを生成
+/// Index 0=hip, 1=L_foot, 2=R_foot, 3=chest, 4=L_knee, 5=R_knee
+/// 下半身（足・膝: index 1,2,4,5）はlower_body用パラメータを使用
+fn make_filters(config: &FilterConfig) -> [PoseFilter; TRACKER_COUNT] {
+    std::array::from_fn(|i| match i {
+        1 | 2 | 4 | 5 => PoseFilter::from_config_lower_body(config),
+        _ => PoseFilter::from_config(config),
+    })
 }
 
 fn main() -> Result<()> {
@@ -353,7 +364,7 @@ fn main() -> Result<()> {
     let fov_v = if multi_camera { 0.0 } else { config.camera.fov_v };
     let body_tracker = BodyTracker::new(&config.tracker, fov_v, multi_camera);
     let filters: [PoseFilter; TRACKER_COUNT] =
-        std::array::from_fn(|_| PoseFilter::from_config(&config.filter));
+        make_filters(&config.filter);
     let extrapolators: [Extrapolator; TRACKER_COUNT] =
         std::array::from_fn(|_| Extrapolator::new());
     let lerpers: [Lerper; TRACKER_COUNT] =
@@ -433,6 +444,7 @@ fn main() -> Result<()> {
             reject_count: [0; TRACKER_COUNT],
             last_inference_time: Instant::now(),
             interp_mode: config.interpolation.mode.clone(),
+            filter_config: config.filter.clone(),
         })
         .insert_resource(VmtSender(vmt))
         .insert_resource(CalibrationState {
@@ -631,9 +643,7 @@ fn calibration_system(
         if deadline.saturating_duration_since(Instant::now()).is_zero() {
             if let Some(ref pose) = pose_state.pose_3d {
                 if tracker_state.body_tracker.calibrate(pose) {
-                    tracker_state.filters = std::array::from_fn(|_| {
-                        PoseFilter::new(1.5, 0.01, 1.0, 0.01)
-                    });
+                    tracker_state.filters = make_filters(&tracker_state.filter_config);
                     tracker_state.extrapolators = std::array::from_fn(|_| Extrapolator::new());
                     tracker_state.lerpers = std::array::from_fn(|_| Lerper::new());
                     tracker_state.last_poses = [None; TRACKER_COUNT];

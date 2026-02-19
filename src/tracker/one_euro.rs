@@ -124,6 +124,17 @@ impl PoseFilter {
         )
     }
 
+    /// 下半身（足・膝）用: lower_body_position_betaが設定されていればそれを使用
+    pub fn from_config_lower_body(config: &FilterConfig) -> Self {
+        let beta = config.lower_body_position_beta.unwrap_or(config.position_beta);
+        Self::new(
+            config.position_min_cutoff,
+            beta,
+            config.rotation_min_cutoff,
+            config.rotation_beta,
+        )
+    }
+
     pub fn apply(&mut self, pose: TrackerPose) -> TrackerPose {
         let now = Instant::now();
         let dt = match self.last_time {
