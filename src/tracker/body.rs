@@ -28,6 +28,9 @@ struct Calibration {
     yaw_right_knee: f32,
     pitch_left_knee: f32,
     pitch_right_knee: f32,
+    // 体幹pitch/roll基準値
+    pitch_torso: f32,  // 肩-腰ベクトルの前傾角
+    roll_torso: f32,   // 左右肩/腰の高低差による傾き
 }
 
 pub struct BodyTracker {
@@ -164,9 +167,12 @@ impl BodyTracker {
         let yaw_right_knee =
             self.compute_knee_yaw(pose, KeypointIndex::RightHip, KeypointIndex::RightKnee);
         let pitch_left_knee =
-            self.compute_knee_pitch(pose, KeypointIndex::LeftKnee, KeypointIndex::LeftAnkle);
+            self.compute_knee_pitch(pose, KeypointIndex::LeftHip, KeypointIndex::LeftKnee, KeypointIndex::LeftAnkle);
         let pitch_right_knee =
-            self.compute_knee_pitch(pose, KeypointIndex::RightKnee, KeypointIndex::RightAnkle);
+            self.compute_knee_pitch(pose, KeypointIndex::RightHip, KeypointIndex::RightKnee, KeypointIndex::RightAnkle);
+
+        let pitch_torso = self.compute_torso_pitch(pose);
+        let roll_torso = self.compute_torso_roll(pose);
 
         self.calibration = Some(Calibration {
             hip_x,
@@ -183,6 +189,8 @@ impl BodyTracker {
             yaw_right_knee,
             pitch_left_knee,
             pitch_right_knee,
+            pitch_torso,
+            roll_torso,
         });
         true
     }
@@ -323,6 +331,76 @@ impl BodyTracker {
         Some((hip_y - shoulder_y).abs())
     }
 
+    /// 体幹のpitch（前傾・後傾）: 肩中点と腰中点のベクトルから計算
+    /// world_coordsモード: yz平面での角度（3D）
+    /// 2Dモード: 肩-腰間のy距離変化から推定（前傾すると肩-腰のy距離が縮む）
+    fn compute_torso_pitch(&self, pose: &Pose) -> f32 {
+        let ls = pose.get(KeypointIndex::LeftShoulder);
+        let rs = pose.get(KeypointIndex::RightShoulder);
+        let lh = pose.get(KeypointIndex::LeftHip);
+        let rh = pose.get(KeypointIndex::RightHip);
+
+        let s_valid = ls.is_valid(self.confidence_threshold)
+            && rs.is_valid(self.confidence_threshold);
+        let h_valid = lh.is_valid(self.confidence_threshold)
+            && rh.is_valid(self.confidence_threshold);
+
+        if !s_valid || !h_valid {
+            return 0.0;
+        }
+
+        let shoulder_y = (ls.y + rs.y) / 2.0;
+        let hip_y = (lh.y + rh.y) / 2.0;
+
+        if self.world_coords {
+            // 3Dモード: 肩→腰ベクトルのyz平面での角度
+            let shoulder_z = (ls.z + rs.z) / 2.0;
+            let hip_z = (lh.z + rh.z) / 2.0;
+            let dy = hip_y - shoulder_y; // 下方向が正（カメラ座標系）
+            let dz = hip_z - shoulder_z;
+            // 鉛直（Y+方向）からのずれ角: 前傾でdz>0（カメラから離れる）→pitch正
+            f32::atan2(dz, dy)
+        } else {
+            // 2Dモード: 肩-腰間のy距離と胴体高さの比率から推定
+            // 前傾すると肩が腰に近づき（y距離が縮む）、後傾すると離れる
+            let cal = match &self.calibration {
+                Some(cal) if cal.torso_height > 0.01 => cal,
+                _ => return 0.0,
+            };
+            let current_torso_height = (hip_y - shoulder_y).abs();
+            if current_torso_height < 0.01 {
+                return 0.0;
+            }
+            // acos(current/ref)で角度推定。currentがrefより短い→前傾
+            let ratio = (current_torso_height / cal.torso_height).clamp(0.0, 1.0);
+            f32::acos(ratio)
+        }
+    }
+
+    /// 体幹のroll（左右傾き）: 左右肩の高さの差から計算
+    /// 正のroll = 右肩が下がる（時計回り、前方から見て）
+    fn compute_torso_roll(&self, pose: &Pose) -> f32 {
+        let ls = pose.get(KeypointIndex::LeftShoulder);
+        let rs = pose.get(KeypointIndex::RightShoulder);
+
+        if !ls.is_valid(self.confidence_threshold) || !rs.is_valid(self.confidence_threshold) {
+            return 0.0;
+        }
+
+        // 肩の水平距離
+        let dx = (ls.x - rs.x).abs();
+        if dx < 0.001 {
+            return 0.0;
+        }
+
+        // 左肩 - 右肩のy差（画像座標: y下が正→右肩が下ならrs.y > ls.y）
+        let dy = rs.y - ls.y;
+
+        // mirror_xの場合は左右が反転
+        let roll = f32::atan2(dy, dx);
+        if self.mirror_x { -roll } else { roll }
+    }
+
     fn estimate_depth(&self, pose: &Pose) -> f32 {
         // 3Dモデルのz座標がある場合
         let left_hip = pose.get(KeypointIndex::LeftHip);
@@ -437,17 +515,23 @@ impl BodyTracker {
         [0.0, half.sin(), 0.0, half.cos()]
     }
 
-    /// yaw(Y軸回転) + pitch(X軸回転) から quaternion を生成
-    /// q = q_yaw * q_pitch
-    fn yaw_pitch_to_quaternion(yaw: f32, pitch: f32) -> [f32; 4] {
+    /// yaw(Y軸回転) + pitch(X軸回転) + roll(Z軸回転) から quaternion を生成
+    /// 回転順序: q = q_yaw * q_pitch * q_roll (Y → X → Z)
+    fn yaw_pitch_roll_to_quaternion(yaw: f32, pitch: f32, roll: f32) -> [f32; 4] {
         let (sy, cy) = (yaw / 2.0).sin_cos();
         let (sp, cp) = (pitch / 2.0).sin_cos();
+        let (sr, cr) = (roll / 2.0).sin_cos();
         [
-            cy * sp,       // x
-            sy * cp,       // y
-            -sy * sp,      // z
-            cy * cp,       // w
+            cy * sp * cr + sy * cp * sr,   // x
+            sy * cp * cr - cy * sp * sr,   // y
+            cy * cp * sr - sy * sp * cr,   // z
+            cy * cp * cr + sy * sp * sr,   // w
         ]
+    }
+
+    /// yaw(Y軸回転) + pitch(X軸回転) から quaternion を生成（roll=0のショートカット）
+    fn yaw_pitch_to_quaternion(yaw: f32, pitch: f32) -> [f32; 4] {
+        Self::yaw_pitch_roll_to_quaternion(yaw, pitch, 0.0)
     }
 
     fn compute_hip(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32, body_ratio: f32) -> Option<TrackerPose> {
@@ -456,7 +540,11 @@ impl BodyTracker {
 
         let ref_yaw = self.calibration.as_ref().map_or(0.0, |c| c.yaw_shoulder);
         let yaw = self.compute_shoulder_yaw(pose) - ref_yaw;
-        let rotation = Self::yaw_to_quaternion(yaw);
+        let ref_pitch = self.calibration.as_ref().map_or(0.0, |c| c.pitch_torso);
+        let pitch = self.compute_torso_pitch(pose) - ref_pitch;
+        let ref_roll = self.calibration.as_ref().map_or(0.0, |c| c.roll_torso);
+        let roll = self.compute_torso_roll(pose) - ref_roll;
+        let rotation = Self::yaw_pitch_roll_to_quaternion(yaw, pitch, roll);
 
         Some(TrackerPose::new(position, rotation))
     }
@@ -555,16 +643,59 @@ impl BodyTracker {
 
         let ref_yaw = self.calibration.as_ref().map_or(0.0, |c| c.yaw_shoulder);
         let yaw = self.compute_shoulder_yaw(pose) - ref_yaw;
-        let rotation = Self::yaw_to_quaternion(yaw);
+        let ref_pitch = self.calibration.as_ref().map_or(0.0, |c| c.pitch_torso);
+        let pitch = self.compute_torso_pitch(pose) - ref_pitch;
+        let ref_roll = self.calibration.as_ref().map_or(0.0, |c| c.roll_torso);
+        let roll = self.compute_torso_roll(pose) - ref_roll;
+        let rotation = Self::yaw_pitch_roll_to_quaternion(yaw, pitch, roll);
 
         Some(TrackerPose::new(position, rotation))
     }
 
-    /// 膝のpitch: 膝→足首ベクトルの鉛直方向からの傾き
-    /// 現在はz値が歪み補正なしで不正確なため無効化（常に0を返す）
-    /// TODO: カメラキャリブレーションのdist_coeffs問題を解決後に再有効化
-    fn compute_knee_pitch(&self, _pose: &Pose, _knee_idx: KeypointIndex, _ankle_idx: KeypointIndex) -> f32 {
-        0.0
+    /// 膝のpitch: 膝の曲がり角度
+    /// 2Dモード: hip-knee-ankleの角度から膝の屈曲を推定
+    /// 3Dモード（world_coords）: hip-knee-ankleのyz平面での角度
+    fn compute_knee_pitch(&self, pose: &Pose, hip_idx: KeypointIndex, knee_idx: KeypointIndex, ankle_idx: KeypointIndex) -> f32 {
+        let hip = pose.get(hip_idx);
+        let knee = pose.get(knee_idx);
+        let ankle = pose.get(ankle_idx);
+
+        if !hip.is_valid(self.confidence_threshold)
+            || !knee.is_valid(self.confidence_threshold)
+            || !ankle.is_valid(self.confidence_threshold)
+        {
+            return 0.0;
+        }
+
+        if self.world_coords {
+            // 3D: 膝→足首ベクトルの鉛直方向からの傾き（yz平面）
+            let dy = ankle.y - knee.y;
+            let dz = ankle.z - knee.z;
+            f32::atan2(dz, dy)
+        } else {
+            // 2D: hip-knee-ankleの3点から膝の屈曲角度を推定
+            // ベクトル: knee→hip, knee→ankle
+            let v1x = hip.x - knee.x;
+            let v1y = hip.y - knee.y;
+            let v2x = ankle.x - knee.x;
+            let v2y = ankle.y - knee.y;
+
+            let dot = v1x * v2x + v1y * v2y;
+            let len1 = (v1x * v1x + v1y * v1y).sqrt();
+            let len2 = (v2x * v2x + v2y * v2y).sqrt();
+
+            if len1 < 0.001 || len2 < 0.001 {
+                return 0.0;
+            }
+
+            // 膝が完全に伸びている場合cos≈-1（180°）、曲がるとcos>-1
+            let cos_angle = (dot / (len1 * len2)).clamp(-1.0, 1.0);
+            let angle = f32::acos(cos_angle); // 0..π
+
+            // 完全伸展(π)からの屈曲量をpitchとする
+            // 膝は後方にのみ曲がるので常に正（または0）
+            (std::f32::consts::PI - angle).max(0.0)
+        }
     }
 
     /// 膝のyaw: 腰→膝方向
@@ -608,7 +739,7 @@ impl BodyTracker {
         };
         let pitch = if has_keypoint {
             let ref_pitch = self.calibration.as_ref().map_or(0.0, |c| c.pitch_left_knee);
-            self.compute_knee_pitch(pose, KeypointIndex::LeftKnee, KeypointIndex::LeftAnkle) - ref_pitch
+            self.compute_knee_pitch(pose, KeypointIndex::LeftHip, KeypointIndex::LeftKnee, KeypointIndex::LeftAnkle) - ref_pitch
         } else {
             0.0
         };
@@ -643,7 +774,7 @@ impl BodyTracker {
         };
         let pitch = if has_keypoint {
             let ref_pitch = self.calibration.as_ref().map_or(0.0, |c| c.pitch_right_knee);
-            self.compute_knee_pitch(pose, KeypointIndex::RightKnee, KeypointIndex::RightAnkle) - ref_pitch
+            self.compute_knee_pitch(pose, KeypointIndex::RightHip, KeypointIndex::RightKnee, KeypointIndex::RightAnkle) - ref_pitch
         } else {
             0.0
         };
@@ -1066,6 +1197,190 @@ mod tests {
         // しゃがむとVR Y座標が下がる
         assert!(squat_hip_y < cal_hip_y,
             "squat hip.y({:.3}) should be lower than standing({:.3})", squat_hip_y, cal_hip_y);
+    }
+
+    // --- pitch/rollテスト ---
+
+    #[test]
+    fn test_yaw_pitch_roll_quaternion_identity() {
+        let q = BodyTracker::yaw_pitch_roll_to_quaternion(0.0, 0.0, 0.0);
+        // identity quaternion: (0, 0, 0, 1)
+        assert!((q[0]).abs() < 1e-6);
+        assert!((q[1]).abs() < 1e-6);
+        assert!((q[2]).abs() < 1e-6);
+        assert!((q[3] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_yaw_pitch_roll_quaternion_normalized() {
+        let q = BodyTracker::yaw_pitch_roll_to_quaternion(0.5, 0.3, 0.2);
+        let len = (q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]).sqrt();
+        assert!((len - 1.0).abs() < 1e-6, "quaternion should be unit, got len={}", len);
+    }
+
+    #[test]
+    fn test_yaw_pitch_to_quaternion_matches_ypr() {
+        // yaw_pitch_to_quaternion should equal yaw_pitch_roll with roll=0
+        let q1 = BodyTracker::yaw_pitch_to_quaternion(0.7, 0.4);
+        let q2 = BodyTracker::yaw_pitch_roll_to_quaternion(0.7, 0.4, 0.0);
+        for i in 0..4 {
+            assert!((q1[i] - q2[i]).abs() < 1e-6,
+                "component {} mismatch: {} vs {}", i, q1[i], q2[i]);
+        }
+    }
+
+    #[test]
+    fn test_calibration_zeroes_rotation() {
+        // キャリブレーション時のポーズ → rotation ≈ identity
+        let config = TrackerConfig::default();
+        let mut tracker = BodyTracker::from_config(&config);
+        let pose = make_pose(
+            (0.4, 0.5), (0.6, 0.5),
+            (0.4, 0.3), (0.6, 0.3),
+            (0.4, 0.7), (0.6, 0.7),
+            (0.4, 0.9), (0.6, 0.9),
+        );
+        assert!(tracker.calibrate(&pose));
+        let result = tracker.compute(&pose);
+
+        // hip, chest: キャリブレーション時の回転 ≈ identity
+        let hip = result.hip.unwrap();
+        assert!((hip.rotation[3] - 1.0).abs() < 0.01,
+            "hip rotation.w should be ~1 at calibration, got {:?}", hip.rotation);
+        let chest = result.chest.unwrap();
+        assert!((chest.rotation[3] - 1.0).abs() < 0.01,
+            "chest rotation.w should be ~1 at calibration, got {:?}", chest.rotation);
+    }
+
+    #[test]
+    fn test_hip_pitch_forward_lean() {
+        // 前傾: 肩がカメラ方向に近づく（2Dでは肩-腰のy距離が縮む）
+        let config = TrackerConfig::default();
+        let mut tracker = BodyTracker::from_config(&config);
+        // キャリブレーション: 直立（肩y=0.3, 腰y=0.5, torso_height=0.2）
+        let cal_pose = make_pose(
+            (0.4, 0.5), (0.6, 0.5),
+            (0.4, 0.3), (0.6, 0.3),
+            (0.4, 0.7), (0.6, 0.7),
+            (0.4, 0.9), (0.6, 0.9),
+        );
+        assert!(tracker.calibrate(&cal_pose));
+
+        // 前傾: 肩が腰に近づく（肩y=0.4, 腰y=0.5, torso_height=0.1）
+        let lean_pose = make_pose(
+            (0.4, 0.5), (0.6, 0.5),
+            (0.4, 0.4), (0.6, 0.4),
+            (0.4, 0.7), (0.6, 0.7),
+            (0.4, 0.9), (0.6, 0.9),
+        );
+        let result = tracker.compute(&lean_pose);
+        let hip = result.hip.unwrap();
+        // 前傾→pitchがかかる→rotation.wが1.0から離れる
+        assert!(hip.rotation[3] < 0.999,
+            "forward lean should produce non-identity rotation, got w={}", hip.rotation[3]);
+        // pitch成分（x）が非ゼロ
+        assert!(hip.rotation[0].abs() > 0.01,
+            "forward lean should have pitch (rotation.x), got {:?}", hip.rotation);
+    }
+
+    #[test]
+    fn test_hip_roll_side_tilt() {
+        // 右肩が下がる→rollがかかる
+        let config = TrackerConfig::default();
+        let mut tracker = BodyTracker::from_config(&config);
+        // キャリブレーション: 水平な肩
+        let cal_pose = make_pose(
+            (0.4, 0.5), (0.6, 0.5),
+            (0.4, 0.3), (0.6, 0.3),
+            (0.4, 0.7), (0.6, 0.7),
+            (0.4, 0.9), (0.6, 0.9),
+        );
+        assert!(tracker.calibrate(&cal_pose));
+
+        // 右肩下がり: rs.y=0.35 > ls.y=0.25
+        let tilt_pose = make_pose(
+            (0.4, 0.5), (0.6, 0.5),
+            (0.4, 0.25), (0.6, 0.35),
+            (0.4, 0.7), (0.6, 0.7),
+            (0.4, 0.9), (0.6, 0.9),
+        );
+        let result = tracker.compute(&tilt_pose);
+        let hip = result.hip.unwrap();
+        // roll成分（z）が非ゼロ
+        assert!(hip.rotation[2].abs() > 0.01,
+            "side tilt should have roll (rotation.z), got {:?}", hip.rotation);
+    }
+
+    #[test]
+    fn test_knee_pitch_bent() {
+        // 膝を曲げる: hip-knee-ankleの角度が180°より小さい
+        let config = TrackerConfig::default();
+        let mut tracker = BodyTracker::from_config(&config);
+        // キャリブレーション: 膝まっすぐ（hip→knee→ankleが一直線）
+        let cal_pose = make_pose(
+            (0.4, 0.5), (0.6, 0.5),
+            (0.4, 0.3), (0.6, 0.3),
+            (0.4, 0.7), (0.6, 0.7),
+            (0.4, 0.9), (0.6, 0.9),
+        );
+        assert!(tracker.calibrate(&cal_pose));
+
+        // 膝を曲げる: ankleが前方（x方向）にずれる
+        let bent_pose = make_pose(
+            (0.4, 0.5), (0.6, 0.5),
+            (0.4, 0.3), (0.6, 0.3),
+            (0.4, 0.7), (0.6, 0.7),
+            (0.3, 0.85), (0.7, 0.85), // ankleが前方に
+        );
+        let result = tracker.compute(&bent_pose);
+        let left_knee = result.left_knee.unwrap();
+        // 膝曲げ→pitch成分が非ゼロ
+        assert!(left_knee.rotation[0].abs() > 0.01,
+            "bent knee should have pitch, got {:?}", left_knee.rotation);
+    }
+
+    #[test]
+    fn test_world_coords_torso_pitch() {
+        // 3Dモードで前傾: 肩がz方向に前に出る
+        let config = TrackerConfig::default();
+        let mut tracker = BodyTracker::new(&config, 0.0, true);
+        let pose = standing_world_pose();
+        tracker.calibrate(&pose);
+
+        // 前傾: 肩のz座標が腰より大きい（カメラから離れる方向）
+        let lean_pose = make_world_pose(
+            (0.15, 0.1, 2.0), (-0.15, 0.1, 2.0),       // hip同じ
+            (0.2, -0.4, 2.3), (-0.2, -0.4, 2.3),       // 肩が0.3m前方
+            (0.15, 0.5, 2.0), (-0.15, 0.5, 2.0),
+            (0.15, 0.9, 2.0), (-0.15, 0.9, 2.0),
+        );
+        let result = tracker.compute(&lean_pose);
+        let hip = result.hip.unwrap();
+        // pitch成分（x）が非ゼロ
+        assert!(hip.rotation[0].abs() > 0.01,
+            "3D forward lean should have pitch, got {:?}", hip.rotation);
+    }
+
+    #[test]
+    fn test_world_coords_roll() {
+        // 3Dモードで右肩下がり
+        let config = TrackerConfig::default();
+        let mut tracker = BodyTracker::new(&config, 0.0, true);
+        let pose = standing_world_pose();
+        tracker.calibrate(&pose);
+
+        // 右肩が下がる: rs.y=0.0（直立=-0.4から+0.4上がる）→ rs.y=-0.1
+        let tilt_pose = make_world_pose(
+            (0.15, 0.1, 2.0), (-0.15, 0.1, 2.0),
+            (0.2, -0.5, 2.0), (-0.2, -0.3, 2.0),  // ls下がる(-0.5), rs上がる(-0.3)
+            (0.15, 0.5, 2.0), (-0.15, 0.5, 2.0),
+            (0.15, 0.9, 2.0), (-0.15, 0.9, 2.0),
+        );
+        let result = tracker.compute(&tilt_pose);
+        let hip = result.hip.unwrap();
+        // roll成分（z）が非ゼロ
+        assert!(hip.rotation[2].abs() > 0.01,
+            "3D side tilt should have roll, got {:?}", hip.rotation);
     }
 
 }
