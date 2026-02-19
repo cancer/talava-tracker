@@ -211,7 +211,12 @@ pub struct CameraEntry {
     /// 垂直画角（度）
     #[serde(default)]
     pub fov_v: f32,
+    /// カメラの有効/無効（デフォルトtrue）
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
 }
+
+fn default_enabled() -> bool { true }
 
 impl Config {
     /// cameras配列が設定されていればそれを、なければ既存のcamera設定から生成
@@ -226,6 +231,7 @@ impl Config {
             position: [0.0, 0.0, 0.0],
             rotation: [0.0, 0.0, 0.0],
             fov_v: self.camera.fov_v,
+            enabled: true,
         }]
     }
 }
