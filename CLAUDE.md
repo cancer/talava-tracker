@@ -9,7 +9,8 @@ cargo build          # ビルド
 cargo run            # 実行（tracker_bevy、default-run）
 cargo test           # 全テスト実行
 cargo test test_name # 単一テスト実行
-cargo run --bin calibrate  # カメラキャリブレーション
+cargo run --bin calibrate    # カメラキャリブレーション
+cargo run --bin camera_view  # 画角調整（カメラ映像グリッド表示）
 ```
 
 ## What This Project Does

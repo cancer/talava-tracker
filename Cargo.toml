@@ -38,3 +38,7 @@ path = "src/bin/generate_board.rs"
 [[bin]]
 name = "camera_probe"
 path = "src/bin/camera_probe.rs"
+
+[[bin]]
+name = "camera_view"
+path = "src/bin/camera_view.rs"
