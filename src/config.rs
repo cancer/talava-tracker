@@ -16,8 +16,6 @@ pub struct Config {
     #[serde(default)]
     pub debug: DebugConfig,
     #[serde(default)]
-    pub smooth: SmoothConfig,
-    #[serde(default)]
     pub app: AppConfig,
     #[serde(default)]
     pub interpolation: InterpolationConfig,
@@ -73,14 +71,6 @@ pub struct CameraConfig {
 pub struct DebugConfig {
     #[serde(default)]
     pub view: bool,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SmoothConfig {
-    #[serde(default = "default_smooth_position")]
-    pub position: f32,
-    #[serde(default = "default_smooth_rotation")]
-    pub rotation: f32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,9 +228,6 @@ fn default_depth_scale() -> f32 { 1.0 }
 fn default_offset_y() -> f32 { 1.0 }
 fn default_width() -> u32 { 640 }
 fn default_height() -> u32 { 480 }
-fn default_smooth_position() -> f32 { 0.5 }
-fn default_smooth_rotation() -> f32 { 0.3 }
-
 impl Default for VmtConfig {
     fn default() -> Self {
         Self { addr: default_vmt_addr() }
@@ -279,15 +266,6 @@ impl Default for DebugConfig {
     }
 }
 
-impl Default for SmoothConfig {
-    fn default() -> Self {
-        Self {
-            position: default_smooth_position(),
-            rotation: default_smooth_rotation(),
-        }
-    }
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -296,7 +274,6 @@ impl Default for Config {
             camera: CameraConfig::default(),
             cameras: Vec::new(),
             debug: DebugConfig::default(),
-            smooth: SmoothConfig::default(),
             app: AppConfig::default(),
             interpolation: InterpolationConfig::default(),
             filter: FilterConfig::default(),

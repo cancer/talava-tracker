@@ -73,7 +73,7 @@ fn main() -> Result<()> {
             let mut selected = vec![false; found.len()];
 
             for &idx in &found {
-                let mut cam = OpenCvCamera::open_with_resolution(idx, Some(640), Some(480))?;
+                let mut cam = OpenCvCamera::open_with_resolution(idx, Some(1280), Some(960))?;
                 // 実フレームサイズを取得してウィンドウを合わせる
                 let first_frame = cam.read_frame()?;
                 let fw = first_frame.cols() as usize;
@@ -182,7 +182,7 @@ fn main() -> Result<()> {
     for (cam_idx, &cam_id) in camera_indices.iter().enumerate() {
         println!("--- カメラ {} ({}/{}) ---", cam_id, cam_idx + 1, num_cameras);
 
-        let camera = ThreadedCamera::start(cam_id, None, None)?;
+        let camera = ThreadedCamera::start(cam_id, Some(1280), Some(960))?;
         let (w, h) = camera.resolution();
         let image_size = Size::new(w as i32, h as i32);
         image_sizes.push(image_size);
@@ -302,7 +302,7 @@ fn main() -> Result<()> {
         let mut cameras: Vec<ThreadedCamera> = Vec::new();
         let mut cam_sizes: Vec<(usize, usize)> = Vec::new();
         for &cam_id in &camera_indices {
-            let cam = ThreadedCamera::start(cam_id, None, None)?;
+            let cam = ThreadedCamera::start(cam_id, Some(1280), Some(960))?;
             let (w, h) = cam.resolution();
             cam_sizes.push((w as usize, h as usize));
             cameras.push(cam);
