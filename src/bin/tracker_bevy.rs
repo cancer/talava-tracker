@@ -137,11 +137,20 @@ macro_rules! log {
 }
 
 fn main() -> Result<()> {
-    // macOSスリープ防止: プロセス終了時に自動解除
-    let _caffeinate = std::process::Command::new("caffeinate")
-        .args(["-i", "-w", &std::process::id().to_string()])
+    // macOSスリープ防止: -d(ディスプレイ) -i(アイドル) -w PID(プロセス終了で自動解除)
+    let _caffeinate = match std::process::Command::new("caffeinate")
+        .args(["-d", "-i", "-w", &std::process::id().to_string()])
         .spawn()
-        .ok();
+    {
+        Ok(child) => {
+            eprintln!("caffeinate started (pid={})", child.id());
+            Some(child)
+        }
+        Err(e) => {
+            eprintln!("caffeinate failed: {}", e);
+            None
+        }
+    };
 
     let config = Config::load(CONFIG_PATH)?;
     let logfile = open_log_file()?;

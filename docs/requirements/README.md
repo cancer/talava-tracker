@@ -12,7 +12,6 @@
 | [external-interfaces.md](external-interfaces.md) | 外部インターフェース仕様（VMT OSC、SteamVR座標系、ONNX等） |
 | [constraints.md](constraints.md) | 制約条件（ハードウェア・環境・技術） |
 | [decisions.md](decisions.md) | 技術的意思決定ログ |
-| [open-issues.md](open-issues.md) | 未解決課題と今後の展望 |
 | [history.md](history.md) | 開発経緯・要求変遷の時系列 |
 
 ## 関連ドキュメント
