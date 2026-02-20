@@ -33,6 +33,7 @@ position_min_cutoff = 1.5
 position_beta = 0.3
 rotation_min_cutoff = 1.0
 rotation_beta = 0.01
+# lower_body_position_beta = 0.5  # 下半身（足・膝）専用beta。未設定時はposition_betaを使用
 
 [interpolation]
 mode = "extrapolate"  # "none" | "extrapolate" | "lerp"

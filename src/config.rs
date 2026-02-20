@@ -110,11 +110,11 @@ impl Default for InterpolationConfig {
     }
 }
 fn default_pos_min_cutoff() -> f32 { 1.5 }
-fn default_pos_beta() -> f32 { 0.01 }
+fn default_pos_beta() -> f32 { 0.3 }
 fn default_rot_min_cutoff() -> f32 { 1.0 }
 fn default_rot_beta() -> f32 { 0.01 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct FilterConfig {
     #[serde(default = "default_pos_min_cutoff")]
     pub position_min_cutoff: f32,
@@ -124,6 +124,9 @@ pub struct FilterConfig {
     pub rotation_min_cutoff: f32,
     #[serde(default = "default_rot_beta")]
     pub rotation_beta: f32,
+    /// 下半身（足・膝）専用のposition_beta。未設定時はposition_betaを使用
+    #[serde(default)]
+    pub lower_body_position_beta: Option<f32>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -180,6 +183,7 @@ impl Default for FilterConfig {
             position_beta: default_pos_beta(),
             rotation_min_cutoff: default_rot_min_cutoff(),
             rotation_beta: default_rot_beta(),
+            lower_body_position_beta: None,
         }
     }
 }
