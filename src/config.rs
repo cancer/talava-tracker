@@ -10,10 +10,6 @@ pub struct Config {
     #[serde(default)]
     pub tracker: TrackerConfig,
     #[serde(default)]
-    pub camera: CameraConfig,
-    #[serde(default)]
-    pub cameras: Vec<CameraEntry>,
-    #[serde(default)]
     pub debug: DebugConfig,
     #[serde(default)]
     pub app: AppConfig,
@@ -23,8 +19,8 @@ pub struct Config {
     pub filter: FilterConfig,
     #[serde(default)]
     pub calibration: CalibrationConfig,
-    /// キャリブレーションファイルパス（設定されていればtracker_bevyで使用）
-    pub calibration_file: Option<String>,
+    /// キャリブレーションファイルパス（必須）
+    pub calibration_file: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,16 +31,6 @@ pub struct VmtConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct TrackerConfig {
-    #[serde(default = "default_scale")]
-    pub scale_x: f32,
-    #[serde(default = "default_scale")]
-    pub scale_y: f32,
-    #[serde(default = "default_body_scale")]
-    pub body_scale: f32,
-    #[serde(default = "default_leg_scale")]
-    pub leg_scale: f32,
-    #[serde(default = "default_depth_scale")]
-    pub depth_scale: f32,
     #[serde(default)]
     pub mirror_x: bool,
     #[serde(default = "default_offset_y")]
@@ -52,19 +38,6 @@ pub struct TrackerConfig {
     /// 足トラッカーのY方向オフセット（メートル）。負値で足を下げる
     #[serde(default)]
     pub foot_y_offset: f32,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CameraConfig {
-    #[serde(default)]
-    pub index: i32,
-    #[serde(default = "default_width")]
-    pub width: u32,
-    #[serde(default = "default_height")]
-    pub height: u32,
-    /// 垂直画角（度）。0で補正無効
-    #[serde(default)]
-    pub fov_v: f32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,50 +161,9 @@ impl Default for FilterConfig {
     }
 }
 
-/// 複数カメラ設定エントリ
-#[derive(Debug, Deserialize, Clone)]
-pub struct CameraEntry {
-    pub index: i32,
-    #[serde(default = "default_width")]
-    pub width: u32,
-    #[serde(default = "default_height")]
-    pub height: u32,
-    /// カメラ位置 [x, y, z] メートル
-    #[serde(default)]
-    pub position: [f32; 3],
-    /// カメラ回転 [rx, ry, rz] 度 (Euler)
-    #[serde(default)]
-    pub rotation: [f32; 3],
-    /// 垂直画角（度）
-    #[serde(default)]
-    pub fov_v: f32,
-}
-
-impl Config {
-    /// cameras配列が設定されていればそれを、なければ既存のcamera設定から生成
-    pub fn camera_entries(&self) -> Vec<CameraEntry> {
-        if !self.cameras.is_empty() {
-            return self.cameras.clone();
-        }
-        vec![CameraEntry {
-            index: self.camera.index,
-            width: self.camera.width,
-            height: self.camera.height,
-            position: [0.0, 0.0, 0.0],
-            rotation: [0.0, 0.0, 0.0],
-            fov_v: self.camera.fov_v,
-        }]
-    }
-}
-
 fn default_vmt_addr() -> String { "127.0.0.1:39570".to_string() }
-fn default_scale() -> f32 { 1.0 }
-fn default_body_scale() -> f32 { 1.0 }
-fn default_leg_scale() -> f32 { 1.0 }
-fn default_depth_scale() -> f32 { 1.0 }
 fn default_offset_y() -> f32 { 1.0 }
-fn default_width() -> u32 { 640 }
-fn default_height() -> u32 { 480 }
+
 impl Default for VmtConfig {
     fn default() -> Self {
         Self { addr: default_vmt_addr() }
@@ -241,25 +173,9 @@ impl Default for VmtConfig {
 impl Default for TrackerConfig {
     fn default() -> Self {
         Self {
-            scale_x: default_scale(),
-            scale_y: default_scale(),
-            body_scale: default_body_scale(),
-            leg_scale: default_leg_scale(),
-            depth_scale: default_depth_scale(),
             mirror_x: false,
             offset_y: default_offset_y(),
             foot_y_offset: 0.0,
-        }
-    }
-}
-
-impl Default for CameraConfig {
-    fn default() -> Self {
-        Self {
-            index: 0,
-            width: default_width(),
-            height: default_height(),
-            fov_v: 0.0,
         }
     }
 }
@@ -270,28 +186,10 @@ impl Default for DebugConfig {
     }
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            vmt: VmtConfig::default(),
-            tracker: TrackerConfig::default(),
-            camera: CameraConfig::default(),
-            cameras: Vec::new(),
-            debug: DebugConfig::default(),
-            app: AppConfig::default(),
-            interpolation: InterpolationConfig::default(),
-            filter: FilterConfig::default(),
-            calibration: CalibrationConfig::default(),
-            calibration_file: None,
-        }
-    }
-}
-
 impl Config {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = fs::read_to_string(path)?;
         let config: Config = toml::from_str(&content)?;
         Ok(config)
     }
-
 }

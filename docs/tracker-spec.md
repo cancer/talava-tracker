@@ -2,7 +2,7 @@
 
 ## 概要
 
-単眼カメラからSpinePose（37キーポイント）で人体姿勢を推定し、6つの仮想トラッカーの位置(x, y, z)と回転(yaw)をOSC経由でVMTに送信する。
+複数カメラからSpinePose（37キーポイント）で人体姿勢を推定し、三角測量で3D座標を復元後、6つの仮想トラッカーの位置(x, y, z)と回転(yaw)をOSC経由でVMTに送信する。
 
 ```
 Mac (カメラ + SpinePose推論)
@@ -12,14 +12,14 @@ Windows (VMT → SteamVR → Beat Saber/VMC)
 
 ## トラッカー一覧
 
-| Index | 部位   | 位置の元データ      | Yaw の元データ       | スケール   |
-|-------|--------|---------------------|----------------------|------------|
-| 0     | 腰     | Hip中点             | 肩方向               | body_scale |
-| 1     | 左足   | LeftAnkle           | 左膝→左足首          | leg_scale  |
-| 2     | 右足   | RightAnkle          | 右膝→右足首          | leg_scale  |
-| 3     | 胸     | Spine03（肩中点FB） | 肩方向               | body_scale |
-| 4     | 左膝   | LeftKnee            | 左腰→左膝            | leg_scale  |
-| 5     | 右膝   | RightKnee           | 右腰→右膝            | leg_scale  |
+| Index | 部位   | 位置の元データ      | Yaw の元データ       |
+|-------|--------|---------------------|----------------------|
+| 0     | 腰     | Hip中点             | 肩方向               |
+| 1     | 左足   | LeftAnkle           | 左膝→左足首          |
+| 2     | 右足   | RightAnkle          | 右膝→右足首          |
+| 3     | 胸     | Spine03（肩中点FB） | 肩方向               |
+| 4     | 左膝   | LeftKnee            | 左腰→左膝            |
+| 5     | 右膝   | RightKnee           | 右腰→右膝            |
 
 - Spine03: SpinePoseキーポイント。検出失敗時は肩中点にフォールバック(FB)。
 - 全トラッカーの回転はyawのみ（pitch, rollは常に0）。
@@ -41,7 +41,7 @@ args: [index: i32, enable: i32, timeoffset: f32, x: f32, y: f32, z: f32, qx: f32
 |----|----------------|--------------------------|
 | x  | 左右           | 画像x（左が正）          |
 | y  | 上下           | 画像y（上が正）+ offset_y |
-| z  | 前後（奥行き） | 胴体高さ比から推定        |
+| z  | 前後（奥行き） | 三角測量で算出            |
 
 ## 座標変換（convert_position）
 
@@ -50,25 +50,18 @@ args: [index: i32, enable: i32, timeoffset: f32, x: f32, y: f32, z: f32, qx: f32
 ```
 ref_x, ref_y = キャリブレーション時のHip中点（未キャリブレーション時は0.5, 0.5）
 
-fov = fov_scale(y)  ... FOV補正係数
-
-pos_x = ((ref_x - hip_x) * scale_x + (hip_x - x) * part_scale * fov) * body_ratio
-pos_y = offset_y + ((ref_y - hip_y) * scale_y + (hip_y - y) * part_scale * fov) * body_ratio
-pos_z = estimate_depth(pose)
+pos_x = (ref_x - hip_x) + (hip_x - x)
+pos_y = offset_y + (ref_y - hip_y) + (hip_y - y)
+pos_z = estimate_depth(pose)  ... 三角測量のz値から算出
 ```
 
 ### 式の構成要素
 
-**グローバル移動項**: `(ref_x - hip_x) * scale_x`, `(ref_y - hip_y) * scale_y`
+**グローバル移動項**: `(ref_x - hip_x)`, `(ref_y - hip_y)`
 - キャリブレーション基準点からの腰の移動量。全トラッカー共通。
 
-**パーツオフセット項**: `(hip_x - x) * part_scale * fov`
-- 腰から各部位までの距離。`part_scale`はbody_scaleまたはleg_scale。
-- FOV補正 `fov` で画像端の距離圧縮を補正。
-
-**body_ratio**: 奥行き変化による見かけの体型変化の補正。
-- `cal_torso_height / current_torso_height`
-- 近づく → 体が大きく映る → ratio < 1 → 全変位を縮小して体型維持。
+**パーツオフセット項**: `(hip_x - x)`
+- 腰から各部位までの距離。三角測量によりメートル単位。
 
 ## キャリブレーション
 
@@ -88,44 +81,18 @@ pos_z = estimate_depth(pose)
 
 ## 奥行き推定（estimate_depth）
 
-胴体の縦の長さ（肩中点→腰中点の垂直距離）の変化率から奥行きを推定。
+三角測量の3D z座標からVR空間の奥行きを算出。
 
 ```
-torso_height = |avg(shoulder_y) - avg(hip_y)|
-pos_z = (1.0 - cal_torso_height / current_torso_height) * depth_scale
+hip_z = avg(left_hip.z, right_hip.z)
+pos_z = cal_hip_z - hip_z
 ```
 
-- 近づく → torso_height増 → z > 0（前方）
-- 離れる → torso_height減 → z < 0（後方）
-- キャリブレーション距離 → z ≈ 0
+- カメラに近づく → hip_z減 → pos_z > 0（VR前方）
+- カメラから離れる → hip_z増 → pos_z < 0（VR後方）
+- キャリブレーション距離 → pos_z ≈ 0
 
-胴体高さを選んだ理由: 体の回転（yaw）に対して不変。肩幅は回転で変化するため不適。
-
-## 体型補正（body_ratio）
-
-奥行きが変化すると画像上の体サイズが変わり、パーツ間距離が伸縮する。これを打ち消す。
-
-```
-body_ratio = cal_torso_height / current_torso_height
-```
-
-グローバル移動項とパーツオフセット項の両方に掛ける。
-
-## FOV補正（fov_scale）
-
-カメラが肩の高さにある場合、画像中心から離れた部位（膝、足首）はカメラからの斜め距離が増え、1ピクセルあたりの物理距離が大きくなる。
-
-```
-half_fov = camera_fov_v_rad / 2
-theta = atan((y - 0.5) * 2 * tan(half_fov))
-fov_scale = 1 / cos(theta)
-```
-
-- 画像中心（y = 0.5）: 補正 = 1.0
-- 画像端: 補正 > 1.0（距離を拡大）
-- `fov_v = 0` で無効（補正 = 1.0 固定）
-
-パーツオフセット項にのみ適用。
+各キーポイントの奥行きも個別に算出（`keypoint_depth`）し、hip以外のトラッカーも正確な前後位置を持つ。
 
 ## フォールバック（キーポイント見失い時）
 
@@ -207,22 +174,9 @@ BodyTracker.compute() → Extrapolator.update() / Lerper.update()
 
 | パラメータ  | 型    | デフォルト | 説明 |
 |-------------|-------|-----------|------|
-| scale_x     | f32   | 1.0       | 水平方向のグローバル移動スケール |
-| scale_y     | f32   | 1.0       | 垂直方向のグローバル移動スケール |
-| body_scale  | f32   | 1.0       | 腰・胸のパーツオフセットスケール |
-| leg_scale   | f32   | 1.0       | 足・膝のパーツオフセットスケール |
-| depth_scale | f32   | 1.0       | 奥行き推定のスケール |
 | mirror_x    | bool  | false     | 左右反転 |
 | offset_y    | f32   | 1.0       | Y座標のベースオフセット（VR空間での高さ基準） |
-
-### [camera]
-
-| パラメータ | 型   | デフォルト | 説明 |
-|-----------|------|-----------|------|
-| index     | i32  | 0         | カメラデバイスID |
-| width     | u32  | 640       | カメラ解像度（幅） |
-| height    | u32  | 480       | カメラ解像度（高さ） |
-| fov_v     | f32  | 0.0       | 垂直画角（度）。0で補正無効 |
+| foot_y_offset | f32 | 0.0      | 足トラッカーのY方向オフセット（メートル） |
 
 ### [app]
 
@@ -263,10 +217,8 @@ BodyTracker.compute() → Extrapolator.update() / Lerper.update()
 
 ## 既知の制約
 
-### 単眼2Dポーズ推定の限界
-
-- **回転**: yawのみ。pitch, rollは取得不可
-- **奥行き**: 胴体高さ比による推定のみ（精度限定的）
+- **回転**: yawのみ。pitch, rollは取得不可（pitchは三角測量z値から計算可能だが、歪み補正問題のため無効化中）
 - **オクルージョン**: 体の一部が隠れると追跡不可。フォールバック（固定オフセット）で部分的に対処
 - **足の回転感度**: 膝→足首方向のyawは内股/がに股の微妙な変化を捉えにくい
 - **つま先立ち**: 足首y座標の変化は捉えるが、足のpitch（傾き）は出力しない
+- **三角測量精度**: カメラ間の基線長・角度に依存。歪み係数が大きい場合の補正が課題

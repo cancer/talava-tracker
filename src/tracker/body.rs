@@ -15,8 +15,6 @@ pub struct BodyPoses {
 struct Calibration {
     hip_x: f32,
     hip_y: f32,
-    shoulder_y: f32,
-    torso_height: f32,
     hip_z: f32, // 3Dモデルの基準z座標（キャリブレーション時の腰z）
     yaw_shoulder: f32,
     yaw_left_foot: f32,
@@ -33,77 +31,21 @@ struct Calibration {
 
 pub struct BodyTracker {
     confidence_threshold: f32,
-    scale_x: f32,
-    scale_y: f32,
-    body_scale: f32,
-    leg_scale: f32,
-    depth_scale: f32,
     mirror_x: bool,
     offset_y: f32,
     foot_y_offset: f32,
-    fov_v_rad: f32,
-    world_coords: bool, // 三角測量モード: キーポイントがワールド座標（メートル）
     calibration: Option<Calibration>,
 }
 
 impl BodyTracker {
-    pub fn from_config(config: &TrackerConfig) -> Self {
-        Self::new(config, 0.0, false)
-    }
-
-    pub fn new(config: &TrackerConfig, fov_v_deg: f32, world_coords: bool) -> Self {
-        // world_coordsモード: 三角測量がメートル単位を出力するためスケール不要
-        let (scale_x, scale_y, body_scale, leg_scale, depth_scale) = if world_coords {
-            (1.0, 1.0, 1.0, 1.0, 1.0)
-        } else {
-            (config.scale_x, config.scale_y, config.body_scale, config.leg_scale, config.depth_scale)
-        };
+    pub fn new(config: &TrackerConfig) -> Self {
         Self {
             confidence_threshold: 0.2,
-            scale_x,
-            scale_y,
-            body_scale,
-            leg_scale,
-            depth_scale,
             mirror_x: config.mirror_x,
             offset_y: config.offset_y,
             foot_y_offset: config.foot_y_offset,
-            fov_v_rad: fov_v_deg.to_radians(),
-            world_coords,
             calibration: None,
         }
-    }
-
-    /// フレーム境界の四肢キーポイントを無効化したPoseを返す
-    /// 画像端のキーポイントはモデルの受容野が切れるため位置が不正確
-    /// 体幹（腰・肩）は画像端でもゴーストになりにくいため対象外
-    fn sanitize_pose(pose: &Pose) -> Pose {
-        use KeypointIndex::*;
-        // 四肢・肩: X/Y両方の境界チェック
-        let full_boundary: &[KeypointIndex] = &[
-            LeftShoulder, RightShoulder,
-            LeftKnee, RightKnee, LeftAnkle, RightAnkle,
-            LeftBigToe, RightBigToe, LeftSmallToe, RightSmallToe,
-            LeftHeel, RightHeel,
-        ];
-        // 腰: X方向のみ境界チェック（Y方向は下半身がフレーム外でも許容）
-        let x_only_boundary: &[KeypointIndex] = &[
-            LeftHip, RightHip,
-        ];
-        let mut sanitized = pose.clone();
-        for &idx in full_boundary {
-            let kp = &mut sanitized.keypoints[idx as usize];
-            if kp.x <= 0.02 || kp.x >= 0.98 || kp.y <= 0.02 || kp.y >= 0.98 {
-                kp.confidence = 0.0;
-            }
-        }
-        for &idx in x_only_boundary {
-            let kp = &mut sanitized.keypoints[idx as usize];
-            if kp.x <= 0.02 || kp.x >= 0.98 {
-                kp.confidence = 0.0;
-            }
-        }
-        sanitized
     }
 
     /// カメラのチルト角を推定（ラジアン）
@@ -183,22 +125,11 @@ impl BodyTracker {
     }
 
     pub fn calibrate(&mut self, pose: &Pose) -> bool {
-        // world_coordsモード: 生poseからチルト角を計算し、補正済みposeでキャリブレーション
-        let tilt_angle = if self.world_coords {
-            Self::compute_tilt_angle(pose, self.confidence_threshold)
-        } else {
-            0.0
-        };
+        let tilt_angle = Self::compute_tilt_angle(pose, self.confidence_threshold);
 
-        let sanitized;
-        let rotated;
-        let pose = if self.world_coords {
-            rotated = Self::rotate_pose_yz(pose, tilt_angle, self.confidence_threshold);
-            &rotated
-        } else {
-            sanitized = Self::sanitize_pose(pose);
-            &sanitized
-        };
+        let rotated = Self::rotate_pose_yz(pose, tilt_angle, self.confidence_threshold);
+        let pose = &rotated;
+
         let left_hip = pose.get(KeypointIndex::LeftHip);
         let right_hip = pose.get(KeypointIndex::RightHip);
 
@@ -210,18 +141,6 @@ impl BodyTracker {
 
         let hip_x = (left_hip.x + right_hip.x) / 2.0;
         let hip_y = (left_hip.y + right_hip.y) / 2.0;
-
-        let left_shoulder = pose.get(KeypointIndex::LeftShoulder);
-        let right_shoulder = pose.get(KeypointIndex::RightShoulder);
-        let shoulder_y = if left_shoulder.is_valid(self.confidence_threshold)
-            && right_shoulder.is_valid(self.confidence_threshold)
-        {
-            (left_shoulder.y + right_shoulder.y) / 2.0
-        } else {
-            0.5
-        };
-
-        let torso_height = self.compute_torso_height(pose).unwrap_or(0.0);
 
         // 3Dモデルのz座標を保存（キャリブレーション基準点）
         let hip_z = (left_hip.z + right_hip.z) / 2.0;
@@ -257,8 +176,6 @@ impl BodyTracker {
         self.calibration = Some(Calibration {
             hip_x,
             hip_y,
-            shoulder_y,
-            torso_height,
             hip_z,
             yaw_shoulder,
             yaw_left_foot,
@@ -278,20 +195,10 @@ impl BodyTracker {
         self.calibration.is_some()
     }
 
-    /// VR空間での最大スケール係数（閾値のスケーリング用）
-    pub fn max_scale(&self) -> f32 {
-        self.scale_x
-            .max(self.scale_y)
-            .max(self.body_scale)
-            .max(self.leg_scale)
-    }
-
     pub fn compute(&self, pose: &Pose) -> BodyPoses {
-        // ワールド座標モードでは境界チェック不要（座標が0-1正規化ではなくメートル単位）
         // キャリブレーション済みならチルト補正を適用
-        let sanitized;
         let rotated;
-        let pose = if self.world_coords {
+        let pose = {
             let tilt = self.calibration.as_ref().map_or(0.0, |c| c.tilt_angle);
             if tilt.abs() > 0.001 {
                 rotated = Self::rotate_pose_yz(pose, tilt, self.confidence_threshold);
@@ -299,9 +206,6 @@ impl BodyTracker {
             } else {
                 pose
             }
-        } else {
-            sanitized = Self::sanitize_pose(pose);
-            &sanitized
         };
         let left_hip = pose.get(KeypointIndex::LeftHip);
         let right_hip = pose.get(KeypointIndex::RightHip);
@@ -314,112 +218,51 @@ impl BodyTracker {
         };
 
         let hip_z = self.estimate_depth(pose);
-        let body_ratio = if self.world_coords { 1.0 } else { self.compute_body_ratio(pose) };
 
-        // Per-keypoint z: world_coordsモードでは各キーポイントの三角測量z値を使用
-        // 三角測量で同一カメラペア（hip基準）が強制されるため、z値の一貫性が保証される
-        // 非world_coordsモードではhip推定深度を全部位に使用（2Dポーズにはz情報なし）
-        let (lf_z, rf_z, ch_z, lk_z, rk_z) = if self.world_coords {
-            (
-                self.keypoint_depth(pose, KeypointIndex::LeftAnkle, hip_z),
-                self.keypoint_depth(pose, KeypointIndex::RightAnkle, hip_z),
-                hip_z, // 胸は肩-腰間の内挿位置、直接のキーポイントなし
-                self.keypoint_depth(pose, KeypointIndex::LeftKnee, hip_z),
-                self.keypoint_depth(pose, KeypointIndex::RightKnee, hip_z),
-            )
-        } else {
-            (hip_z, hip_z, hip_z, hip_z, hip_z)
-        };
+        // Per-keypoint z: 各キーポイントの三角測量z値を使用
+        let lf_z = self.keypoint_depth(pose, KeypointIndex::LeftAnkle, hip_z);
+        let rf_z = self.keypoint_depth(pose, KeypointIndex::RightAnkle, hip_z);
+        let ch_z = hip_z; // 胸は肩-腰間の内挿位置、直接のキーポイントなし
+        let lk_z = self.keypoint_depth(pose, KeypointIndex::LeftKnee, hip_z);
+        let rk_z = self.keypoint_depth(pose, KeypointIndex::RightKnee, hip_z);
 
-        let mut left_foot = self.compute_left_foot(pose, hip_center, lf_z, body_ratio);
-        let mut right_foot = self.compute_right_foot(pose, hip_center, rf_z, body_ratio);
-        let mut left_knee = self.compute_left_knee(pose, hip_center, lk_z, body_ratio);
-        let mut right_knee = self.compute_right_knee(pose, hip_center, rk_z, body_ratio);
+        let mut left_foot = self.compute_left_foot(pose, hip_center, lf_z);
+        let mut right_foot = self.compute_right_foot(pose, hip_center, rf_z);
+        let mut left_knee = self.compute_left_knee(pose, hip_center, lk_z);
+        let mut right_knee = self.compute_right_knee(pose, hip_center, rk_z);
 
         // 左右同一位置の検出: モデルが片側のみ検出時にもう片方を複製するアーティファクト
         Self::reject_duplicate_pair(&mut left_foot, &mut right_foot);
         Self::reject_duplicate_pair(&mut left_knee, &mut right_knee);
 
         BodyPoses {
-            hip: self.compute_hip(pose, hip_center, hip_z, body_ratio),
+            hip: self.compute_hip(pose, hip_center, hip_z),
             left_foot,
             right_foot,
-            chest: self.compute_chest(pose, hip_center, ch_z, body_ratio),
+            chest: self.compute_chest(pose, hip_center, ch_z),
             left_knee,
             right_knee,
         }
     }
 
-    /// 画像座標yにおけるFOV補正係数
-    /// カメラ中心から離れるほど斜め距離が増え、1ピクセルあたりの物理距離が大きくなる
-    fn fov_scale(&self, y: f32) -> f32 {
-        let half_fov = self.fov_v_rad / 2.0;
-        if half_fov < 0.01 {
-            return 1.0;
-        }
-        // カメラ高さ基準: 肩位置からの角度で補正
-        // カメラが肩の高さにある場合、肩から離れるほど斜め距離が増える
-        let camera_y = match &self.calibration {
-            Some(cal) => cal.shoulder_y,
-            None => 0.5,
-        };
-        let theta = ((y - camera_y) * 2.0 * half_fov.tan()).atan();
-        1.0 / theta.cos()
-    }
-
-    fn convert_position(&self, x: f32, y: f32, hip_x: f32, hip_y: f32, part_scale: f32, pos_z: f32, body_ratio: f32) -> [f32; 3] {
+    fn convert_position(&self, x: f32, y: f32, hip_x: f32, hip_y: f32, pos_z: f32) -> [f32; 3] {
         let (ref_x, ref_y) = match &self.calibration {
             Some(cal) => (cal.hip_x, cal.hip_y),
             None => (0.5, 0.5),
         };
-        let fov = self.fov_scale(y);
 
-        // パースペクティブ補正: 奥行き変化による見かけの腰位置シフトを除去
-        // ピンホールカメラモデルでは画像中心(0.5)からのオフセットが深度に反比例する
-        // 前後移動がVR空間の上下移動に化けるのを防ぐ
-        // ワールド座標モードでは不要（三角測量が真の3D位置を算出済み）
-        let (perspective_x_shift, perspective_y_shift) = if self.world_coords {
-            (0.0, 0.0)
-        } else {
-            (
-                (ref_x - 0.5) * (1.0 / body_ratio - 1.0),
-                (ref_y - 0.5) * (1.0 / body_ratio - 1.0),
-            )
-        };
+        let global_x = ref_x - hip_x;
+        let global_y = ref_y - hip_y;
 
-        let global_x = (ref_x - hip_x + perspective_x_shift) * self.scale_x;
-        let global_y = (ref_y - hip_y + perspective_y_shift) * self.scale_y;
-
-        let mut pos_x = (global_x + (hip_x - x) * part_scale * fov) * body_ratio;
+        let mut pos_x = global_x + (hip_x - x);
         if self.mirror_x {
             pos_x = -pos_x;
         }
-        let pos_y = self.offset_y + (global_y + (hip_y - y) * part_scale * fov) * body_ratio;
+        let pos_y = self.offset_y + global_y + (hip_y - y);
         [pos_x, pos_y, pos_z]
     }
 
-    /// 胴体の縦の長さ（肩中点→腰中点の垂直距離）
-    fn compute_torso_height(&self, pose: &Pose) -> Option<f32> {
-        let ls = pose.get(KeypointIndex::LeftShoulder);
-        let rs = pose.get(KeypointIndex::RightShoulder);
-        let lh = pose.get(KeypointIndex::LeftHip);
-        let rh = pose.get(KeypointIndex::RightHip);
-
-        if !ls.is_valid(self.confidence_threshold)
-            || !rs.is_valid(self.confidence_threshold)
-            || !lh.is_valid(self.confidence_threshold)
-            || !rh.is_valid(self.confidence_threshold)
-        {
-            return None;
-        }
-
-        let shoulder_y = (ls.y + rs.y) / 2.0;
-        let hip_y = (lh.y + rh.y) / 2.0;
-        Some((hip_y - shoulder_y).abs())
-    }
-
     fn estimate_depth(&self, pose: &Pose) -> f32 {
-        // 3Dモデルのz座標がある場合
         let left_hip = pose.get(KeypointIndex::LeftHip);
         let right_hip = pose.get(KeypointIndex::RightHip);
         if left_hip.is_valid(self.confidence_threshold)
@@ -430,21 +273,10 @@ impl BodyTracker {
             // キャリブレーション済みなら基準z値からの差分を使用
             // カメラ座標系(z=奥)→VR座標系(z=前)の変換: 符号反転
             let ref_z = self.calibration.as_ref().map_or(0.0, |c| c.hip_z);
-            return (ref_z - hip_z) * self.depth_scale;
+            return ref_z - hip_z;
         }
 
-        // フォールバック: 胴体高さ比率ベース推定
-        let cal = match &self.calibration {
-            Some(cal) if cal.torso_height > 0.01 => cal,
-            _ => return 0.0,
-        };
-
-        let current = match self.compute_torso_height(pose) {
-            Some(h) if h > 0.01 => h,
-            _ => return 0.0,
-        };
-
-        (1.0 - cal.torso_height / current) * self.depth_scale
+        0.0
     }
 
     /// 個別キーポイントの奥行き（VR z座標）
@@ -454,26 +286,10 @@ impl BodyTracker {
         let kp = pose.get(kp_idx);
         if kp.is_valid(self.confidence_threshold) && kp.z.abs() > 0.001 {
             let ref_z = self.calibration.as_ref().map_or(0.0, |c| c.hip_z);
-            (ref_z - kp.z) * self.depth_scale
+            ref_z - kp.z
         } else {
             fallback
         }
-    }
-
-    /// 奥行き変化による見かけの体型変化を補正する比率
-    /// cal_torso / current: 近づく→比率<1→オフセット縮小、離れる→比率>1→オフセット拡大
-    fn compute_body_ratio(&self, pose: &Pose) -> f32 {
-        let cal = match &self.calibration {
-            Some(cal) if cal.torso_height > 0.01 => cal,
-            _ => return 1.0,
-        };
-
-        let current = match self.compute_torso_height(pose) {
-            Some(h) if h > 0.01 => h,
-            _ => return 1.0,
-        };
-
-        cal.torso_height / current
     }
 
     fn compute_shoulder_yaw(&self, pose: &Pose) -> f32 {
@@ -545,9 +361,9 @@ impl BodyTracker {
         ]
     }
 
-    fn compute_hip(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32, body_ratio: f32) -> Option<TrackerPose> {
+    fn compute_hip(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32) -> Option<TrackerPose> {
         let (hip_x, hip_y) = hip_center?;
-        let position = self.convert_position(hip_x, hip_y, hip_x, hip_y, self.body_scale, pos_z, body_ratio);
+        let position = self.convert_position(hip_x, hip_y, hip_x, hip_y, pos_z);
 
         let ref_yaw = self.calibration.as_ref().map_or(0.0, |c| c.yaw_shoulder);
         let yaw = self.compute_shoulder_yaw(pose) - ref_yaw;
@@ -556,7 +372,7 @@ impl BodyTracker {
         Some(TrackerPose::new(position, rotation))
     }
 
-    fn compute_left_foot(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32, body_ratio: f32) -> Option<TrackerPose> {
+    fn compute_left_foot(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32) -> Option<TrackerPose> {
         let (hip_x, hip_y) = hip_center?;
         let knee = pose.get(KeypointIndex::LeftKnee);
         let ankle = pose.get(KeypointIndex::LeftAnkle);
@@ -573,7 +389,7 @@ impl BodyTracker {
             return None;
         };
 
-        let mut position = self.convert_position(ax, ay, hip_x, hip_y, self.leg_scale, pos_z, body_ratio);
+        let mut position = self.convert_position(ax, ay, hip_x, hip_y, pos_z);
         position[1] += self.foot_y_offset;
 
         // yaw: knee+ankle両方有効な場合のみ計算、それ以外は0
@@ -588,7 +404,7 @@ impl BodyTracker {
         Some(TrackerPose::new(position, rotation))
     }
 
-    fn compute_right_foot(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32, body_ratio: f32) -> Option<TrackerPose> {
+    fn compute_right_foot(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32) -> Option<TrackerPose> {
         let (hip_x, hip_y) = hip_center?;
         let knee = pose.get(KeypointIndex::RightKnee);
         let ankle = pose.get(KeypointIndex::RightAnkle);
@@ -605,7 +421,7 @@ impl BodyTracker {
             return None;
         };
 
-        let mut position = self.convert_position(ax, ay, hip_x, hip_y, self.leg_scale, pos_z, body_ratio);
+        let mut position = self.convert_position(ax, ay, hip_x, hip_y, pos_z);
         position[1] += self.foot_y_offset;
 
         // yaw: knee+ankle両方有効な場合のみ計算、それ以外は0
@@ -620,7 +436,7 @@ impl BodyTracker {
         Some(TrackerPose::new(position, rotation))
     }
 
-    fn compute_chest(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32, body_ratio: f32) -> Option<TrackerPose> {
+    fn compute_chest(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32) -> Option<TrackerPose> {
         let (hip_x, hip_y) = hip_center?;
         let left_shoulder = pose.get(KeypointIndex::LeftShoulder);
         let right_shoulder = pose.get(KeypointIndex::RightShoulder);
@@ -646,7 +462,7 @@ impl BodyTracker {
         // Y座標: 肩と腰中点を内挿して胸骨付近を推定
         let y = shoulder_y + (hip_y - shoulder_y) * 0.35;
 
-        let position = self.convert_position(x, y, hip_x, hip_y, self.body_scale, pos_z, body_ratio);
+        let position = self.convert_position(x, y, hip_x, hip_y, pos_z);
 
         let ref_yaw = self.calibration.as_ref().map_or(0.0, |c| c.yaw_shoulder);
         let yaw = self.compute_shoulder_yaw(pose) - ref_yaw;
@@ -677,7 +493,7 @@ impl BodyTracker {
         }
     }
 
-    fn compute_left_knee(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32, body_ratio: f32) -> Option<TrackerPose> {
+    fn compute_left_knee(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32) -> Option<TrackerPose> {
         let (hip_x, hip_y) = hip_center?;
         let knee = pose.get(KeypointIndex::LeftKnee);
 
@@ -693,7 +509,7 @@ impl BodyTracker {
             return None;
         };
 
-        let position = self.convert_position(kx, ky, hip_x, hip_y, self.leg_scale, pos_z, body_ratio);
+        let position = self.convert_position(kx, ky, hip_x, hip_y, pos_z);
 
         let yaw = if has_keypoint {
             let ref_yaw = self.calibration.as_ref().map_or(0.0, |c| c.yaw_left_knee);
@@ -712,7 +528,7 @@ impl BodyTracker {
         Some(TrackerPose::new(position, rotation))
     }
 
-    fn compute_right_knee(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32, body_ratio: f32) -> Option<TrackerPose> {
+    fn compute_right_knee(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32) -> Option<TrackerPose> {
         let (hip_x, hip_y) = hip_center?;
         let knee = pose.get(KeypointIndex::RightKnee);
 
@@ -728,7 +544,7 @@ impl BodyTracker {
             return None;
         };
 
-        let position = self.convert_position(kx, ky, hip_x, hip_y, self.leg_scale, pos_z, body_ratio);
+        let position = self.convert_position(kx, ky, hip_x, hip_y, pos_z);
 
         let yaw = if has_keypoint {
             let ref_yaw = self.calibration.as_ref().map_or(0.0, |c| c.yaw_right_knee);
@@ -752,238 +568,6 @@ impl BodyTracker {
 mod tests {
     use super::*;
     use crate::pose::Keypoint;
-
-    fn make_pose(
-        left_hip: (f32, f32),
-        right_hip: (f32, f32),
-        left_shoulder: (f32, f32),
-        right_shoulder: (f32, f32),
-        left_knee: (f32, f32),
-        right_knee: (f32, f32),
-        left_ankle: (f32, f32),
-        right_ankle: (f32, f32),
-    ) -> Pose {
-        let mut keypoints = [Keypoint::default(); KeypointIndex::COUNT];
-        keypoints[KeypointIndex::LeftHip as usize] =
-            Keypoint::new(left_hip.0, left_hip.1, 0.9);
-        keypoints[KeypointIndex::RightHip as usize] =
-            Keypoint::new(right_hip.0, right_hip.1, 0.9);
-        keypoints[KeypointIndex::LeftShoulder as usize] =
-            Keypoint::new(left_shoulder.0, left_shoulder.1, 0.9);
-        keypoints[KeypointIndex::RightShoulder as usize] =
-            Keypoint::new(right_shoulder.0, right_shoulder.1, 0.9);
-        keypoints[KeypointIndex::LeftKnee as usize] =
-            Keypoint::new(left_knee.0, left_knee.1, 0.9);
-        keypoints[KeypointIndex::RightKnee as usize] =
-            Keypoint::new(right_knee.0, right_knee.1, 0.9);
-        keypoints[KeypointIndex::LeftAnkle as usize] =
-            Keypoint::new(left_ankle.0, left_ankle.1, 0.9);
-        keypoints[KeypointIndex::RightAnkle as usize] =
-            Keypoint::new(right_ankle.0, right_ankle.1, 0.9);
-        Pose::new(keypoints)
-    }
-
-    #[test]
-    fn test_hip_center_uncalibrated() {
-        let config = TrackerConfig::default();
-        let tracker = BodyTracker::from_config(&config);
-        // Hip at center (0.5, 0.5)
-        let pose = make_pose(
-            (0.5, 0.5), (0.5, 0.5),   // hips
-            (0.4, 0.3), (0.6, 0.3),   // shoulders
-            (0.4, 0.7), (0.6, 0.7),   // knees
-            (0.4, 0.9), (0.6, 0.9),   // ankles
-        );
-        let result = tracker.compute(&pose);
-        let hip = result.hip.unwrap();
-        assert!((hip.position[0]).abs() < 0.01);
-        assert!((hip.position[1] - 1.0).abs() < 0.01);
-        assert!((hip.position[2]).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_calibration_zeroes_hip() {
-        let config = TrackerConfig::default();
-        let mut tracker = BodyTracker::from_config(&config);
-        let pose = make_pose(
-            (0.3, 0.4), (0.3, 0.4),
-            (0.2, 0.2), (0.4, 0.2),
-            (0.2, 0.6), (0.4, 0.6),
-            (0.2, 0.8), (0.4, 0.8),
-        );
-        assert!(tracker.calibrate(&pose));
-
-        let result = tracker.compute(&pose);
-        let hip = result.hip.unwrap();
-        assert!((hip.position[0]).abs() < 0.01);
-        assert!((hip.position[1] - 1.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_chest_above_hip() {
-        let config = TrackerConfig::default();
-        let tracker = BodyTracker::from_config(&config);
-        // Shoulders at y=0.3 (higher in image = higher in space), hips at y=0.5
-        let pose = make_pose(
-            (0.4, 0.5), (0.6, 0.5),
-            (0.4, 0.3), (0.6, 0.3),
-            (0.4, 0.7), (0.6, 0.7),
-            (0.4, 0.9), (0.6, 0.9),
-        );
-        let result = tracker.compute(&pose);
-        let hip = result.hip.unwrap();
-        let chest = result.chest.unwrap();
-        // Chest should have higher pos_y than hip (shoulders are above hips in image)
-        assert!(chest.position[1] > hip.position[1]);
-    }
-
-    #[test]
-    fn test_foot_below_hip() {
-        let config = TrackerConfig::default();
-        let tracker = BodyTracker::from_config(&config);
-        // Ankles at y=0.9 (lower in image = lower in space), hips at y=0.5
-        let pose = make_pose(
-            (0.4, 0.5), (0.6, 0.5),
-            (0.4, 0.3), (0.6, 0.3),
-            (0.4, 0.7), (0.6, 0.7),
-            (0.4, 0.9), (0.6, 0.9),
-        );
-        let result = tracker.compute(&pose);
-        let hip = result.hip.unwrap();
-        let left_foot = result.left_foot.unwrap();
-        let right_foot = result.right_foot.unwrap();
-        // Feet should have lower pos_y than hip
-        assert!(left_foot.position[1] < hip.position[1]);
-        assert!(right_foot.position[1] < hip.position[1]);
-    }
-
-    #[test]
-    fn test_all_trackers_returned() {
-        let config = TrackerConfig::default();
-        let tracker = BodyTracker::from_config(&config);
-        let pose = make_pose(
-            (0.4, 0.5), (0.6, 0.5),
-            (0.4, 0.3), (0.6, 0.3),
-            (0.4, 0.7), (0.6, 0.7),
-            (0.4, 0.9), (0.6, 0.9),
-        );
-        let result = tracker.compute(&pose);
-        assert!(result.hip.is_some());
-        assert!(result.left_foot.is_some());
-        assert!(result.right_foot.is_some());
-        assert!(result.chest.is_some());
-    }
-
-    #[test]
-    fn test_depth_closer_positive_z() {
-        let config = TrackerConfig::default();
-        let mut tracker = BodyTracker::from_config(&config);
-
-        // キャリブレーション: 肩y=0.3, 腰y=0.5 → 胴体高さ=0.2
-        let cal_pose = make_pose(
-            (0.4, 0.5), (0.6, 0.5),
-            (0.4, 0.3), (0.6, 0.3),
-            (0.4, 0.7), (0.6, 0.7),
-            (0.4, 0.9), (0.6, 0.9),
-        );
-        assert!(tracker.calibrate(&cal_pose));
-
-        // 近づく: 胴体が大きく映る（肩y=0.25, 腰y=0.55 → 胴体高さ=0.3）
-        let closer_pose = make_pose(
-            (0.35, 0.55), (0.65, 0.55),
-            (0.35, 0.25), (0.65, 0.25),
-            (0.35, 0.75), (0.65, 0.75),
-            (0.35, 0.95), (0.65, 0.95),
-        );
-        let result = tracker.compute(&closer_pose);
-        let hip = result.hip.unwrap();
-        assert!(hip.position[2] > 0.0, "closer should give positive z, got {}", hip.position[2]);
-    }
-
-    #[test]
-    fn test_depth_farther_negative_z() {
-        let config = TrackerConfig::default();
-        let mut tracker = BodyTracker::from_config(&config);
-
-        // キャリブレーション: 胴体高さ=0.2
-        let cal_pose = make_pose(
-            (0.4, 0.5), (0.6, 0.5),
-            (0.4, 0.3), (0.6, 0.3),
-            (0.4, 0.7), (0.6, 0.7),
-            (0.4, 0.9), (0.6, 0.9),
-        );
-        assert!(tracker.calibrate(&cal_pose));
-
-        // 離れる: 胴体が小さく映る（肩y=0.35, 腰y=0.5 → 胴体高さ=0.15）
-        let farther_pose = make_pose(
-            (0.45, 0.5), (0.55, 0.5),
-            (0.45, 0.35), (0.55, 0.35),
-            (0.45, 0.65), (0.55, 0.65),
-            (0.45, 0.8), (0.55, 0.8),
-        );
-        let result = tracker.compute(&farther_pose);
-        let hip = result.hip.unwrap();
-        assert!(hip.position[2] < 0.0, "farther should give negative z, got {}", hip.position[2]);
-    }
-
-    #[test]
-    fn test_body_proportion_stable_at_different_depths() {
-        let config = TrackerConfig::default();
-        let mut tracker = BodyTracker::from_config(&config);
-
-        // キャリブレーション: 胴体高さ=0.2
-        let cal_pose = make_pose(
-            (0.4, 0.5), (0.6, 0.5),
-            (0.4, 0.3), (0.6, 0.3),
-            (0.4, 0.7), (0.6, 0.7),
-            (0.4, 0.9), (0.6, 0.9),
-        );
-        assert!(tracker.calibrate(&cal_pose));
-        let cal_result = tracker.compute(&cal_pose);
-        let cal_hip_y = cal_result.hip.unwrap().position[1];
-        let cal_chest_y = cal_result.chest.unwrap().position[1];
-        let cal_diff = cal_chest_y - cal_hip_y;
-
-        // 近づく: 胴体が1.5倍に（胴体高さ0.3）
-        let closer_pose = make_pose(
-            (0.35, 0.55), (0.65, 0.55),
-            (0.35, 0.25), (0.65, 0.25),
-            (0.35, 0.75), (0.65, 0.75),
-            (0.35, 0.95), (0.65, 0.95),
-        );
-        let closer_result = tracker.compute(&closer_pose);
-        let closer_hip_y = closer_result.hip.unwrap().position[1];
-        let closer_chest_y = closer_result.chest.unwrap().position[1];
-        let closer_diff = closer_chest_y - closer_hip_y;
-
-        // 胸-腰の距離がキャリブレーション時と近いこと（補正なしだと1.5倍になる）
-        let ratio = closer_diff / cal_diff;
-        assert!(
-            (ratio - 1.0).abs() < 0.15,
-            "body proportion should be stable, got ratio={:.2} (cal_diff={:.3}, closer_diff={:.3})",
-            ratio, cal_diff, closer_diff
-        );
-    }
-
-    #[test]
-    fn test_depth_zero_at_calibration() {
-        let config = TrackerConfig::default();
-        let mut tracker = BodyTracker::from_config(&config);
-
-        let pose = make_pose(
-            (0.4, 0.5), (0.6, 0.5),
-            (0.4, 0.3), (0.6, 0.3),
-            (0.4, 0.7), (0.6, 0.7),
-            (0.4, 0.9), (0.6, 0.9),
-        );
-        assert!(tracker.calibrate(&pose));
-
-        let result = tracker.compute(&pose);
-        let hip = result.hip.unwrap();
-        assert!((hip.position[2]).abs() < 0.01, "same pose as calibration should give z≈0, got {}", hip.position[2]);
-    }
-
-    // --- ワールド座標（三角測量）モードのテスト ---
 
     /// カメラ座標系（X右, Y下, Z前方）メートル単位のPoseを生成
     /// カメラ高さ1.0m、人物2.0m前方を想定
@@ -1031,16 +615,15 @@ mod tests {
     #[test]
     fn test_world_coords_calibration_succeeds() {
         let config = TrackerConfig::default();
-        let mut tracker = BodyTracker::new(&config, 0.0, true);
+        let mut tracker = BodyTracker::new(&config);
         let pose = standing_world_pose();
-        // ワールド座標でもキャリブレーション成功すること
         assert!(tracker.calibrate(&pose), "calibration should succeed with world coords");
     }
 
     #[test]
     fn test_world_coords_all_trackers_returned() {
         let config = TrackerConfig::default();
-        let mut tracker = BodyTracker::new(&config, 0.0, true);
+        let mut tracker = BodyTracker::new(&config);
         let pose = standing_world_pose();
         tracker.calibrate(&pose);
 
@@ -1056,7 +639,7 @@ mod tests {
     #[test]
     fn test_world_coords_anatomy() {
         let config = TrackerConfig::default();
-        let mut tracker = BodyTracker::new(&config, 0.0, true);
+        let mut tracker = BodyTracker::new(&config);
         let pose = standing_world_pose();
         tracker.calibrate(&pose);
 
@@ -1084,7 +667,7 @@ mod tests {
     #[test]
     fn test_world_coords_calibration_zeroes_hip() {
         let config = TrackerConfig::default();
-        let mut tracker = BodyTracker::new(&config, 0.0, true);
+        let mut tracker = BodyTracker::new(&config);
         let pose = standing_world_pose();
         tracker.calibrate(&pose);
 
@@ -1100,7 +683,7 @@ mod tests {
     #[test]
     fn test_world_coords_lateral_movement() {
         let config = TrackerConfig::default();
-        let mut tracker = BodyTracker::new(&config, 0.0, true);
+        let mut tracker = BodyTracker::new(&config);
         let pose = standing_world_pose();
         tracker.calibrate(&pose);
 
@@ -1121,7 +704,7 @@ mod tests {
     #[test]
     fn test_world_coords_depth_movement() {
         let config = TrackerConfig::default();
-        let mut tracker = BodyTracker::new(&config, 0.0, true);
+        let mut tracker = BodyTracker::new(&config);
         let pose = standing_world_pose();
         tracker.calibrate(&pose);
 
@@ -1142,7 +725,7 @@ mod tests {
     #[test]
     fn test_world_coords_squat() {
         let config = TrackerConfig::default();
-        let mut tracker = BodyTracker::new(&config, 0.0, true);
+        let mut tracker = BodyTracker::new(&config);
         let pose = standing_world_pose();
         tracker.calibrate(&pose);
 
@@ -1169,7 +752,7 @@ mod tests {
     #[test]
     fn test_tilt_correction_z_does_not_leak_into_y() {
         let config = TrackerConfig::default();
-        let mut tracker = BodyTracker::new(&config, 0.0, true);
+        let mut tracker = BodyTracker::new(&config);
 
         // カメラが30°下向き: 立っている人のhip→ankleが(Δy=0.69, Δz=0.40)に見える
         // 真の鉛直距離0.8m, tilt=30° → Δy=0.8*cos(30°)≈0.69, Δz=0.8*sin(30°)=0.40

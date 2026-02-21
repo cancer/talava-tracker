@@ -69,7 +69,6 @@ struct PoseState {
     prev_poses: Vec<Option<Pose>>,
     pose_timestamps: Vec<Option<Instant>>,
     pose_3d: Option<Pose>,
-    multi_camera: bool,
 }
 
 #[derive(Resource)]
@@ -174,103 +173,55 @@ fn main() -> Result<()> {
     log!(logfile, "Target FPS: {}", config.app.target_fps);
     log!(logfile, "Interpolation: {}", config.interpolation.mode);
 
-    // カメラ起動: calibration.jsonがあればそちらから、なければconfig.tomlの設定を使用
+    // カメラ起動: calibration.jsonからカメラパラメータを読み込み
     let mut cameras = Vec::new();
     let mut params = Vec::new();
     let mut widths = Vec::new();
     let mut heights = Vec::new();
 
-    if let Some(ref cal_path) = config.calibration_file {
-        // キャリブレーションファイルからカメラ起動
-        match load_calibration(cal_path) {
-            Ok(cal) => {
-                log!(logfile, "Calibration: {}", cal_path);
-                log!(logfile, "Cameras: {}", cal.cameras.len());
-                for cam_cal in &cal.cameras {
-                    let cam = ThreadedCamera::start(
-                        cam_cal.camera_index,
-                        Some(cam_cal.width),
-                        Some(cam_cal.height),
-                    )?;
-                    let (w, h) = cam.resolution();
-                    log!(logfile, "Camera {}: {}x{}", cam_cal.camera_index, w, h);
-                    // 歪み係数は無効化: キャリブレーションの歪み係数が異常に大きい場合
-                    // (k2=-100等)、undistort_point()が収束せずリプロジェクション比較が破綻する。
-                    // 歪み補正なしでも内部/外部パラメータによる三角測量は機能する。
-                    let dc: [f64; 5] = [0.0; 5];
-                    params.push(CameraParams::from_calibration(
-                        &cam_cal.intrinsic_matrix,
-                        &dc,
-                        &cam_cal.rvec,
-                        &cam_cal.tvec,
-                        cam_cal.width,
-                        cam_cal.height,
-                    ));
-                    // 実際の解像度がキャリブレーション解像度と異なる場合、
-                    // 内部パラメータをリスケール
-                    if w != cam_cal.width || h != cam_cal.height {
-                        let last = params.last_mut().unwrap();
-                        if last.rescale_to(w, h) {
-                            log!(logfile, "  -> Rescaled intrinsics: {}x{} -> {}x{}", cam_cal.width, cam_cal.height, w, h);
-                        } else {
-                            log!(logfile, "  WARNING: Aspect ratio mismatch! cal={}x{} actual={}x{}. Triangulation may be inaccurate.",
-                                cam_cal.width, cam_cal.height, w, h);
-                        }
-                    }
-                    widths.push(w);
-                    heights.push(h);
-                    cameras.push(cam);
-                }
-            }
-            Err(e) => {
-                log!(logfile, "Calibration load failed: {}. Falling back to config.", e);
-                // フォールバック: config.toml
-                let entries = config.camera_entries();
-                for entry in &entries {
-                    let cam = ThreadedCamera::start(
-                        entry.index,
-                        Some(entry.width),
-                        Some(entry.height),
-                    )?;
-                    let (w, h) = cam.resolution();
-                    log!(logfile, "Camera {}: {}x{}", entry.index, w, h);
-                    if entries.len() >= 2 {
-                        params.push(CameraParams::from_config(
-                            entry.fov_v, w, h, entry.position, entry.rotation,
-                        ));
-                    }
-                    widths.push(w);
-                    heights.push(h);
-                    cameras.push(cam);
-                }
+    let cal_path = &config.calibration_file;
+    let cal = load_calibration(cal_path)
+        .unwrap_or_else(|e| panic!("Calibration load failed: {}. calibration_file={}", e, cal_path));
+    log!(logfile, "Calibration: {}", cal_path);
+    log!(logfile, "Cameras: {}", cal.cameras.len());
+    for cam_cal in &cal.cameras {
+        let cam = ThreadedCamera::start(
+            cam_cal.camera_index,
+            Some(cam_cal.width),
+            Some(cam_cal.height),
+        )?;
+        let (w, h) = cam.resolution();
+        log!(logfile, "Camera {}: {}x{}", cam_cal.camera_index, w, h);
+        // 歪み係数は無効化: キャリブレーションの歪み係数が異常に大きい場合
+        // (k2=-100等)、undistort_point()が収束せずリプロジェクション比較が破綻する。
+        // 歪み補正なしでも内部/外部パラメータによる三角測量は機能する。
+        let dc: [f64; 5] = [0.0; 5];
+        params.push(CameraParams::from_calibration(
+            &cam_cal.intrinsic_matrix,
+            &dc,
+            &cam_cal.rvec,
+            &cam_cal.tvec,
+            cam_cal.width,
+            cam_cal.height,
+        ));
+        // 実際の解像度がキャリブレーション解像度と異なる場合、
+        // 内部パラメータをリスケール
+        if w != cam_cal.width || h != cam_cal.height {
+            let last = params.last_mut().unwrap();
+            if last.rescale_to(w, h) {
+                log!(logfile, "  -> Rescaled intrinsics: {}x{} -> {}x{}", cam_cal.width, cam_cal.height, w, h);
+            } else {
+                log!(logfile, "  WARNING: Aspect ratio mismatch! cal={}x{} actual={}x{}. Triangulation may be inaccurate.",
+                    cam_cal.width, cam_cal.height, w, h);
             }
         }
-    } else {
-        // config.tomlのカメラ設定を使用
-        let entries = config.camera_entries();
-        log!(logfile, "Cameras: {}", entries.len());
-        for entry in &entries {
-            let cam = ThreadedCamera::start(
-                entry.index,
-                Some(entry.width),
-                Some(entry.height),
-            )?;
-            let (w, h) = cam.resolution();
-            log!(logfile, "Camera {}: {}x{}", entry.index, w, h);
-            if entries.len() >= 2 {
-                params.push(CameraParams::from_config(
-                    entry.fov_v, w, h, entry.position, entry.rotation,
-                ));
-            }
-            widths.push(w);
-            heights.push(h);
-            cameras.push(cam);
-        }
+        widths.push(w);
+        heights.push(h);
+        cameras.push(cam);
     }
 
     let num_cameras = cameras.len();
-    let multi_camera = num_cameras >= 2;
-    log!(logfile, "Mode: {}", if multi_camera { "triangulation" } else { "single camera" });
+    log!(logfile, "Mode: triangulation");
     log!(logfile, "");
 
     // 推論スレッド
@@ -394,8 +345,7 @@ fn main() -> Result<()> {
     });
 
     // Body tracker
-    let fov_v = if multi_camera { 0.0 } else { config.camera.fov_v };
-    let body_tracker = BodyTracker::new(&config.tracker, fov_v, multi_camera);
+    let body_tracker = BodyTracker::new(&config.tracker);
     let filters: [PoseFilter; TRACKER_COUNT] =
         make_filters(&config.filter);
     let extrapolators: [Extrapolator; TRACKER_COUNT] =
@@ -465,7 +415,6 @@ fn main() -> Result<()> {
             prev_poses: vec![None; num_cameras],
             pose_timestamps: vec![None; num_cameras],
             pose_3d: None,
-            multi_camera,
         })
         .insert_resource(TrackerState {
             body_tracker,
@@ -581,15 +530,7 @@ fn triangulate_system(
     cam_inputs: Res<CameraInputs>,
     mut pose_state: ResMut<PoseState>,
 ) {
-    if !pose_state.multi_camera {
-        // 単眼モード: 最初のカメラのPoseをそのまま使用
-        // clone()で毎フレーム供給することでOne Euroフィルタが高頻度(75Hz)で
-        // 動作し、安定した平滑化を実現する
-        pose_state.pose_3d = pose_state.poses_2d[0].clone();
-        return;
-    }
-
-    // 複数カメラ: 全カメラのPoseが揃っているか、またはタイムアウトで部分更新
+    // 全カメラのPoseが揃っているか、またはタイムアウトで部分更新
     let all_ready = pose_state.poses_2d.iter().all(|p| p.is_some());
     let ready_count = pose_state.poses_2d.iter().filter(|p| p.is_some()).count();
 
@@ -736,7 +677,7 @@ fn compute_trackers_system(
     };
 
     // 三角測量の出力が妥当な範囲か検証（カメラから±10m以内）
-    if pose_state.multi_camera {
+    {
         use talava_tracker::pose::KeypointIndex;
         let lh = pose.get(KeypointIndex::LeftHip);
         let rh = pose.get(KeypointIndex::RightHip);
@@ -760,14 +701,7 @@ fn compute_trackers_system(
     let lerp_t = (dt / (1.0 / 30.0)).min(1.0);
 
     let now = Instant::now();
-    // VR空間スケールに応じた閾値
-    // 単眼モード(scale~1): 1.0/1.5、複眼モード(scale~3.4): スケール比例
-    let scale_factor = if pose_state.multi_camera {
-        let cfg = &tracker_state.body_tracker;
-        cfg.max_scale()
-    } else {
-        1.0
-    };
+    let scale_factor = 1.0_f32;
     let max_displacement = 0.4 * scale_factor;
     let max_limb_dist = 1.5 * scale_factor;
 
@@ -822,16 +756,12 @@ fn compute_trackers_system(
                     // 連続5回拒否 → 正当な急速移動と判断
                     // ただしz軸ジャンプ（三角測量のカメラペア切替由来）を防ぐため
                     // 受入前にz差をチェック（マルチカメラモード時）
-                    let z_ok = if pose_state.multi_camera {
-                        match tracker_state.last_poses[i].as_ref() {
-                            Some(last) => {
-                                let dz = (p.position[2] - last.position[2]).abs();
-                                dz <= 0.3 * scale_factor
-                            }
-                            None => true,
+                    let z_ok = match tracker_state.last_poses[i].as_ref() {
+                        Some(last) => {
+                            let dz = (p.position[2] - last.position[2]).abs();
+                            dz <= 0.3 * scale_factor
                         }
-                    } else {
-                        true
+                        None => true,
                     };
                     if z_ok {
                         // フィルタリセットして新位置を受け入れ

@@ -3,7 +3,7 @@
 ## 概要
 
 カメラ映像から人体姿勢を推定し、SteamVRの仮想トラッカーとして出力するシステム。
-単眼モードと複眼（三角測量）モードを切り替え可能。
+複数カメラ三角測量による3Dポーズ推定。
 
 ## 用途
 
@@ -37,22 +37,11 @@ Beat Saber撮影（操作用途ではない）
 
 ## 動作モード
 
-### 単眼モード
-
-`config.toml`で`calibration_file`が未設定、かつ`[[cameras]]`が1台以下の場合。
-
-- `[camera]`セクションの設定を使用
-- 2Dポーズをそのままbody trackerに渡す
-- FOV補正による奥行き推定（`fov_v`設定）
-- One Euroフィルタが毎フレーム`.clone()`で供給され、高頻度（~75Hz）で安定動作
-
-### 複眼モード（三角測量）
-
-`config.toml`で`calibration_file = "calibration.json"`を設定した場合。
+`config.toml`で`calibration_file = "calibration.json"`を設定（必須）。
 
 - `calibration.json`からカメラパラメータ（内部行列、歪み係数、外部パラメータ）を読み込み
 - 各カメラで独立に2Dポーズ推定 → DLT三角測量で3Dポーズを再構成
-- FOV補正は無効（`fov_v = 0.0`）、三角測量が直接3D座標を算出
+- 三角測量が直接メートル単位の3D座標を算出
 
 ## データフロー（複眼モード）
 
@@ -93,7 +82,7 @@ Beat Saber撮影（操作用途ではない）
                     ▼
          ┌─────────────────────┐
          │compute_trackers_system│  pose_3d → BodyTracker.compute()
-         │  ・sanitize_pose     │  → 6トラッカーの位置・回転算出
+         │                      │  → 6トラッカーの位置・回転算出
          │  ・外れ値除去        │  → One Euroフィルタ → last_poses更新
          │  ・ステールデータ検出│
          └─────────────────────┘
@@ -204,7 +193,6 @@ BodyTrackerの基準姿勢設定。5秒のカウントダウン後に現在の�
 
 | フィルタ | 閾値 | 対象 |
 |----------|------|------|
-| sanitize_pose | 境界2% | 画像端のキーポイントをconfidence=0に（四肢XY, 腰Xのみ） |
 | 速度外れ値除去 | MAX_DISPLACEMENT=1.0 | 前フレームからの3D距離 |
 | hip-四肢距離 | MAX_LIMB_DIST=1.5 | 四肢のhipからの2D距離 |
 | 左右同一位置 | dist<0.05 | 左右が同位置なら両方None |

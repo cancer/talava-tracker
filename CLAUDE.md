@@ -15,7 +15,7 @@ cargo run --bin camera_view  # 画角調整（カメラ映像グリッド表示�
 
 ## What This Project Does
 
-Beat Saber撮影用のSteamVR仮想トラッカーシステム。カメラから人体姿勢を推定し、腰・足・胸・膝のトラッカーデータをOSC経由でVMTに送信する。単眼/複眼（三角測量）モード対応。
+Beat Saber撮影用のSteamVR仮想トラッカーシステム。複数カメラ三角測量による3Dポーズ推定で、腰・足・胸・膝のトラッカーデータをOSC経由でVMTに送信する。
 
 ## Architecture
 
@@ -36,7 +36,7 @@ Mac (talava-tracker)  --OSC/UDP:39570-->  Windows (VMT -> SteamVR -> Beat Saber)
 
 ### Data Flow
 
-カメラ映像 → ThreadedCamera → 人物検出 → 前処理 → ONNX推論 → [三角測量] → トラッカー算出 → 平滑化 → OSC送信
+カメラ映像 → ThreadedCamera → 人物検出 → 前処理 → ONNX推論 → 三角測量 → トラッカー算出 → 平滑化 → OSC送信
 
 ### Tracker Index
 

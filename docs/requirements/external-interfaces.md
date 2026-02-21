@@ -153,7 +153,7 @@ opencv = { version = "0.93", features = ["videoio", "imgproc", "imgcodecs", "aru
 
 - バックエンド: `CAP_AVFOUNDATION`（macOS専用）
 - 設定: FPS=60, バッファサイズ=1
-- 解像度: 640x480（単眼）/ 1920x1080（複眼時の一部カメラ）
+- 解像度: 1920x1080（一部カメラ）
 
 ### キャリブレーション (aruco + calib3d)
 

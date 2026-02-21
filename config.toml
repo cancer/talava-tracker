@@ -4,20 +4,9 @@ calibration_file = "calibration.json"
 addr = "192.168.10.35:39570"
 
 [tracker]
-scale_x = 3.0
-scale_y = 3.4
-body_scale = 0.8       # 上半身スケール
-leg_scale = 0.55       # 脚スケール
-depth_scale = 3.0
 mirror_x = false
-offset_y = 1.1
-foot_y_offset = -0.15  # 足トラッカーY補正（負=下げる）
-
-[camera]
-index = 0
-width = 640
-height = 480
-fov_v = 55
+offset_y = 1.0
+foot_y_offset = 0  # 足トラッカーY補正（負=下げる）
 
 [debug]
 view = false
@@ -33,7 +22,8 @@ position_min_cutoff = 1.5
 position_beta = 0.3
 rotation_min_cutoff = 1.0
 rotation_beta = 0.01
-# lower_body_position_beta = 0.5  # 下半身（足・膝）専用beta。未設定時はposition_betaを使用
+lower_body_position_min_cutoff = 1.0  # 下半身専用min_cutoff（静止時の平滑化強化。上半身1.5）
+lower_body_position_beta = 0.5        # 下半身専用beta（動作時の追従強化。上半身0.3）
 
 [interpolation]
 mode = "extrapolate"  # "none" | "extrapolate" | "lerp"

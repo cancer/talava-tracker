@@ -1,11 +1,9 @@
 pub mod body;
 pub mod extrapolate;
-pub mod hip;
 pub mod lerp;
 pub mod one_euro;
 
 pub use body::{BodyPoses, BodyTracker};
 pub use extrapolate::Extrapolator;
-pub use hip::HipTracker;
 pub use lerp::Lerper;
 pub use one_euro::PoseFilter;
