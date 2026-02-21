@@ -1,6 +1,45 @@
+use std::fmt;
 use nalgebra::{Matrix3, Matrix3x4, Matrix4, Vector3, Vector4};
 
 use crate::pose::{Keypoint, KeypointIndex, Pose};
+
+/// 三角測量の診断情報
+#[derive(Debug, Default)]
+pub struct TriangulationDiag {
+    pub num_cameras: usize,
+    pub hip_ref_pair: Option<(usize, usize)>,
+    pub hip_ref_err: Option<f32>,
+    pub hip_pair_errors: Vec<(usize, usize, f32)>,
+    pub z_jump_rejected: bool,
+    pub z_jump_value: Option<(f32, f32)>, // (prev_z, cur_z)
+    pub valid_keypoint_count: usize,
+}
+
+impl fmt::Display for TriangulationDiag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "tri: cams={}", self.num_cameras)?;
+        if let Some((ci, cj)) = self.hip_ref_pair {
+            write!(f, " ref=c{}+c{}", ci, cj)?;
+            if let Some(err) = self.hip_ref_err {
+                write!(f, "({:.0}px)", err)?;
+            }
+        } else {
+            write!(f, " ref=NONE")?;
+            if !self.hip_pair_errors.is_empty() {
+                let pairs: Vec<String> = self.hip_pair_errors.iter()
+                    .map(|(a, b, e)| format!("c{}+c{}={:.0}px", a, b, e))
+                    .collect();
+                write!(f, " hip_errs=[{}]", pairs.join(","))?;
+            }
+        }
+        if self.z_jump_rejected {
+            if let Some((pz, cz)) = self.z_jump_value {
+                write!(f, " Z_JUMP({:.3}->{:.3})", pz, cz)?;
+            }
+        }
+        write!(f, " kps={}/{}", self.valid_keypoint_count, KeypointIndex::COUNT)
+    }
+}
 
 /// リプロジェクションエラー閾値（ピクセル）
 /// 三角測量した3D点をカメラに再投影した際の最大許容誤差
@@ -384,12 +423,13 @@ fn reprojection_error(
 /// Hip（LeftHip）の最良カメラペアを特定する
 /// 全キーポイントをこのペアで三角測量することで、z値の一貫性を確保する
 /// （異なるキーポイントが異なるカメラペアを選ぶと±0.3-0.4mのz軸ノイズが発生するため）
+/// 戻り値: (best_pair, best_err, all_pair_errors)
 fn find_hip_reference_pair(
     cameras: &[&CameraParams],
     observations: &[Vec<Option<(f32, f32, f32)>>],
     prev_pair: Option<(usize, usize)>,
     verbose: bool,
-) -> Option<(usize, usize)> {
+) -> (Option<(usize, usize)>, Option<f32>, Vec<(usize, usize, f32)>) {
     let kp_idx = KeypointIndex::LeftHip as usize;
     let n = cameras.len();
 
@@ -406,7 +446,7 @@ fn find_hip_reference_pair(
     }
 
     if valid_cameras.len() < 2 {
-        return None;
+        return (None, None, Vec::new());
     }
 
     // ヒステリシス: 前回ペアが今フレームでも有効（両カメラでhip検出あり）なら優先
@@ -423,13 +463,14 @@ fn find_hip_reference_pair(
                 if verbose {
                     eprintln!("tri: hip_ref_pair=cam{}+cam{} err={:.1}px (prev pair reused)", prev_ci, prev_cj, prev_err);
                 }
-                return Some((prev_ci, prev_cj));
+                return (Some((prev_ci, prev_cj)), Some(prev_err), Vec::new());
             }
         }
     }
 
     let mut best_err = f32::MAX;
     let mut best_pair = None;
+    let mut all_pair_errors = Vec::new();
 
     let vc = valid_cameras.len();
     for i in 0..vc {
@@ -439,6 +480,8 @@ fn find_hip_reference_pair(
             let (px, py, pz) = triangulate_point(&pair_cams, &pair_pts);
             let p3d = Vector4::new(px, py, pz, 1.0);
             let pair_err = reprojection_error(&pair_cams, &pair_pts, &p3d);
+
+            all_pair_errors.push((valid_cam_indices[i], valid_cam_indices[j], pair_err));
 
             if pair_err < best_err {
                 best_err = pair_err;
@@ -454,9 +497,9 @@ fn find_hip_reference_pair(
     }
 
     if best_err < MAX_REPROJ_ERROR {
-        best_pair
+        (best_pair, Some(best_err), all_pair_errors)
     } else {
-        None
+        (None, None, all_pair_errors)
     }
 }
 
@@ -474,12 +517,17 @@ pub fn triangulate_poses(
     cameras: &[&CameraParams],
     poses_2d: &[&Pose],
     confidence_threshold: f32,
-) -> Pose {
+) -> (Pose, TriangulationDiag) {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Mutex;
     static CALL_COUNT: AtomicU32 = AtomicU32::new(0);
     let count = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
     let verbose = count % 30 == 0;
+
+    let mut diag = TriangulationDiag {
+        num_cameras: cameras.len(),
+        ..Default::default()
+    };
 
     // 前回の基準ペアとhip z値を保持（ヒステリシス + z差チェック用）
     static PREV_HIP_REF_PAIR: Mutex<Option<(usize, usize)>> = Mutex::new(None);
@@ -509,7 +557,10 @@ pub fn triangulate_poses(
 
     // Phase 1: Hipの最良カメラペアを基準ペアとして決定（前回ペアを優先）
     let prev_pair = PREV_HIP_REF_PAIR.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let hip_ref_pair = find_hip_reference_pair(cameras, &observations, prev_pair, verbose);
+    let (hip_ref_pair, hip_ref_err, hip_pair_errors) = find_hip_reference_pair(cameras, &observations, prev_pair, verbose);
+    diag.hip_ref_pair = hip_ref_pair;
+    diag.hip_ref_err = hip_ref_err;
+    diag.hip_pair_errors = hip_pair_errors;
 
     let mut keypoints = [Keypoint::default(); KeypointIndex::COUNT];
 
@@ -642,8 +693,10 @@ pub fn triangulate_poses(
                     eprintln!("tri: hip z jump {:.3}m (prev={:.3}, cur={:.3}) -> frame rejected",
                         z_jump, pz, cur_z);
                 }
+                diag.z_jump_rejected = true;
+                diag.z_jump_value = Some((pz, cur_z));
                 // z差が大きすぎる → このフレームを棄却（前回z値は維持）
-                return Pose::new([Keypoint::default(); KeypointIndex::COUNT]);
+                return (Pose::new([Keypoint::default(); KeypointIndex::COUNT]), diag);
             }
         }
         // 正常なら前回hip zを更新
@@ -652,7 +705,10 @@ pub fn triangulate_poses(
         }
     }
 
-    Pose::new(keypoints)
+    // 有効キーポイント数を集計
+    diag.valid_keypoint_count = keypoints.iter().filter(|kp| kp.confidence > 0.0).count();
+
+    (Pose::new(keypoints), diag)
 }
 
 #[cfg(test)]
@@ -718,7 +774,7 @@ mod tests {
         let pose1 = Pose::new(kp1);
         let pose2 = Pose::new(kp2);
 
-        let result = triangulate_poses(&[&cam1, &cam2], &[&pose1, &pose2], 0.3);
+        let (result, _diag) = triangulate_poses(&[&cam1, &cam2], &[&pose1, &pose2], 0.3);
 
         // Nose: only 1 camera → should not be triangulated
         assert_eq!(result.get(KeypointIndex::Nose).confidence, 0.0);
@@ -760,7 +816,7 @@ mod tests {
         let pose2 = Pose::new(kp2);
         let pose3 = Pose::new(kp3);
 
-        let result = triangulate_poses(
+        let (result, _diag) = triangulate_poses(
             &[&cam1, &cam2, &cam3],
             &[&pose1, &pose2, &pose3],
             0.3,
