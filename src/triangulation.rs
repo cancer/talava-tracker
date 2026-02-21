@@ -154,6 +154,18 @@ impl CameraParams {
             dist_coeffs[2] as f32, dist_coeffs[3] as f32,
             dist_coeffs[4] as f32,
         ];
+
+        // fx/fy比の検証: 正方ピクセルなら~1.0、異常値はキャリブレーション品質の問題を示す
+        let fx = intrinsic[0];
+        let fy = intrinsic[4];
+        if fy.abs() > 1e-10 {
+            let ratio = fx / fy;
+            if ratio > 1.2 || ratio < 0.8 {
+                eprintln!("WARNING: from_calibration() fx/fy ratio={:.3} (fx={:.1}, fy={:.1}). Non-square pixels suggest calibration issue.",
+                    ratio, fx, fy);
+            }
+        }
+
         Self {
             projection,
             image_width: width as f32,
@@ -375,6 +387,7 @@ fn reprojection_error(
 fn find_hip_reference_pair(
     cameras: &[&CameraParams],
     observations: &[Vec<Option<(f32, f32, f32)>>],
+    prev_pair: Option<(usize, usize)>,
     verbose: bool,
 ) -> Option<(usize, usize)> {
     let kp_idx = KeypointIndex::LeftHip as usize;
@@ -394,6 +407,25 @@ fn find_hip_reference_pair(
 
     if valid_cameras.len() < 2 {
         return None;
+    }
+
+    // ヒステリシス: 前回ペアが今フレームでも有効（両カメラでhip検出あり）なら優先
+    if let Some((prev_ci, prev_cj)) = prev_pair {
+        let pi = valid_cam_indices.iter().position(|&c| c == prev_ci);
+        let pj = valid_cam_indices.iter().position(|&c| c == prev_cj);
+        if let (Some(vi), Some(vj)) = (pi, pj) {
+            let pair_cams = [valid_cameras[vi], valid_cameras[vj]];
+            let pair_pts = [valid_points[vi], valid_points[vj]];
+            let (px, py, pz) = triangulate_point(&pair_cams, &pair_pts);
+            let p3d = Vector4::new(px, py, pz, 1.0);
+            let prev_err = reprojection_error(&pair_cams, &pair_pts, &p3d);
+            if prev_err < MAX_REPROJ_ERROR {
+                if verbose {
+                    eprintln!("tri: hip_ref_pair=cam{}+cam{} err={:.1}px (prev pair reused)", prev_ci, prev_cj, prev_err);
+                }
+                return Some((prev_ci, prev_cj));
+            }
+        }
     }
 
     let mut best_err = f32::MAX;
@@ -434,15 +466,24 @@ fn find_hip_reference_pair(
 ///   （異なるペアを使うとz値が±0.3-0.4m揺らぐため）
 /// - 基準ペアで三角測量できないキーポイントはフォールバックで個別ペア選択
 ///
+/// フレーム間hip z差の最大許容値（メートル）
+/// カメラペア切替やno pose復帰でz軸が0.3-0.5mジャンプするのを防ぐ
+const MAX_HIP_Z_JUMP: f32 = 0.3;
+
 pub fn triangulate_poses(
     cameras: &[&CameraParams],
     poses_2d: &[&Pose],
     confidence_threshold: f32,
 ) -> Pose {
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Mutex;
     static CALL_COUNT: AtomicU32 = AtomicU32::new(0);
     let count = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
     let verbose = count % 30 == 0;
+
+    // 前回の基準ペアとhip z値を保持（ヒステリシス + z差チェック用）
+    static PREV_HIP_REF_PAIR: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+    static PREV_HIP_Z: Mutex<Option<f32>> = Mutex::new(None);
 
     assert_eq!(cameras.len(), poses_2d.len());
     let n = cameras.len();
@@ -466,8 +507,9 @@ pub fn triangulate_poses(
         observations.push(cam_obs);
     }
 
-    // Phase 1: Hipの最良カメラペアを基準ペアとして決定
-    let hip_ref_pair = find_hip_reference_pair(cameras, &observations, verbose);
+    // Phase 1: Hipの最良カメラペアを基準ペアとして決定（前回ペアを優先）
+    let prev_pair = PREV_HIP_REF_PAIR.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let hip_ref_pair = find_hip_reference_pair(cameras, &observations, prev_pair, verbose);
 
     let mut keypoints = [Keypoint::default(); KeypointIndex::COUNT];
 
@@ -569,6 +611,44 @@ pub fn triangulate_poses(
             keypoints[kp_idx] = Keypoint::new_3d(
                 best_point.0, best_point.1, best_point.2, best_conf,
             );
+        }
+    }
+
+    // 前回ペアを更新
+    if let Ok(mut prev) = PREV_HIP_REF_PAIR.lock() {
+        *prev = hip_ref_pair;
+    }
+
+    // 修正C: フレーム間hip z差の閾値棄却
+    // LeftHip/RightHipの中点zを使い、前フレームから大きく飛んだ場合は全キーポイントを棄却
+    let lh = &keypoints[KeypointIndex::LeftHip as usize];
+    let rh = &keypoints[KeypointIndex::RightHip as usize];
+    let current_hip_z = if lh.confidence > 0.0 && rh.confidence > 0.0 {
+        Some((lh.z + rh.z) / 2.0)
+    } else if lh.confidence > 0.0 {
+        Some(lh.z)
+    } else if rh.confidence > 0.0 {
+        Some(rh.z)
+    } else {
+        None
+    };
+
+    if let Some(cur_z) = current_hip_z {
+        let prev_z = PREV_HIP_Z.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(pz) = prev_z {
+            let z_jump = (cur_z - pz).abs();
+            if z_jump > MAX_HIP_Z_JUMP {
+                if verbose {
+                    eprintln!("tri: hip z jump {:.3}m (prev={:.3}, cur={:.3}) -> frame rejected",
+                        z_jump, pz, cur_z);
+                }
+                // z差が大きすぎる → このフレームを棄却（前回z値は維持）
+                return Pose::new([Keypoint::default(); KeypointIndex::COUNT]);
+            }
+        }
+        // 正常なら前回hip zを更新
+        if let Ok(mut prev) = PREV_HIP_Z.lock() {
+            *prev = Some(cur_z);
         }
     }
 
