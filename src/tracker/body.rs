@@ -2,6 +2,15 @@ use crate::config::TrackerConfig;
 use crate::pose::{KeypointIndex, Pose};
 use crate::vmt::TrackerPose;
 
+/// 骨長制約によるクランプ情報
+#[derive(Default)]
+pub struct BoneClamps {
+    pub left_hip_knee: Option<(f32, f32)>,   // (実測距離, 閾値)
+    pub right_hip_knee: Option<(f32, f32)>,
+    pub left_knee_ankle: Option<(f32, f32)>,
+    pub right_knee_ankle: Option<(f32, f32)>,
+}
+
 /// 全トラッカーの計算結果
 pub struct BodyPoses {
     pub hip: Option<TrackerPose>,
@@ -10,6 +19,7 @@ pub struct BodyPoses {
     pub chest: Option<TrackerPose>,
     pub left_knee: Option<TrackerPose>,
     pub right_knee: Option<TrackerPose>,
+    pub bone_clamps: BoneClamps,
 }
 
 struct Calibration {
@@ -29,6 +39,11 @@ struct Calibration {
     pitch_left_knee: f32,
     pitch_right_knee: f32,
     tilt_angle: f32, // カメラチルト角（ラジアン）: YZ平面の回転補正用
+    // 骨長制約（world_coordsモードのみ、3Dユークリッド距離）
+    left_hip_knee: Option<f32>,
+    right_hip_knee: Option<f32>,
+    left_knee_ankle: Option<f32>,
+    right_knee_ankle: Option<f32>,
 }
 
 pub struct BodyTracker {
@@ -254,6 +269,42 @@ impl BodyTracker {
         let pitch_right_knee =
             self.compute_knee_pitch(pose, KeypointIndex::RightKnee, KeypointIndex::RightAnkle);
 
+        // 骨長計測（world_coordsモードのみ: 3Dユークリッド距離）
+        let (left_hip_knee, right_hip_knee, left_knee_ankle, right_knee_ankle) =
+            if self.world_coords {
+                let hip_mid = ((left_hip.x + right_hip.x) / 2.0,
+                               (left_hip.y + right_hip.y) / 2.0,
+                               (left_hip.z + right_hip.z) / 2.0);
+                let lk = pose.get(KeypointIndex::LeftKnee);
+                let rk = pose.get(KeypointIndex::RightKnee);
+                let la = pose.get(KeypointIndex::LeftAnkle);
+                let ra = pose.get(KeypointIndex::RightAnkle);
+
+                let left_hk = if lk.is_valid(self.confidence_threshold) {
+                    Some(Self::dist_3d(hip_mid, (lk.x, lk.y, lk.z)))
+                } else {
+                    None
+                };
+                let right_hk = if rk.is_valid(self.confidence_threshold) {
+                    Some(Self::dist_3d(hip_mid, (rk.x, rk.y, rk.z)))
+                } else {
+                    None
+                };
+                let left_ka = if lk.is_valid(self.confidence_threshold) && la.is_valid(self.confidence_threshold) {
+                    Some(Self::dist_3d((lk.x, lk.y, lk.z), (la.x, la.y, la.z)))
+                } else {
+                    None
+                };
+                let right_ka = if rk.is_valid(self.confidence_threshold) && ra.is_valid(self.confidence_threshold) {
+                    Some(Self::dist_3d((rk.x, rk.y, rk.z), (ra.x, ra.y, ra.z)))
+                } else {
+                    None
+                };
+                (left_hk, right_hk, left_ka, right_ka)
+            } else {
+                (None, None, None, None)
+            };
+
         self.calibration = Some(Calibration {
             hip_x,
             hip_y,
@@ -270,6 +321,10 @@ impl BodyTracker {
             pitch_left_knee,
             pitch_right_knee,
             tilt_angle,
+            left_hip_knee,
+            right_hip_knee,
+            left_knee_ankle,
+            right_knee_ankle,
         });
         true
     }
@@ -286,19 +341,133 @@ impl BodyTracker {
             .max(self.leg_scale)
     }
 
+    /// 3Dユークリッド距離
+    fn dist_3d(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
+        let dx = a.0 - b.0;
+        let dy = a.1 - b.1;
+        let dz = a.2 - b.2;
+        (dx * dx + dy * dy + dz * dz).sqrt()
+    }
+
+    /// 骨長制約: キャリブレーション時の骨長を超えるキーポイントを骨長上限に引き戻す（クランプ）
+    /// 棄却（confidence=0）だとトラッカーが消えるため、方向を保ったまま位置を制限する
+    /// hip→kneeを先にクランプし、クランプ後のknee位置でknee→ankleをチェック
+    fn enforce_bone_constraints(pose: &mut Pose, cal: &Calibration, hip_knee_margin: f32, knee_ankle_margin: f32, confidence_threshold: f32) -> BoneClamps {
+        let mut clamps = BoneClamps::default();
+        let left_hip = pose.get(KeypointIndex::LeftHip);
+        let right_hip = pose.get(KeypointIndex::RightHip);
+        if !left_hip.is_valid(confidence_threshold) || !right_hip.is_valid(confidence_threshold) {
+            return clamps;
+        }
+        let hip_mid = ((left_hip.x + right_hip.x) / 2.0,
+                       (left_hip.y + right_hip.y) / 2.0,
+                       (left_hip.z + right_hip.z) / 2.0);
+
+        // Left hip→knee: clamp
+        {
+            let lk = pose.get(KeypointIndex::LeftKnee);
+            if lk.is_valid(confidence_threshold) {
+                if let Some(cal_len) = cal.left_hip_knee {
+                    let (px, py, pz) = (lk.x, lk.y, lk.z);
+                    let dist = Self::dist_3d(hip_mid, (px, py, pz));
+                    let threshold = cal_len * (1.0 + hip_knee_margin);
+                    if dist > threshold && dist > 0.001 {
+                        let s = threshold / dist;
+                        let kp = &mut pose.keypoints[KeypointIndex::LeftKnee as usize];
+                        kp.x = hip_mid.0 + (px - hip_mid.0) * s;
+                        kp.y = hip_mid.1 + (py - hip_mid.1) * s;
+                        kp.z = hip_mid.2 + (pz - hip_mid.2) * s;
+                        clamps.left_hip_knee = Some((dist, threshold));
+                    }
+                }
+            }
+        }
+
+        // Left knee→ankle: clamp（クランプ後のknee位置を使用）
+        {
+            let lk = pose.get(KeypointIndex::LeftKnee);
+            let la = pose.get(KeypointIndex::LeftAnkle);
+            if lk.is_valid(confidence_threshold) && la.is_valid(confidence_threshold) {
+                if let Some(cal_len) = cal.left_knee_ankle {
+                    let (kx, ky, kz) = (lk.x, lk.y, lk.z);
+                    let (ax, ay, az) = (la.x, la.y, la.z);
+                    let dist = Self::dist_3d((kx, ky, kz), (ax, ay, az));
+                    let threshold = cal_len * (1.0 + knee_ankle_margin);
+                    if dist > threshold && dist > 0.001 {
+                        let s = threshold / dist;
+                        let kp = &mut pose.keypoints[KeypointIndex::LeftAnkle as usize];
+                        kp.x = kx + (ax - kx) * s;
+                        kp.y = ky + (ay - ky) * s;
+                        kp.z = kz + (az - kz) * s;
+                        clamps.left_knee_ankle = Some((dist, threshold));
+                    }
+                }
+            }
+        }
+
+        // Right hip→knee: clamp
+        {
+            let rk = pose.get(KeypointIndex::RightKnee);
+            if rk.is_valid(confidence_threshold) {
+                if let Some(cal_len) = cal.right_hip_knee {
+                    let (px, py, pz) = (rk.x, rk.y, rk.z);
+                    let dist = Self::dist_3d(hip_mid, (px, py, pz));
+                    let threshold = cal_len * (1.0 + hip_knee_margin);
+                    if dist > threshold && dist > 0.001 {
+                        let s = threshold / dist;
+                        let kp = &mut pose.keypoints[KeypointIndex::RightKnee as usize];
+                        kp.x = hip_mid.0 + (px - hip_mid.0) * s;
+                        kp.y = hip_mid.1 + (py - hip_mid.1) * s;
+                        kp.z = hip_mid.2 + (pz - hip_mid.2) * s;
+                        clamps.right_hip_knee = Some((dist, threshold));
+                    }
+                }
+            }
+        }
+
+        // Right knee→ankle: clamp（クランプ後のknee位置を使用）
+        {
+            let rk = pose.get(KeypointIndex::RightKnee);
+            let ra = pose.get(KeypointIndex::RightAnkle);
+            if rk.is_valid(confidence_threshold) && ra.is_valid(confidence_threshold) {
+                if let Some(cal_len) = cal.right_knee_ankle {
+                    let (kx, ky, kz) = (rk.x, rk.y, rk.z);
+                    let (ax, ay, az) = (ra.x, ra.y, ra.z);
+                    let dist = Self::dist_3d((kx, ky, kz), (ax, ay, az));
+                    let threshold = cal_len * (1.0 + knee_ankle_margin);
+                    if dist > threshold && dist > 0.001 {
+                        let s = threshold / dist;
+                        let kp = &mut pose.keypoints[KeypointIndex::RightAnkle as usize];
+                        kp.x = kx + (ax - kx) * s;
+                        kp.y = ky + (ay - ky) * s;
+                        kp.z = kz + (az - kz) * s;
+                        clamps.right_knee_ankle = Some((dist, threshold));
+                    }
+                }
+            }
+        }
+
+        clamps
+    }
+
     pub fn compute(&self, pose: &Pose) -> BodyPoses {
         // ワールド座標モードでは境界チェック不要（座標が0-1正規化ではなくメートル単位）
         // キャリブレーション済みならチルト補正を適用
         let sanitized;
-        let rotated;
+        let mut constrained;
+        let mut bone_clamps = BoneClamps::default();
         let pose = if self.world_coords {
             let tilt = self.calibration.as_ref().map_or(0.0, |c| c.tilt_angle);
             if tilt.abs() > 0.001 {
-                rotated = Self::rotate_pose_yz(pose, tilt, self.confidence_threshold);
-                &rotated
+                constrained = Self::rotate_pose_yz(pose, tilt, self.confidence_threshold);
             } else {
-                pose
+                constrained = pose.clone();
             }
+            // 骨長制約: キャリブレーション済みの場合のみ
+            if let Some(cal) = &self.calibration {
+                bone_clamps = Self::enforce_bone_constraints(&mut constrained, cal, 0.2, 0.15, self.confidence_threshold);
+            }
+            &constrained
         } else {
             sanitized = Self::sanitize_pose(pose);
             &sanitized
@@ -347,6 +516,7 @@ impl BodyTracker {
             chest: self.compute_chest(pose, hip_center, ch_z, body_ratio),
             left_knee,
             right_knee,
+            bone_clamps,
         }
     }
 
@@ -1237,6 +1407,78 @@ mod tests {
         assert!(moved_hip_z > cal_hip_z + 0.1,
             "forward movement should increase z: cal_hip.z={:.3}, moved_hip.z={:.3}",
             cal_hip_z, moved_hip_z);
+    }
+
+    // --- 骨長制約テスト ---
+
+    #[test]
+    fn test_bone_clamp_pulls_back_stretched_knee() {
+        let config = TrackerConfig::default();
+        let mut tracker = BodyTracker::new(&config, 0.0, true);
+        let cal_pose = standing_world_pose();
+        assert!(tracker.calibrate(&cal_pose));
+
+        // 左膝をhipから1.5倍の距離に移動（外れ値）
+        let cal = tracker.calibration.as_ref().unwrap();
+        let cal_len = cal.left_hip_knee.unwrap();
+        let stretched_y = 0.1 + cal_len * 1.5; // hip_y + 1.5倍距離（下方向）
+        let stretched_pose = make_world_pose(
+            (0.15, 0.1, 2.0), (-0.15, 0.1, 2.0),
+            (0.2, -0.4, 2.0), (-0.2, -0.4, 2.0),
+            (0.15, stretched_y, 2.0), (-0.15, 0.5, 2.0),  // 左膝だけ引き伸ばし
+            (0.15, stretched_y + 0.4, 2.0), (-0.15, 0.9, 2.0),
+        );
+
+        let result = tracker.compute(&stretched_pose);
+        // クランプ方式: トラッカーは消えない（位置が引き戻されるだけ）
+        assert!(result.left_knee.is_some(), "clamped knee should still produce tracker");
+        assert!(result.left_foot.is_some(), "clamped ankle should still produce tracker");
+        // クランプが発動したことを確認
+        assert!(result.bone_clamps.left_hip_knee.is_some(), "hip-knee clamp should fire");
+        // 右側は正常（クランプなし）
+        assert!(result.bone_clamps.right_hip_knee.is_none(), "right side should not clamp");
+    }
+
+    #[test]
+    fn test_bone_clamp_no_change_in_normal_range() {
+        let config = TrackerConfig::default();
+        let mut tracker = BodyTracker::new(&config, 0.0, true);
+        let cal_pose = standing_world_pose();
+        assert!(tracker.calibrate(&cal_pose));
+
+        // キャリブレーション時と同じポーズ → クランプ発動しない
+        let result = tracker.compute(&cal_pose);
+        assert!(result.left_knee.is_some(), "normal range knee should be valid");
+        assert!(result.bone_clamps.left_hip_knee.is_none(), "no clamp in normal range");
+        assert!(result.bone_clamps.left_knee_ankle.is_none(), "no clamp in normal range");
+    }
+
+    #[test]
+    fn test_bone_clamp_pulls_back_stretched_ankle() {
+        let config = TrackerConfig::default();
+        let mut tracker = BodyTracker::new(&config, 0.0, true);
+        let cal_pose = standing_world_pose();
+        assert!(tracker.calibrate(&cal_pose));
+
+        // 左足首をkneeから1.5倍の距離に移動（外れ値）
+        let cal = tracker.calibration.as_ref().unwrap();
+        let cal_len = cal.left_knee_ankle.unwrap();
+        let stretched_ankle_y = 0.5 + cal_len * 1.5; // knee_y + 1.5倍距離
+        let stretched_pose = make_world_pose(
+            (0.15, 0.1, 2.0), (-0.15, 0.1, 2.0),
+            (0.2, -0.4, 2.0), (-0.2, -0.4, 2.0),
+            (0.15, 0.5, 2.0), (-0.15, 0.5, 2.0),      // 膝は正常位置
+            (0.15, stretched_ankle_y, 2.0), (-0.15, 0.9, 2.0), // 左足首だけ引き伸ばし
+        );
+
+        let result = tracker.compute(&stretched_pose);
+        // 膝は正常（クランプなし）
+        assert!(result.bone_clamps.left_hip_knee.is_none(), "knee should not be clamped");
+        // 足首はクランプ発動
+        assert!(result.bone_clamps.left_knee_ankle.is_some(), "ankle clamp should fire");
+        // トラッカーは全部出る
+        assert!(result.left_knee.is_some(), "knee tracker valid");
+        assert!(result.left_foot.is_some(), "foot tracker valid (clamped position)");
     }
 
 }

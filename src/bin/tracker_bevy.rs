@@ -85,6 +85,7 @@ struct TrackerState {
     last_inference_time: Instant,
     interp_mode: String,
     filter_config: FilterConfig,
+    bone_clamp_count: [u32; 4], // [L_hip_knee, R_hip_knee, L_knee_ankle, R_knee_ankle]
 }
 
 #[derive(Resource)]
@@ -479,6 +480,7 @@ fn main() -> Result<()> {
             last_inference_time: Instant::now(),
             interp_mode: config.interpolation.mode.clone(),
             filter_config: config.filter.clone(),
+            bone_clamp_count: [0; 4],
         })
         .insert_resource(VmtSender(vmt))
         .insert_resource(CalibrationState {
@@ -751,6 +753,11 @@ fn compute_trackers_system(
     }
 
     let body_poses = tracker_state.body_tracker.compute(pose);
+    let br = &body_poses.bone_clamps;
+    if br.left_hip_knee.is_some()  { tracker_state.bone_clamp_count[0] += 1; }
+    if br.right_hip_knee.is_some() { tracker_state.bone_clamp_count[1] += 1; }
+    if br.left_knee_ankle.is_some()  { tracker_state.bone_clamp_count[2] += 1; }
+    if br.right_knee_ankle.is_some() { tracker_state.bone_clamp_count[3] += 1; }
     let poses = [
         body_poses.hip, body_poses.left_foot, body_poses.right_foot,
         body_poses.chest, body_poses.left_knee, body_poses.right_knee,
@@ -977,7 +984,7 @@ fn debug_view_system(
     let _ = debug_view.renderer.update();
 }
 
-fn fps_system(mut fps: ResMut<FpsCounter>, tracker_state: Res<TrackerState>, pose_state: Res<PoseState>, lf: Res<LogFileRes>) {
+fn fps_system(mut fps: ResMut<FpsCounter>, mut tracker_state: ResMut<TrackerState>, pose_state: Res<PoseState>, lf: Res<LogFileRes>) {
     fps.frame_count += 1;
     let elapsed = fps.timer.elapsed().as_secs_f32();
     if elapsed >= 1.0 {
@@ -1010,13 +1017,22 @@ fn fps_system(mut fps: ResMut<FpsCounter>, tracker_state: Res<TrackerState>, pos
                 cam_diag.push_str(&format!(" cam{}[{}]", cam_idx, confs.join(",")));
             }
         }
+        let bc = &tracker_state.bone_clamp_count;
+        let bone_diag = if bc.iter().any(|&c| c > 0) {
+            format!(" bone_clamp[LHK={},RHK={},LKA={},RKA={}]",
+                bc[0], bc[1], bc[2], bc[3])
+        } else {
+            String::new()
+        };
         log!(lf.0,
-            "FPS: {:.1} (infer: {}) | {}{}",
+            "FPS: {:.1} (infer: {}) | {}{}{}",
             fps.frame_count as f32 / elapsed,
             fps.inference_count,
             if parts.is_empty() { "no pose".to_string() } else { parts.join(" ") },
             cam_diag,
+            bone_diag,
         );
+        tracker_state.bone_clamp_count = [0; 4];
         fps.frame_count = 0;
         fps.inference_count = 0;
         fps.timer = Instant::now();
