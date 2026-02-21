@@ -5,80 +5,90 @@
 - **手順: コード修正・ビルド等を全部終わらせる → 準備完了後に「カメラの前に立ってください」と報告 → ユーザーが立ってからcargo run**
 - **ユーザーは暇ではない。準備が終わる前に呼ぶな。報告なしに起動するな**
 - **被写体が不要なcargo run(ビルド確認、cargo test等)では呼ぶな。呼ぶのはポーズ検出テスト時のみ**
+- **動作確認が済むまでコミットするな**
 
-## 現在の状態（2026-02-15）
+## 現在の状態（2026-02-21）
+
+### 最優先課題: レンズ歪み補正の有効化
+
+全カメラの歪み補正が無効化されている（`src/bin/tracker_bevy.rs` L201: `let dc: [f64; 5] = [0.0; 5]`）。
+
+**問題**: 2D観測は歪んだ画像上の座標だが、射影行列P=K[R|t]は歪みなしの座標系で定義されている。この座標系不一致がリプロジェクションエラーの主因。
+
+**診断結果**（2026-02-21 実機ログ `tracker_20260221_160027.log`）:
+- c0+c1: hip reproj error = 145-177px（閾値120pxをわずかに超過）→ ref_pair=NONE
+- c0+c2: 1700-3300px（cam2の歪みが極端）
+- c1+c2: 1600-3300px
+- ref_pair=NONEが大量発生 → hipが三角測量できず → キャリブレーション失敗・no poseの主因
+
+**無効化された経緯**: cam2のdist_coeffs（k2=11.5, k3=-49.9）が極端すぎてundistort_point()のNewton-Raphson法が収束しない → 全カメラ巻き添えで無効化された。
+
+**解決方針**: 全カメラの歪み補正を有効にする。cam2の極端な係数に対しては、逆歪みモデル（観測を補正）ではなく順歪みモデル（投影側に歪みを適用）を使えば反復法不要で任意の係数に対応可能。
+
+### z-jump棄却の永久ループ
+
+`triangulate_poses()`のhip z-jumpチェック（MAX_HIP_Z_JUMP=0.3m）で棄却されると、PREV_HIP_Zが更新されない → 以降のフレームも全て棄却される永久ループに陥る。
+
+実測: prev_hip_z=1.536が固定され、z=4-14mのフレームが延々と棄却される。
+
+### 未コミットの変更（main上）
+
+1. 速度チェック基準: last_poses→last_raw_poses（フィルタ前位置と比較）
+2. max_displacement: 0.4→0.15
+3. 下半身フィルタ分離: lower_body_position_min_cutoff=1.0, beta=0.5
+4. キャリブレーション時のlast_raw_poses/reject_countリセット
+5. TriangulationDiag: 三角測量の棄却理由をログファイルに出力
+6. config.toml: leg_scale, offset_y, foot_y_offset変更
+
+### カメラ構成（3台）
+
+| カメラ | 解像度 | fx | dist_coeffs | 備考 |
+|--------|--------|-----|-------------|------|
+| cam0 (index=0) | 1760x1328 | 1567 | k1=0.22, k2=-1.34, k3=5.07 | 基準カメラ（rvec/tvec=0） |
+| cam2 (index=2) | 1920x1440 | 1765 | k1=-0.80, k2=11.5, k3=-49.9 | 歪み係数が極端 |
+| cam3 (index=3) | 1920x1080 | 1521 | k1=0.26, k2=-1.95, k3=1.76 | 上方見下ろし角度、最も広角 |
+
+- **cam2・cam3は角度が異なるからこそ三角測量に不可欠。除外は選択肢にない**
+- calibration.jsonのreprojection_error: cam0=0.20px, cam2=0.13px, cam3=0.38px（キャリブレーション自体は良好）
 
 ### 完了した修正
-1. **歪み補正追加** (`src/triangulation.rs`): CameraParamsにundistort_point()実装。calibration.jsonの歪み係数(k1=-1.29等)を反映
-2. **再投影エラーチェック** (`src/triangulation.rs`): 三角測量結果をカメラに再投影し、50px以上の誤差で棄却
-3. **画像サイズ修正** (`src/triangulation.rs`): image_width/image_heightフィールド追加。P[0,2]からの推定を廃止
-4. **per-keypointバウンダリチェック** (`src/bin/tracker_bevy.rs`): 個別キーポイントの±10m/z>0チェック
-5. **2段階ステールタイムアウト** (`src/bin/tracker_bevy.rs`): Phase1(0.3s)送信停止、Phase2(3.0s)速度参照クリア
-6. **limb_ok None→false** (`src/bin/tracker_bevy.rs`): hip基準なしの四肢を拒否
-7. **自動キャリブレーション** (`src/bin/tracker_bevy.rs`): hip 3秒検出で自動発動
 
-### 未解決の重大問題
-
-#### 1. z値ドリフト（最優先）
-最新の実行結果(bc947e5)で確認:
-- キャリブレーション前: hip z=1.25（正常）→ z=6.33（異常ジャンプ）
-- 自動キャリブレーションがz=6.5の異常値で発動してしまった
-- キャリブレーション後: hip z=-0.08（正常）→ z=-7.11（ドリフト）
-- **原因**: 三角測量の出力自体が不安定。z値が1.3と6.5の間で二峰性を示す
-
-対策案:
-- 自動キャリブレーションに値の妥当性チェックを追加（z値の分散が小さいことを確認）
-- 再投影エラー閾値(50px)を下げて品質の低い三角測量を排除
-- 三角測量結果に時間的な一貫性チェックを追加
-
-#### 2. 右側キーポイント欠落
-R_foot, R_kneeがほぼ出現しない。原因候補:
-- カメラ2からの右側キーポイントの検出信頼度が低い
-- 片方のカメラでしか見えないため三角測量の2カメラ要件を満たさない
-- カメラ設置角度の問題（上半身がフレーム外になる問題と関連）
-
-#### 3. L_footのフリーズ
-L_foot(-0.37, -0.57, -6.39)が長時間同一座標。ステールタイムアウトが正しく機能していない可能性
-
-#### 4. "no pose"の頻度が高い
-ポーズ検出できるフレームが半分以下。考えられる原因:
-- 再投影エラーで正当なキーポイントも棄却されている
-- 両カメラで同時に検出される確率が低い（フレーム同期の問題）
-
-### デバッグの進め方
-
-#### 再投影エラーの実測値を確認する
-`src/triangulation.rs`のtriangulate_poses()内、再投影チェックのところに一時的なeprintlnを追加:
-```rust
-// この位置（max_reproj_err計算後、if文の前）に追加
-eprintln!("reproj[{}]: err={:.1}px pos=({:.2},{:.2},{:.2})",
-    kp_idx, max_reproj_err, x, y, z);
-```
-これで歪み補正後の実際のエラー値がわかる。50pxの閾値が適切か判断できる。
-
-#### undistort_point()の収束確認
-calibration.jsonの歪み係数が非常に大きい(k1=-1.29, k3=-33.4)。反復法(10回)で収束しているか確認:
-```rust
-// undistort_point()のforループ内に追加
-if i == 9 { eprintln!("undistort iter10: ({:.4},{:.4})", x, y); }
-```
+1. **歪み補正実装** (`src/triangulation.rs`): CameraParamsにundistort_point()実装（Newton-Raphson法）
+2. **再投影エラーチェック**: MAX_REPROJ_ERROR=120px（max方式）
+3. **Hip基準ペア固定**: 全キーポイントで同じカメラペアを使いz軸一貫性を確保
+4. **per-keypointバウンダリチェック**: ±10m/z>0
+5. **hip z-jumpチェック**: MAX_HIP_Z_JUMP=0.3mでフレーム棄却
+6. **TriangulationDiag**: 棄却理由（ref_pair, reproj error, z-jump）のログ出力
 
 ### ファイル構成
+
 | ファイル | 内容 |
 |---------|------|
-| `src/triangulation.rs` | DLT三角測量、歪み補正、再投影チェック |
+| `src/triangulation.rs` | DLT三角測量、歪み補正、再投影チェック、TriangulationDiag |
 | `src/bin/tracker_bevy.rs` | Bevy ECSメインループ、品質チェック、VMT送信 |
 | `src/tracker/body.rs` | キーポイント→トラッカー位置変換、キャリブレーション |
+| `src/tracker/one_euro.rs` | One Euroフィルタ（上半身/下半身分離対応） |
+| `src/config.rs` | 設定ファイル読み込み（lower_body_position_min_cutoff追加済み） |
 | `calibration.json` | カメラ内部/外部パラメータ、歪み係数 |
 | `config.toml` | アプリ設定（カメラ、フィルタ、VMT） |
 
-### calibration.jsonの歪み係数
-- Camera 0: k1=-1.29, k2=7.25, p1=-0.14, p2=0.03, k3=-33.4
-- Camera 2: k1=-2.73, k2=15.3, p1=0.10, p2=0.008, k3=-27.1
+### デバッグの進め方
 
-これらは非常に大きな値。広角レンズの可能性が高い。undistort_point()の反復法が正しく収束するか要確認。
+#### TriangulationDiagのログ出力を確認する
 
-### 過去の実行結果の場所
-- `/private/tmp/claude-501/-Users-cancer-repos-talava-tracker/tasks/bc947e5.output` - 歪み補正あり、キャリブレーション成功→zドリフト
-- `/private/tmp/claude-501/-Users-cancer-repos-talava-tracker/tasks/b0280aa.output` - 歪み補正あり、キャリブレーション前のデータ（hip安定）
-- `/private/tmp/claude-501/-Users-cancer-repos-talava-tracker/tasks/bada63f.output` - キャリブレーション失敗（hip不検出タイミング）
+`triangulate_system`が問題フレーム（ref_pair=NONE, z-jump棄却, kps=0, boundary棄却）を自動的にログファイルに出力する。
+
+出力例:
+```
+tri: cams=3 ref=NONE hip_errs=[c0+c1=155px,c0+c2=2671px,c1+c2=2532px] kps=16/37
+tri: cams=2 ref=c0+c1(113px) kps=22/37 boundary_rej=16
+tri: cams=2 ref=c0+c1(44px) Z_JUMP(1.536->4.289) kps=0/37
+```
+
+読み方:
+- `ref=NONE`: hipの基準カメラペアが見つからない（全ペアがMAX_REPROJ_ERROR超過）
+- `hip_errs=[...]`: 各カメラペアのhipリプロジェクションエラー
+- `ref=c0+c1(113px)`: c0+c1ペアが選ばれた（エラー113px）
+- `Z_JUMP(prev->cur)`: hip z値のジャンプで全キーポイント棄却
+- `boundary_rej=N`: 境界チェック（±10m, z>0）で除去されたキーポイント数
+- `kps=N/37`: 有効キーポイント数/全キーポイント数
