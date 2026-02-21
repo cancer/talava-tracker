@@ -820,18 +820,37 @@ fn compute_trackers_system(
                 tracker_state.reject_count[i] += 1;
                 if tracker_state.reject_count[i] >= 5 {
                     // 連続5回拒否 → 正当な急速移動と判断
-                    // フィルタリセットして新位置を受け入れ
-                    tracker_state.filters[i].reset();
-                    tracker_state.extrapolators[i] = Extrapolator::new();
-                    tracker_state.lerpers[i] = Lerper::new();
-                    let smoothed = tracker_state.filters[i].apply(p);
-                    tracker_state.extrapolators[i].update(smoothed);
-                    tracker_state.lerpers[i].update(smoothed, lerp_t);
-                    tracker_state.last_poses[i] = Some(smoothed);
-                    tracker_state.last_update_times[i] = now;
-                    tracker_state.stale[i] = false;
-                    tracker_state.reject_count[i] = 0;
-                    accepted = true;
+                    // ただしz軸ジャンプ（三角測量のカメラペア切替由来）を防ぐため
+                    // 受入前にz差をチェック（マルチカメラモード時）
+                    let z_ok = if pose_state.multi_camera {
+                        match tracker_state.last_poses[i].as_ref() {
+                            Some(last) => {
+                                let dz = (p.position[2] - last.position[2]).abs();
+                                dz <= 0.3 * scale_factor
+                            }
+                            None => true,
+                        }
+                    } else {
+                        true
+                    };
+                    if z_ok {
+                        // フィルタリセットして新位置を受け入れ
+                        tracker_state.filters[i].reset();
+                        tracker_state.extrapolators[i] = Extrapolator::new();
+                        tracker_state.lerpers[i] = Lerper::new();
+                        let smoothed = tracker_state.filters[i].apply(p);
+                        tracker_state.extrapolators[i].update(smoothed);
+                        tracker_state.lerpers[i].update(smoothed, lerp_t);
+                        tracker_state.last_poses[i] = Some(smoothed);
+                        tracker_state.last_update_times[i] = now;
+                        tracker_state.stale[i] = false;
+                        tracker_state.reject_count[i] = 0;
+                        accepted = true;
+                    } else {
+                        // z差が大きい → カメラペア切替由来の可能性
+                        // カウンタをリセットして棄却を継続
+                        tracker_state.reject_count[i] = 0;
+                    }
                 }
             }
         }
