@@ -580,6 +580,7 @@ const TRIANGULATION_TIMEOUT_MS: f32 = 100.0;
 fn triangulate_system(
     cam_inputs: Res<CameraInputs>,
     mut pose_state: ResMut<PoseState>,
+    lf: Res<LogFileRes>,
 ) {
     if !pose_state.multi_camera {
         // 単眼モード: 最初のカメラのPoseをそのまま使用
@@ -623,15 +624,22 @@ fn triangulate_system(
         return;
     }
 
-    let mut pose_3d = triangulate_poses(&available_params, &available_poses, CONFIDENCE_THRESHOLD);
+    let (mut pose_3d, diag) = triangulate_poses(&available_params, &available_poses, CONFIDENCE_THRESHOLD);
 
     // 三角測量の各キーポイントの境界チェック: カメラ座標系で妥当な範囲外を除去
+    let mut boundary_rejected = 0;
     for kp in pose_3d.keypoints.iter_mut() {
         if kp.confidence > 0.0
             && (kp.x.abs() > 10.0 || kp.y.abs() > 10.0 || kp.z.abs() > 10.0 || kp.z < 0.0)
         {
             kp.confidence = 0.0;
+            boundary_rejected += 1;
         }
+    }
+
+    // 診断ログ: ref_pair無し, z_jump棄却, 有効kp=0のいずれかで出力
+    if diag.hip_ref_pair.is_none() || diag.z_jump_rejected || diag.valid_keypoint_count == 0 || boundary_rejected > 0 {
+        log!(lf.0, "{}{}", diag, if boundary_rejected > 0 { format!(" boundary_rej={}", boundary_rejected) } else { String::new() });
     }
 
     pose_state.pose_3d = Some(pose_3d);
