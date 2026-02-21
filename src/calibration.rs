@@ -195,10 +195,24 @@ pub fn calibrate_intrinsics(
         &mut dist_coeffs,
         &mut rvecs,
         &mut tvecs,
-        0,
+        calib3d::CALIB_FIX_ASPECT_RATIO,
         criteria,
     )
     .context("calibrate_camera failed")?;
+
+    // fx/fy比のバリデーション
+    let fx = *camera_matrix.at_2d::<f64>(0, 0)?;
+    let fy = *camera_matrix.at_2d::<f64>(1, 1)?;
+    if fy.abs() > 1e-10 {
+        let ratio = fx / fy;
+        if ratio < 0.9 || ratio > 1.1 {
+            bail!(
+                "Calibration produced abnormal fx/fy ratio: {:.3} (fx={:.1}, fy={:.1}). \
+                 This indicates poor calibration input. Try capturing more diverse board angles.",
+                ratio, fx, fy,
+            );
+        }
+    }
 
     Ok((camera_matrix, dist_coeffs, error))
 }

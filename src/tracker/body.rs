@@ -28,6 +28,7 @@ struct Calibration {
     yaw_right_knee: f32,
     pitch_left_knee: f32,
     pitch_right_knee: f32,
+    tilt_angle: f32, // カメラチルト角（ラジアン）: YZ平面の回転補正用
 }
 
 pub struct BodyTracker {
@@ -105,10 +106,95 @@ impl BodyTracker {
         sanitized
     }
 
+    /// カメラのチルト角を推定（ラジアン）
+    /// hip中点とankle中点（fallback: knee中点）のYZ差分からX軸まわりの回転角を算出
+    /// カメラが下向きに設置されている場合、実世界の鉛直方向（重力）とカメラY軸がずれている
+    /// 立っている人の体幹は鉛直なので、hip→ankleのベクトルから傾きを推定できる
+    fn compute_tilt_angle(pose: &Pose, confidence_threshold: f32) -> f32 {
+        let left_hip = pose.get(KeypointIndex::LeftHip);
+        let right_hip = pose.get(KeypointIndex::RightHip);
+        if !left_hip.is_valid(confidence_threshold) || !right_hip.is_valid(confidence_threshold) {
+            return 0.0;
+        }
+        let hip_y = (left_hip.y + right_hip.y) / 2.0;
+        let hip_z = (left_hip.z + right_hip.z) / 2.0;
+
+        // ankle優先、fallback: knee
+        let left_ankle = pose.get(KeypointIndex::LeftAnkle);
+        let right_ankle = pose.get(KeypointIndex::RightAnkle);
+        let left_knee = pose.get(KeypointIndex::LeftKnee);
+        let right_knee = pose.get(KeypointIndex::RightKnee);
+
+        let (lower_y, lower_z) = if left_ankle.is_valid(confidence_threshold)
+            && right_ankle.is_valid(confidence_threshold)
+        {
+            (
+                (left_ankle.y + right_ankle.y) / 2.0,
+                (left_ankle.z + right_ankle.z) / 2.0,
+            )
+        } else if left_knee.is_valid(confidence_threshold)
+            && right_knee.is_valid(confidence_threshold)
+        {
+            (
+                (left_knee.y + right_knee.y) / 2.0,
+                (left_knee.z + right_knee.z) / 2.0,
+            )
+        } else {
+            return 0.0;
+        };
+
+        let delta_y = lower_y - hip_y; // カメラY: 下が正
+        let delta_z = lower_z - hip_z; // カメラZ: 前方が正
+
+        // 鉛直ベクトル（重力方向）はカメラ座標系でY+Z成分を持つ
+        // チルト角 = atan2(delta_z, delta_y)
+        // 立っている人のhip→ankleは鉛直なので、このベクトルがカメラのY軸からどれだけ傾いているかがチルト角
+        f32::atan2(delta_z, delta_y)
+    }
+
+    /// PoseのYZ座標をチルト角で回転補正
+    /// カメラ座標系を重力基準に変換する
+    /// Y軸: hip中点のzを全keypointの回転に使用（per-keypoint z三角測量ノイズ→Y漏れ防止）
+    /// Z軸: 各keypointの個別z値を使用（正確な奥行き保持）
+    fn rotate_pose_yz(pose: &Pose, tilt: f32, confidence_threshold: f32) -> Pose {
+        let (sin_t, cos_t) = tilt.sin_cos();
+
+        // hip中点zを基準にY回転（全keypointで共通）
+        // 前後移動による均一なz変化が各keypoint Yに同じ補正を与える
+        // per-keypoint zノイズがY軸に漏れるのを防ぐ
+        let left_hip = pose.get(KeypointIndex::LeftHip);
+        let right_hip = pose.get(KeypointIndex::RightHip);
+        let ref_z = if left_hip.is_valid(confidence_threshold)
+            && right_hip.is_valid(confidence_threshold)
+        {
+            (left_hip.z + right_hip.z) / 2.0
+        } else {
+            0.0
+        };
+
+        let mut rotated = pose.clone();
+        for kp in rotated.keypoints.iter_mut() {
+            let y = kp.y;
+            let z = kp.z;
+            kp.y = y * cos_t + ref_z * sin_t;
+            kp.z = -y * sin_t + z * cos_t;
+        }
+        rotated
+    }
+
     pub fn calibrate(&mut self, pose: &Pose) -> bool {
+        // world_coordsモード: 生poseからチルト角を計算し、補正済みposeでキャリブレーション
+        let tilt_angle = if self.world_coords {
+            Self::compute_tilt_angle(pose, self.confidence_threshold)
+        } else {
+            0.0
+        };
+
         let sanitized;
+        let rotated;
         let pose = if self.world_coords {
-            pose
+            rotated = Self::rotate_pose_yz(pose, tilt_angle, self.confidence_threshold);
+            &rotated
         } else {
             sanitized = Self::sanitize_pose(pose);
             &sanitized
@@ -183,6 +269,7 @@ impl BodyTracker {
             yaw_right_knee,
             pitch_left_knee,
             pitch_right_knee,
+            tilt_angle,
         });
         true
     }
@@ -201,9 +288,17 @@ impl BodyTracker {
 
     pub fn compute(&self, pose: &Pose) -> BodyPoses {
         // ワールド座標モードでは境界チェック不要（座標が0-1正規化ではなくメートル単位）
+        // キャリブレーション済みならチルト補正を適用
         let sanitized;
+        let rotated;
         let pose = if self.world_coords {
-            pose
+            let tilt = self.calibration.as_ref().map_or(0.0, |c| c.tilt_angle);
+            if tilt.abs() > 0.001 {
+                rotated = Self::rotate_pose_yz(pose, tilt, self.confidence_threshold);
+                &rotated
+            } else {
+                pose
+            }
         } else {
             sanitized = Self::sanitize_pose(pose);
             &sanitized
@@ -1066,6 +1161,82 @@ mod tests {
         // しゃがむとVR Y座標が下がる
         assert!(squat_hip_y < cal_hip_y,
             "squat hip.y({:.3}) should be lower than standing({:.3})", squat_hip_y, cal_hip_y);
+    }
+
+    /// チルト角30°のカメラで前後移動した場合、足のY座標が変化しないことを確認
+    /// カメラが30°下向き: 前後移動がカメラYとZ両方に成分を持つ
+    /// チルト補正により、VR Y軸にはZ成分が漏れないはず
+    #[test]
+    fn test_tilt_correction_z_does_not_leak_into_y() {
+        let config = TrackerConfig::default();
+        let mut tracker = BodyTracker::new(&config, 0.0, true);
+
+        // カメラが30°下向き: 立っている人のhip→ankleが(Δy=0.69, Δz=0.40)に見える
+        // 真の鉛直距離0.8m, tilt=30° → Δy=0.8*cos(30°)≈0.69, Δz=0.8*sin(30°)=0.40
+        let tilt = 30.0_f32.to_radians();
+        let (sin_t, cos_t) = tilt.sin_cos();
+
+        // 真の鉛直座標（重力基準）で人物を定義してからカメラ座標に変換
+        // 真のY: hip=0.0, ankle=0.8（下が正）
+        // 真のZ: 全部2.0m前方
+        let hip_true_y = 0.0_f32;
+        let ankle_true_y = 0.8_f32;
+        let shoulder_true_y = -0.5_f32;
+        let knee_true_y = 0.4_f32;
+        let true_z = 2.0_f32;
+
+        // カメラ座標に変換: y_cam = y_true * cos(θ) - z_true * sin(θ)  [逆回転]
+        //                   z_cam = y_true * sin(θ) + z_true * cos(θ)
+        // ※ rotate_pose_yzは順回転なので、逆変換は-θで行う
+        let to_cam = |y: f32, z: f32| -> (f32, f32) {
+            (y * cos_t - z * sin_t, y * sin_t + z * cos_t)
+        };
+
+        let (hip_cy, hip_cz) = to_cam(hip_true_y, true_z);
+        let (shoulder_cy, shoulder_cz) = to_cam(shoulder_true_y, true_z);
+        let (knee_cy, knee_cz) = to_cam(knee_true_y, true_z);
+        let (ankle_cy, ankle_cz) = to_cam(ankle_true_y, true_z);
+
+        let cal_pose = make_world_pose(
+            (0.15, hip_cy, hip_cz), (-0.15, hip_cy, hip_cz),
+            (0.2, shoulder_cy, shoulder_cz), (-0.2, shoulder_cy, shoulder_cz),
+            (0.15, knee_cy, knee_cz), (-0.15, knee_cy, knee_cz),
+            (0.15, ankle_cy, ankle_cz), (-0.15, ankle_cy, ankle_cz),
+        );
+        assert!(tracker.calibrate(&cal_pose));
+
+        // 前後移動: 真のZ方向に0.5m前進（真のYは変化しない）
+        let moved_z = 1.5_f32; // 2.0 → 1.5（カメラに近づく）
+        let (hip_my, hip_mz) = to_cam(hip_true_y, moved_z);
+        let (shoulder_my, shoulder_mz) = to_cam(shoulder_true_y, moved_z);
+        let (knee_my, knee_mz) = to_cam(knee_true_y, moved_z);
+        let (ankle_my, ankle_mz) = to_cam(ankle_true_y, moved_z);
+
+        let moved_pose = make_world_pose(
+            (0.15, hip_my, hip_mz), (-0.15, hip_my, hip_mz),
+            (0.2, shoulder_my, shoulder_mz), (-0.2, shoulder_my, shoulder_mz),
+            (0.15, knee_my, knee_mz), (-0.15, knee_my, knee_mz),
+            (0.15, ankle_my, ankle_mz), (-0.15, ankle_my, ankle_mz),
+        );
+
+        let cal_result = tracker.compute(&cal_pose);
+        let moved_result = tracker.compute(&moved_pose);
+
+        let cal_foot_y = cal_result.left_foot.unwrap().position[1];
+        let moved_foot_y = moved_result.left_foot.unwrap().position[1];
+
+        // 前後移動ではY座標がほぼ変化しないこと（漏れが0.05m以下）
+        let y_diff = (moved_foot_y - cal_foot_y).abs();
+        assert!(y_diff < 0.05,
+            "forward movement should not leak into Y: cal_foot.y={:.3}, moved_foot.y={:.3}, diff={:.3}",
+            cal_foot_y, moved_foot_y, y_diff);
+
+        // 一方でZ座標は変化すること（前進）
+        let cal_hip_z = cal_result.hip.unwrap().position[2];
+        let moved_hip_z = moved_result.hip.unwrap().position[2];
+        assert!(moved_hip_z > cal_hip_z + 0.1,
+            "forward movement should increase z: cal_hip.z={:.3}, moved_hip.z={:.3}",
+            cal_hip_z, moved_hip_z);
     }
 
 }
