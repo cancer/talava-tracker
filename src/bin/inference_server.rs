@@ -6,6 +6,7 @@
 
 use std::io::Write;
 use std::net::UdpSocket;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -47,6 +48,8 @@ struct Config {
     offset_y: f32,
     #[serde(default)]
     foot_y_offset: f32,
+    #[serde(default)]
+    verbose: bool,
     #[serde(default)]
     filter: FilterConfig,
 }
@@ -114,6 +117,13 @@ const KP_LEFT_SMALL_TOE: usize = 22;
 const KP_RIGHT_SMALL_TOE: usize = 23;
 const KP_LEFT_HEEL: usize = 24;
 const KP_RIGHT_HEEL: usize = 25;
+
+const KP_NAMES: &[&str] = &[
+    "Nose","LEye","REye","LEar","REar","LShoulder","RShoulder","LElbow","RElbow",
+    "LWrist","RWrist","LHip","RHip","LKnee","RKnee","LAnkle","RAnkle",
+    "Head","Neck","Hip","LBigToe","RBigToe","LSmallToe","RSmallToe","LHeel","RHeel",
+    "26","27","28","29","30","31","32","33","34","35","36",
+];
 
 #[derive(Debug, Clone, Copy, Default)]
 struct Keypoint {
@@ -1634,13 +1644,13 @@ impl VmtClient {
 
 type LogFile = Arc<Mutex<std::io::BufWriter<std::fs::File>>>;
 
-fn open_log_file() -> Result<LogFile> {
+fn open_log_file() -> Result<(LogFile, String)> {
     std::fs::create_dir_all("logs")?;
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let path = format!("logs/inference_{}.log", ts);
     let file = std::fs::File::create(&path)?;
     eprintln!("Log: {}", path);
-    Ok(Arc::new(Mutex::new(std::io::BufWriter::new(file))))
+    Ok((Arc::new(Mutex::new(std::io::BufWriter::new(file))), path))
 }
 
 macro_rules! log {
@@ -1674,30 +1684,46 @@ enum TcpEvent {
 async fn tcp_receive_loop(
     stream: tokio::net::TcpStream,
     tx: mpsc::SyncSender<TcpEvent>,
+    mut out_rx: tokio::sync::mpsc::Receiver<ServerMessage>,
 ) -> Result<()> {
-    let mut stream = protocol::message_stream(stream);
+    use futures::StreamExt as _;
+
+    let framed = protocol::message_stream(stream);
+    let (mut sink, mut reader) = framed.split();
 
     loop {
-        let msg: ClientMessage = protocol::recv_message(&mut stream).await?;
-        match msg {
-            ClientMessage::CameraCalibration { data } => {
-                let _ = tx.send(TcpEvent::CalibrationReceived(data));
-                protocol::send_message(&mut stream, &ServerMessage::CameraCalibrationAck { ok: true, error: None }).await?;
-                protocol::send_message(&mut stream, &ServerMessage::Ready).await?;
-            }
-            ClientMessage::FrameSet { timestamp_us, frames } => {
-                let decoded: Vec<DecodedFrame> = frames.into_iter().filter_map(|f| {
-                    let buf = Vector::<u8>::from_iter(f.jpeg_data.into_iter());
-                    let mat = imgcodecs::imdecode(&buf, imgcodecs::IMREAD_COLOR).ok()?;
-                    if mat.empty() { return None; }
-                    Some(DecodedFrame { camera_id: f.camera_id, width: f.width as u32, height: f.height as u32, mat })
-                }).collect();
-                if !decoded.is_empty() {
-                    let _ = tx.try_send(TcpEvent::FrameSet(DecodedFrameSet { timestamp_us, frames: decoded }));
+        tokio::select! {
+            result = reader.next() => {
+                let bytes = match result {
+                    Some(Ok(b)) => b,
+                    Some(Err(e)) => return Err(e.into()),
+                    None => return Err(anyhow::anyhow!("connection closed")),
+                };
+                let msg: ClientMessage = bincode::deserialize(&bytes)?;
+                match msg {
+                    ClientMessage::CameraCalibration { data } => {
+                        let _ = tx.send(TcpEvent::CalibrationReceived(data));
+                        protocol::send_to_sink(&mut sink, &ServerMessage::CameraCalibrationAck { ok: true, error: None }).await?;
+                        protocol::send_to_sink(&mut sink, &ServerMessage::Ready).await?;
+                    }
+                    ClientMessage::FrameSet { timestamp_us, frames } => {
+                        let decoded: Vec<DecodedFrame> = frames.into_iter().filter_map(|f| {
+                            let buf = Vector::<u8>::from_iter(f.jpeg_data.into_iter());
+                            let mat = imgcodecs::imdecode(&buf, imgcodecs::IMREAD_COLOR).ok()?;
+                            if mat.empty() { return None; }
+                            Some(DecodedFrame { camera_id: f.camera_id, width: f.width as u32, height: f.height as u32, mat })
+                        }).collect();
+                        if !decoded.is_empty() {
+                            let _ = tx.try_send(TcpEvent::FrameSet(DecodedFrameSet { timestamp_us, frames: decoded }));
+                        }
+                    }
+                    ClientMessage::TriggerPoseCalibration => {
+                        let _ = tx.send(TcpEvent::TriggerPoseCalibration);
+                    }
                 }
             }
-            ClientMessage::TriggerPoseCalibration => {
-                let _ = tx.send(TcpEvent::TriggerPoseCalibration);
+            Some(out_msg) = out_rx.recv() => {
+                protocol::send_to_sink(&mut sink, &out_msg).await?;
             }
         }
     }
@@ -1727,6 +1753,11 @@ fn run_inference_loop(
     model_type: ModelType,
     vmt: &VmtClient,
     logfile: &LogFile,
+    verbose: bool,
+    log_path: &str,
+    out_tx: &tokio::sync::mpsc::Sender<ServerMessage>,
+    trigger_log_send: &AtomicBool,
+    trigger_calibration: &AtomicBool,
 ) {
     let mut camera_params: Vec<CameraParams> = Vec::new();
     let mut calibrated = false;
@@ -1771,6 +1802,32 @@ fn run_inference_loop(
     log!(logfile, "Waiting for calibration data from client...");
 
     loop {
+        // Check console triggers
+        if trigger_calibration.swap(false, Ordering::Relaxed) && calibrated && cal_deadline.is_none() {
+            cal_deadline = Some(Instant::now() + Duration::from_secs(5));
+            log!(logfile, "Calibration in 5s... (console)");
+        }
+        if trigger_log_send.swap(false, Ordering::Relaxed) {
+            if let Ok(mut f) = logfile.lock() {
+                let _ = f.flush();
+            }
+            match std::fs::read(log_path) {
+                Ok(content) => {
+                    let filename = std::path::Path::new(log_path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "inference.log".to_string());
+                    let len = content.len();
+                    let msg = ServerMessage::LogData { filename, data: content };
+                    let _ = out_tx.blocking_send(msg);
+                    log!(logfile, "[log] sent log to camera ({} bytes)", len);
+                }
+                Err(e) => {
+                    log!(logfile, "[log] failed to read log file: {}", e);
+                }
+            }
+        }
+
         let event = match rx.recv_timeout(Duration::from_millis(16)) {
             Ok(ev) => Some(ev),
             Err(mpsc::RecvTimeoutError::Timeout) => None,
@@ -1799,11 +1856,19 @@ fn run_inference_loop(
                             &cam_cal.rvec, &cam_cal.tvec,
                             cam_cal.width, cam_cal.height,
                         );
+                        if verbose {
+                            log!(logfile, "  Camera {} (idx {}): {}x{} dist_coeffs=[{:.4},{:.4},{:.4},{:.4},{:.4}]",
+                                cam_cal.camera_index, idx, cam_cal.width, cam_cal.height,
+                                dc[0], dc[1], dc[2], dc[3], dc[4]);
+                            log!(logfile, "    intrinsic: fx={:.1} fy={:.1} cx={:.1} cy={:.1}",
+                                cp.intrinsic[(0,0)], cp.intrinsic[(1,1)], cp.intrinsic[(0,2)], cp.intrinsic[(1,2)]);
+                        } else {
+                            log!(logfile, "  Camera {} (idx {}): {}x{}", cam_cal.camera_index, idx, cam_cal.width, cam_cal.height);
+                        }
                         camera_params.push(cp);
                         cam_widths.push(cam_cal.width);
                         cam_heights.push(cam_cal.height);
                         cam_id_to_idx.insert(cam_cal.camera_index as u8, idx);
-                        log!(logfile, "  Camera {} (idx {}): {}x{}", cam_cal.camera_index, idx, cam_cal.width, cam_cal.height);
                     }
 
                     num_cameras = cal.cameras.len();
@@ -1837,11 +1902,21 @@ fn run_inference_loop(
                     for decoded in &frame_set.frames {
                         let cam_idx = match cam_id_to_idx.get(&decoded.camera_id) {
                             Some(&idx) => idx,
-                            None => continue,
+                            None => {
+                                if verbose { log!(logfile, "[verbose] unknown camera_id={}, skipping", decoded.camera_id); }
+                                continue;
+                            }
                         };
 
                         let width = decoded.width;
                         let height = decoded.height;
+
+                        if verbose {
+                            let mat_rows = decoded.mat.rows();
+                            let mat_cols = decoded.mat.cols();
+                            log!(logfile, "[verbose] cam{}: decoded={}x{} (expected {}x{})",
+                                cam_idx, mat_cols, mat_rows, width, height);
+                        }
 
                         if width != cam_widths[cam_idx] || height != cam_heights[cam_idx] {
                             if camera_params[cam_idx].rescale_to(width, height) {
@@ -1857,11 +1932,17 @@ fn run_inference_loop(
                                 match prev_poses[cam_idx].as_ref()
                                     .and_then(|p| bbox_from_keypoints(p, width, height, CONFIDENCE_THRESHOLD))
                                 {
-                                    Some(bbox) => match crop_for_pose(&decoded.mat, &bbox, width, height) {
-                                        Ok(v) => v,
-                                        Err(_) => (decoded.mat.clone(), CropRegion::full()),
-                                    },
-                                    None => (decoded.mat.clone(), CropRegion::full()),
+                                    Some(bbox) => {
+                                        if verbose { log!(logfile, "[verbose] cam{}: keypoint crop x={} y={} w={} h={}", cam_idx, bbox.x, bbox.y, bbox.width, bbox.height); }
+                                        match crop_for_pose(&decoded.mat, &bbox, width, height) {
+                                            Ok(v) => v,
+                                            Err(_) => (decoded.mat.clone(), CropRegion::full()),
+                                        }
+                                    }
+                                    None => {
+                                        if verbose { log!(logfile, "[verbose] cam{}: no keypoint bbox, full frame", cam_idx); }
+                                        (decoded.mat.clone(), CropRegion::full())
+                                    }
                                 }
                             }
                             "yolo" => {
@@ -1894,15 +1975,55 @@ fn run_inference_loop(
                             },
                         };
 
+                        if verbose {
+                            log!(logfile, "[verbose] cam{}: letterbox pad_left={:.1} pad_top={:.1} content=({:.3},{:.3})",
+                                cam_idx, letterbox.pad_left, letterbox.pad_top, letterbox.content_width, letterbox.content_height);
+                        }
+
                         // Inference
+                        let infer_start = Instant::now();
                         let mut pose = match detector.detect(input) {
                             Ok(v) => v,
                             Err(e) => { log!(logfile, "inference error: {}", e); continue; }
                         };
+                        let infer_ms = infer_start.elapsed().as_secs_f64() * 1000.0;
 
                         pose = unletterbox_pose(&pose, &letterbox);
                         if !crop_region.is_full() { pose = remap_pose(&pose, &crop_region); }
+
+                        if verbose {
+                            // Log pre-sanitize keypoints for key joints
+                            let diag_kps: &[(usize, &str)] = &[
+                                (KP_LEFT_HIP, "LHip"), (KP_RIGHT_HIP, "RHip"),
+                                (KP_LEFT_KNEE, "LKnee"), (KP_RIGHT_KNEE, "RKnee"),
+                                (KP_LEFT_ANKLE, "LAnkle"), (KP_RIGHT_ANKLE, "RAnkle"),
+                                (KP_LEFT_SHOULDER, "LShoulder"), (KP_RIGHT_SHOULDER, "RShoulder"),
+                            ];
+                            let kp_strs: Vec<String> = diag_kps.iter()
+                                .map(|(idx, name)| {
+                                    let kp = &pose.keypoints[*idx];
+                                    format!("{}({:.3},{:.3},{:.2})", name, kp.x, kp.y, kp.confidence)
+                                }).collect();
+                            log!(logfile, "[verbose] cam{}: infer={:.1}ms 2d=[{}]",
+                                cam_idx, infer_ms, kp_strs.join(" "));
+                        }
+
+                        let pre_sanitize = if verbose { Some(pose.clone()) } else { None };
                         pose = sanitize_pose(&pose);
+
+                        if verbose {
+                            if let Some(ref pre) = pre_sanitize {
+                                let sanitized_kps: Vec<String> = (0..KP_COUNT)
+                                    .filter(|&i| pre.keypoints[i].confidence > 0.0 && pose.keypoints[i].confidence == 0.0)
+                                    .map(|i| {
+                                        let kp = &pre.keypoints[i];
+                                        format!("{}({:.3},{:.3})", KP_NAMES[i], kp.x, kp.y)
+                                    }).collect();
+                                if !sanitized_kps.is_empty() {
+                                    log!(logfile, "[verbose] cam{}: sanitized out: {}", cam_idx, sanitized_kps.join(" "));
+                                }
+                            }
+                        }
 
                         prev_poses[cam_idx] = Some(pose.clone());
                         poses_2d[cam_idx] = Some(pose);
@@ -1922,14 +2043,28 @@ fn run_inference_loop(
                                 .unwrap_or(false)
                         } else { false };
 
+                        if verbose && !should_triangulate && ready_count >= 1 {
+                            let oldest_ms = pose_timestamps.iter().filter_map(|t| *t).min()
+                                .map(|ts| ts.elapsed().as_secs_f32() * 1000.0).unwrap_or(0.0);
+                            log!(logfile, "[verbose] tri: waiting ({}/{} cams ready, oldest={:.0}ms)",
+                                ready_count, num_cameras, oldest_ms);
+                        }
+
                         if should_triangulate {
                             let mut available_poses: Vec<&Pose> = Vec::new();
                             let mut available_params: Vec<&CameraParams> = Vec::new();
+                            let mut available_cam_indices: Vec<usize> = Vec::new();
                             for i in 0..num_cameras {
                                 if let Some(ref pose) = poses_2d[i] {
                                     available_poses.push(pose);
                                     available_params.push(&camera_params[i]);
+                                    available_cam_indices.push(i);
                                 }
+                            }
+
+                            if verbose {
+                                log!(logfile, "[verbose] tri: using {} cameras (idx {:?}), prev_ref_pair={:?}, prev_hip_z={:?}",
+                                    available_poses.len(), available_cam_indices, prev_hip_ref_pair, prev_hip_z);
                             }
 
                             if available_poses.len() >= 2 {
@@ -1938,11 +2073,35 @@ fn run_inference_loop(
                                     &mut prev_hip_ref_pair, &mut prev_hip_z,
                                 );
 
+                                if verbose {
+                                    log!(logfile, "[verbose] tri: ref_pair={:?} hip_z={:?}", prev_hip_ref_pair, prev_hip_z);
+                                    let diag_kps: &[(usize, &str)] = &[
+                                        (KP_LEFT_HIP, "LHip"), (KP_RIGHT_HIP, "RHip"),
+                                        (KP_LEFT_KNEE, "LKnee"), (KP_RIGHT_KNEE, "RKnee"),
+                                        (KP_LEFT_ANKLE, "LAnkle"), (KP_RIGHT_ANKLE, "RAnkle"),
+                                        (KP_LEFT_SHOULDER, "LShoulder"), (KP_RIGHT_SHOULDER, "RShoulder"),
+                                    ];
+                                    let kp_strs: Vec<String> = diag_kps.iter()
+                                        .filter(|(idx, _)| tri_pose.keypoints[*idx].confidence > 0.0)
+                                        .map(|(idx, name)| {
+                                            let kp = &tri_pose.keypoints[*idx];
+                                            format!("{}({:.3},{:.3},{:.3} c={:.2})", name, kp.x, kp.y, kp.z, kp.confidence)
+                                        }).collect();
+                                    log!(logfile, "[verbose] tri 3d: [{}]", kp_strs.join(" "));
+                                }
+
+                                let mut oob_count = 0;
                                 for kp in tri_pose.keypoints.iter_mut() {
                                     if kp.confidence > 0.0
                                         && (kp.x.abs() > 10.0 || kp.y.abs() > 10.0
                                             || kp.z.abs() > 10.0 || kp.z < 0.0)
-                                    { kp.confidence = 0.0; }
+                                    {
+                                        oob_count += 1;
+                                        kp.confidence = 0.0;
+                                    }
+                                }
+                                if verbose && oob_count > 0 {
+                                    log!(logfile, "[verbose] tri: {} keypoints out-of-bounds filtered", oob_count);
                                 }
 
                                 pose_3d = Some(tri_pose);
@@ -2016,6 +2175,7 @@ fn run_inference_loop(
         }
 
         // --- Compute trackers ---
+        let tracker_names = ["hip", "L_foot", "R_foot", "chest", "L_knee", "R_knee"];
         if let Some(ref pose) = pose_3d {
             let lh = pose.get(KP_LEFT_HIP);
             let rh = pose.get(KP_RIGHT_HIP);
@@ -2023,15 +2183,32 @@ fn run_inference_loop(
                 let hx = (lh.x + rh.x) / 2.0;
                 let hy = (lh.y + rh.y) / 2.0;
                 let hz = (lh.z + rh.z) / 2.0;
+                if verbose {
+                    log!(logfile, "[verbose] hip_check: ({:.3},{:.3},{:.3})", hx, hy, hz);
+                }
                 !(hx.abs() > 10.0 || hy.abs() > 10.0 || hz.abs() > 10.0 || hz < 0.0)
-            } else { true };
+            } else {
+                if verbose { log!(logfile, "[verbose] hip not valid (LHip c={:.2}, RHip c={:.2})", lh.confidence, rh.confidence); }
+                true
+            };
 
-            if hip_valid {
+            if !hip_valid {
+                if verbose { log!(logfile, "[verbose] hip OOB, skipping tracker compute"); }
+            } else {
                 let body_poses = body_tracker.compute(pose);
                 let poses = [
                     body_poses.hip, body_poses.left_foot, body_poses.right_foot,
                     body_poses.chest, body_poses.left_knee, body_poses.right_knee,
                 ];
+
+                if verbose {
+                    let raw_strs: Vec<String> = poses.iter().enumerate()
+                        .map(|(i, p)| match p {
+                            Some(tp) => format!("{}({:.3},{:.3},{:.3})", tracker_names[i], tp.position[0], tp.position[1], tp.position[2]),
+                            None => format!("{}(none)", tracker_names[i]),
+                        }).collect();
+                    log!(logfile, "[verbose] body_tracker raw: {}", raw_strs.join(" "));
+                }
 
                 let dt = last_inference_time.elapsed().as_secs_f32();
                 let lerp_t = (dt / (1.0 / 30.0)).min(1.0);
@@ -2042,16 +2219,17 @@ fn run_inference_loop(
                 for i in 0..TRACKER_COUNT {
                     let mut accepted = false;
                     if let Some(p) = poses[i] {
-                        let velocity_ok = match last_poses[i].as_ref() {
+                        let (velocity_ok, displacement) = match last_poses[i].as_ref() {
                             Some(last) => {
                                 let dx = p.position[0] - last.position[0];
                                 let dy = p.position[1] - last.position[1];
                                 let dz = p.position[2] - last.position[2];
-                                (dx * dx + dy * dy + dz * dz).sqrt() <= max_displacement
+                                let d = (dx * dx + dy * dy + dz * dz).sqrt();
+                                (d <= max_displacement, d)
                             }
-                            None => true,
+                            None => (true, 0.0),
                         };
-                        let limb_ok = if i > 0 {
+                        let (limb_ok, limb_dist) = if i > 0 {
                             match last_poses[0].as_ref() {
                                 Some(hip) => {
                                     let dx = p.position[0] - hip.position[0];
@@ -2062,14 +2240,25 @@ fn run_inference_loop(
                                         1 | 2 | 4 | 5 => p.position[1] < hip.position[1],
                                         _ => true,
                                     };
-                                    dist <= max_limb_dist && anatomy_ok
+                                    (dist <= max_limb_dist && anatomy_ok, dist)
                                 }
-                                None => false,
+                                None => (false, 0.0),
                             }
-                        } else { true };
+                        } else { (true, 0.0) };
+
+                        if verbose && (!velocity_ok || !limb_ok) {
+                            log!(logfile, "[verbose] {}: reject vel_ok={} (d={:.3}) limb_ok={} (d={:.3}) reject_count={}",
+                                tracker_names[i], velocity_ok, displacement, limb_ok, limb_dist, reject_count[i]);
+                        }
 
                         if velocity_ok && limb_ok {
                             let smoothed = filters[i].apply(p);
+                            if verbose {
+                                log!(logfile, "[verbose] {}: raw({:.3},{:.3},{:.3}) -> filtered({:.3},{:.3},{:.3})",
+                                    tracker_names[i],
+                                    p.position[0], p.position[1], p.position[2],
+                                    smoothed.position[0], smoothed.position[1], smoothed.position[2]);
+                            }
                             extrapolators[i].update(smoothed);
                             lerpers[i].update(smoothed, lerp_t);
                             last_poses[i] = Some(smoothed);
@@ -2085,6 +2274,7 @@ fn run_inference_loop(
                                     None => true,
                                 };
                                 if z_ok {
+                                    if verbose { log!(logfile, "[verbose] {}: reset after {} rejects (z_ok)", tracker_names[i], reject_count[i]); }
                                     filters[i].reset();
                                     extrapolators[i] = Extrapolator::new();
                                     lerpers[i] = Lerper::new();
@@ -2096,14 +2286,21 @@ fn run_inference_loop(
                                     stale[i] = false;
                                     reject_count[i] = 0;
                                     accepted = true;
-                                } else { reject_count[i] = 0; }
+                                } else {
+                                    if verbose { log!(logfile, "[verbose] {}: reset blocked (z_jump too large)", tracker_names[i]); }
+                                    reject_count[i] = 0;
+                                }
                             }
                         }
                     }
                     if !accepted && last_poses[i].is_some() {
                         let stale_time = now.duration_since(last_update_times[i]).as_secs_f32();
-                        if stale_time > 3.0 { last_poses[i] = None; stale[i] = false; }
+                        if stale_time > 3.0 {
+                            if verbose { log!(logfile, "[verbose] {}: expired (stale {:.1}s)", tracker_names[i], stale_time); }
+                            last_poses[i] = None; stale[i] = false;
+                        }
                         else if stale_time > 0.3 && !stale[i] {
+                            if verbose { log!(logfile, "[verbose] {}: went stale ({:.1}s)", tracker_names[i], stale_time); }
                             stale[i] = true;
                             filters[i].reset();
                             extrapolators[i] = Extrapolator::new();
@@ -2117,6 +2314,20 @@ fn run_inference_loop(
 
         // --- Send VMT ---
         if pose_3d.is_some() {
+            if verbose {
+                let vmt_strs: Vec<String> = (0..TRACKER_COUNT)
+                    .filter(|&i| !stale[i] && last_poses[i].is_some())
+                    .map(|i| {
+                        let p = last_poses[i].as_ref().unwrap();
+                        format!("{}({:.3},{:.3},{:.3} q=[{:.3},{:.3},{:.3},{:.3}])",
+                            tracker_names[i],
+                            p.position[0], p.position[1], p.position[2],
+                            p.rotation[0], p.rotation[1], p.rotation[2], p.rotation[3])
+                    }).collect();
+                if !vmt_strs.is_empty() {
+                    log!(logfile, "[verbose] vmt send: {}", vmt_strs.join(" "));
+                }
+            }
             for i in 0..TRACKER_COUNT {
                 if !stale[i] {
                     if let Some(ref p) = last_poses[i] { let _ = vmt.send(TRACKER_INDICES[i], 1, p); }
@@ -2124,6 +2335,7 @@ fn run_inference_loop(
             }
         } else {
             let dt = last_inference_time.elapsed().as_secs_f32();
+            if verbose { log!(logfile, "[verbose] no pose_3d, interpolating (mode={}, dt={:.3}s)", interp_mode, dt); }
             match interp_mode.as_str() {
                 "extrapolate" => {
                     for i in 0..TRACKER_COUNT {
@@ -2192,12 +2404,14 @@ async fn main() -> Result<()> {
     let config_str = std::fs::read_to_string("inference_server.toml")
         .context("failed to read inference_server.toml")?;
     let config: Config = toml::from_str(&config_str)?;
-    let logfile = open_log_file()?;
+    let (logfile, log_path) = open_log_file()?;
 
-    log!(logfile, "Inference Server (standalone)");
+    log!(logfile, "Inference Server ({})", env!("GIT_VERSION"));
     log!(logfile, "Listen: {}", config.listen_addr);
     log!(logfile, "VMT target: {}", config.vmt_addr);
     log!(logfile, "Interpolation: {}", config.interpolation_mode);
+    if config.verbose { log!(logfile, "Verbose mode: ON"); }
+    log!(logfile, "Press 'l' + Enter to send log to camera");
 
     let (model_path, model_type): (&str, ModelType) = match config.model.as_str() {
         "movenet" => ("models/movenet_lightning.onnx", ModelType::MoveNet),
@@ -2224,6 +2438,34 @@ async fn main() -> Result<()> {
     let vmt = VmtClient::new(&config.vmt_addr)?;
     log!(logfile, "VMT client ready");
 
+    // Console input: 'l' → send log, 'p' → pose calibration
+    let trigger_log_send = Arc::new(AtomicBool::new(false));
+    let trigger_calibration = Arc::new(AtomicBool::new(false));
+    {
+        let log_flag = Arc::clone(&trigger_log_send);
+        let cal_flag = Arc::clone(&trigger_calibration);
+        std::thread::spawn(move || {
+            let stdin = std::io::stdin();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if stdin.read_line(&mut line).is_ok() {
+                    match line.trim() {
+                        "l" => {
+                            eprintln!("[input] log send triggered");
+                            log_flag.store(true, Ordering::Relaxed);
+                        }
+                        "p" => {
+                            eprintln!("[input] pose calibration triggered");
+                            cal_flag.store(true, Ordering::Relaxed);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+    }
+
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     log!(logfile, "Listening on {}", config.listen_addr);
     log!(logfile, "");
@@ -2233,15 +2475,19 @@ async fn main() -> Result<()> {
         log!(logfile, "Client connected: {}", addr);
 
         let (tx, rx) = mpsc::sync_channel::<TcpEvent>(4);
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel::<ServerMessage>(4);
 
         let tcp_task = tokio::spawn(async move {
-            if let Err(e) = tcp_receive_loop(tcp_stream, tx).await {
+            if let Err(e) = tcp_receive_loop(tcp_stream, tx, out_rx).await {
                 eprintln!("TCP error: {}", e);
             }
         });
 
         tokio::task::block_in_place(|| {
-            run_inference_loop(&rx, &config, &mut detector, &mut person_detector, model_type, &vmt, &logfile);
+            run_inference_loop(
+                &rx, &config, &mut detector, &mut person_detector, model_type, &vmt,
+                &logfile, config.verbose, &log_path, &out_tx, &trigger_log_send, &trigger_calibration,
+            );
         });
 
         tcp_task.abort();

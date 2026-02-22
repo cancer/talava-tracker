@@ -3,6 +3,7 @@
 //!
 //! Only imports from `talava_tracker::protocol`. All other functionality is inline.
 
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,6 +15,7 @@ use opencv::videoio::{self, VideoCapture, CAP_ANY};
 use opencv::{imgcodecs, imgproc};
 use serde::Deserialize;
 
+use futures::StreamExt as _;
 use talava_tracker::protocol::{
     self, CalibrationData, ClientMessage, Frame, MessageStream, ServerMessage,
 };
@@ -28,10 +30,38 @@ struct Config {
     server_addr: String,
     #[serde(default = "default_jpeg_quality")]
     jpeg_quality: i32,
+    #[serde(default)]
+    verbose: bool,
 }
 
 fn default_jpeg_quality() -> i32 {
     80
+}
+
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+
+type LogFile = Arc<Mutex<std::io::BufWriter<std::fs::File>>>;
+
+fn open_log_file() -> Result<LogFile> {
+    std::fs::create_dir_all("logs")?;
+    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let path = format!("logs/camera_{}.log", ts);
+    let file = std::fs::File::create(&path)?;
+    eprintln!("Log: {}", path);
+    Ok(Arc::new(Mutex::new(std::io::BufWriter::new(file))))
+}
+
+macro_rules! log {
+    ($logfile:expr, $($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        eprintln!("{}", msg);
+        if let Ok(mut f) = $logfile.lock() {
+            let _ = writeln!(f, "{}", msg);
+            let _ = f.flush();
+        }
+    }};
 }
 
 // ---------------------------------------------------------------------------
@@ -158,27 +188,31 @@ fn collect_frames(cameras: &[CameraThread], timeout: Duration) -> Option<Vec<(i3
 // ---------------------------------------------------------------------------
 
 async fn run_session(
-    stream: &mut MessageStream,
+    stream: MessageStream,
     calibration: &CalibrationData,
     cameras: &[CameraThread],
     jpeg_quality: i32,
     trigger_calibration: &AtomicBool,
+    verbose: bool,
+    logfile: &LogFile,
 ) -> Result<()> {
+    let mut stream = stream;
+
     // 1. Send calibration
     protocol::send_message(
-        stream,
+        &mut stream,
         &ClientMessage::CameraCalibration {
             data: calibration.clone(),
         },
     )
     .await?;
-    eprintln!("[tcp] sent CameraCalibration");
+    log!(logfile, "[tcp] sent CameraCalibration");
 
     // 2. Wait for Ack
-    let ack: ServerMessage = protocol::recv_message(stream).await?;
+    let ack: ServerMessage = protocol::recv_message(&mut stream).await?;
     match ack {
         ServerMessage::CameraCalibrationAck { ok: true, .. } => {
-            eprintln!("[tcp] calibration acknowledged");
+            log!(logfile, "[tcp] calibration acknowledged");
         }
         ServerMessage::CameraCalibrationAck {
             ok: false, error, ..
@@ -189,63 +223,136 @@ async fn run_session(
     }
 
     // 3. Wait for Ready
-    let ready: ServerMessage = protocol::recv_message(stream).await?;
+    let ready: ServerMessage = protocol::recv_message(&mut stream).await?;
     match ready {
-        ServerMessage::Ready => eprintln!("[tcp] server ready, starting stream"),
+        ServerMessage::Ready => log!(logfile, "[tcp] server ready, starting stream"),
         other => bail!("expected Ready, got {other:?}"),
     }
 
-    // 4. Stream frames
+    // 4. Split stream: sink for sending frames, reader for receiving server messages
+    let (mut sink, mut reader) = stream.split();
+
+    // Spawn reader task to receive ServerMessage (e.g. LogData)
+    let reader_logfile = logfile.clone();
+    let reader_task = tokio::spawn(async move {
+        loop {
+            match reader.next().await {
+                Some(Ok(bytes)) => {
+                    match bincode::deserialize::<ServerMessage>(&bytes) {
+                        Ok(ServerMessage::LogData { filename, data }) => {
+                            std::fs::create_dir_all("logs").ok();
+                            let path = format!("logs/{}", filename);
+                            match std::fs::write(&path, &data) {
+                                Ok(_) => {
+                                    let msg = format!("[tcp] received log: {} ({}KB)", path, data.len() / 1024);
+                                    eprintln!("{}", msg);
+                                    if let Ok(mut f) = reader_logfile.lock() {
+                                        let _ = writeln!(f, "{}", msg);
+                                        let _ = f.flush();
+                                    }
+                                }
+                                Err(e) => { eprintln!("[tcp] failed to save log: {}", e); }
+                            }
+                        }
+                        Ok(other) => { eprintln!("[tcp] unexpected server message: {:?}", other); }
+                        Err(e) => { eprintln!("[tcp] deserialize error: {}", e); }
+                    }
+                }
+                Some(Err(e)) => { eprintln!("[tcp] reader error: {}", e); break; }
+                None => break,
+            }
+        }
+    });
+
+    // 5. Stream frames via sink
     let mut fps_counter: u32 = 0;
     let mut fps_timer = Instant::now();
     let frame_timeout = Duration::from_millis(50);
 
-    loop {
-        // Check pose calibration trigger
-        if trigger_calibration.swap(false, Ordering::Relaxed) {
-            eprintln!("[tcp] sending TriggerPoseCalibration");
-            protocol::send_message(stream, &ClientMessage::TriggerPoseCalibration).await?;
+    let result: Result<()> = async {
+        loop {
+            // Check pose calibration trigger
+            if trigger_calibration.swap(false, Ordering::Relaxed) {
+                log!(logfile, "[tcp] sending TriggerPoseCalibration");
+                protocol::send_to_sink(&mut sink, &ClientMessage::TriggerPoseCalibration).await?;
+            }
+
+            // Collect frames from all cameras
+            let sync_start = Instant::now();
+            let raw_frames = match collect_frames(cameras, frame_timeout) {
+                Some(f) => f,
+                None => {
+                    if verbose { log!(logfile, "[verbose] frame sync timeout ({}ms)", frame_timeout.as_millis()); }
+                    continue;
+                }
+            };
+            let sync_elapsed = sync_start.elapsed();
+
+            let timestamp_us = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as u64;
+
+            // JPEG encode
+            let encode_start = Instant::now();
+            let mut frames = Vec::with_capacity(raw_frames.len());
+            let mut total_payload: usize = 0;
+            for (cam_id, w, h, mat) in &raw_frames {
+                let t0 = Instant::now();
+                let jpeg_data = jpeg_encode(mat, jpeg_quality)?;
+                let jpeg_size = jpeg_data.len();
+                total_payload += jpeg_size;
+                if verbose {
+                    let actual_rows = mat.rows();
+                    let actual_cols = mat.cols();
+                    let channels = mat.channels();
+                    log!(logfile,
+                        "[verbose] cam{}: mat={}x{}x{} jpeg={}KB ({:.1}ms)",
+                        cam_id, actual_cols, actual_rows, channels,
+                        jpeg_size / 1024, t0.elapsed().as_secs_f64() * 1000.0,
+                    );
+                }
+                frames.push(Frame {
+                    camera_id: *cam_id as u8,
+                    width: *w as u16,
+                    height: *h as u16,
+                    jpeg_data,
+                });
+            }
+            let encode_elapsed = encode_start.elapsed();
+
+            let send_start = Instant::now();
+            protocol::send_to_sink(
+                &mut sink,
+                &ClientMessage::FrameSet {
+                    timestamp_us,
+                    frames,
+                },
+            )
+            .await?;
+
+            if verbose {
+                log!(logfile,
+                    "[verbose] frameset: sync={:.1}ms encode={:.1}ms send={:.1}ms payload={}KB ts={}",
+                    sync_elapsed.as_secs_f64() * 1000.0,
+                    encode_elapsed.as_secs_f64() * 1000.0,
+                    send_start.elapsed().as_secs_f64() * 1000.0,
+                    total_payload / 1024,
+                    timestamp_us,
+                );
+            }
+
+            fps_counter += 1;
+            if fps_timer.elapsed() >= Duration::from_secs(1) {
+                log!(logfile, "[fps] {fps_counter}");
+                fps_counter = 0;
+                fps_timer = Instant::now();
+            }
         }
+    }.await;
 
-        // Collect frames from all cameras
-        let raw_frames = match collect_frames(cameras, frame_timeout) {
-            Some(f) => f,
-            None => continue,
-        };
-
-        let timestamp_us = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as u64;
-
-        // JPEG encode
-        let mut frames = Vec::with_capacity(raw_frames.len());
-        for (cam_id, w, h, mat) in &raw_frames {
-            let jpeg_data = jpeg_encode(mat, jpeg_quality)?;
-            frames.push(Frame {
-                camera_id: *cam_id as u8,
-                width: *w as u16,
-                height: *h as u16,
-                jpeg_data,
-            });
-        }
-
-        protocol::send_message(
-            stream,
-            &ClientMessage::FrameSet {
-                timestamp_us,
-                frames,
-            },
-        )
-        .await?;
-
-        fps_counter += 1;
-        if fps_timer.elapsed() >= Duration::from_secs(1) {
-            eprintln!("[fps] {fps_counter}");
-            fps_counter = 0;
-            fps_timer = Instant::now();
-        }
-    }
+    reader_task.abort();
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -264,16 +371,18 @@ async fn main() -> Result<()> {
     let config_str =
         std::fs::read_to_string("camera_server.toml").context("failed to read camera_server.toml")?;
     let config: Config = toml::from_str(&config_str)?;
-    eprintln!(
-        "[config] server_addr={}, jpeg_quality={}",
-        config.server_addr, config.jpeg_quality
+    let logfile = open_log_file()?;
+    log!(logfile, "Camera Server ({})", env!("GIT_VERSION"));
+    log!(logfile,
+        "[config] server_addr={}, jpeg_quality={}, verbose={}",
+        config.server_addr, config.jpeg_quality, config.verbose
     );
 
     // Load calibration
     let calib_str = std::fs::read_to_string(&config.calibration_file)
         .with_context(|| format!("failed to read {}", config.calibration_file))?;
     let calibration: CalibrationData = serde_json::from_str(&calib_str)?;
-    eprintln!("[calibration] loaded {} cameras", calibration.cameras.len());
+    log!(logfile, "[calibration] loaded {} cameras", calibration.cameras.len());
 
     // Running flag for camera threads
     let running = Arc::new(AtomicBool::new(true));
@@ -310,28 +419,30 @@ async fn main() -> Result<()> {
 
     // Main loop: connect, stream, reconnect on error
     loop {
-        eprintln!("[tcp] connecting to {}...", config.server_addr);
+        log!(logfile, "[tcp] connecting to {}...", config.server_addr);
         match tokio::net::TcpStream::connect(&config.server_addr).await {
             Ok(tcp) => {
-                eprintln!("[tcp] connected");
-                let mut stream = protocol::message_stream(tcp);
+                log!(logfile, "[tcp] connected");
+                let stream = protocol::message_stream(tcp);
                 if let Err(e) = run_session(
-                    &mut stream,
+                    stream,
                     &calibration,
                     &cameras,
                     config.jpeg_quality,
                     &trigger_calibration,
+                    config.verbose,
+                    &logfile,
                 )
                 .await
                 {
-                    eprintln!("[tcp] session error: {e:#}");
+                    log!(logfile, "[tcp] session error: {e:#}");
                 }
             }
             Err(e) => {
-                eprintln!("[tcp] connection failed: {e}");
+                log!(logfile, "[tcp] connection failed: {e}");
             }
         }
-        eprintln!("[tcp] reconnecting in 2s...");
+        log!(logfile, "[tcp] reconnecting in 2s...");
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }

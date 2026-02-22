@@ -64,11 +64,14 @@ pub struct Frame {
 pub enum ServerMessage {
     CameraCalibrationAck { ok: bool, error: Option<String> },
     Ready,
+    LogData { filename: String, data: Vec<u8> },
 }
 
 // --- TCP codec helpers ---
 
 pub type MessageStream = Framed<TcpStream, LengthDelimitedCodec>;
+pub type MessageSink = futures::stream::SplitSink<MessageStream, Bytes>;
+pub type MessageReader = futures::stream::SplitStream<MessageStream>;
 
 /// Create a framed message stream with length-delimited framing.
 pub fn message_stream(stream: TcpStream) -> MessageStream {
@@ -93,6 +96,27 @@ pub async fn recv_message<T: DeserializeOwned>(
     stream: &mut MessageStream,
 ) -> anyhow::Result<T> {
     match stream.next().await {
+        Some(Ok(bytes)) => Ok(bincode::deserialize(&bytes)?),
+        Some(Err(e)) => Err(e.into()),
+        None => Err(anyhow::anyhow!("connection closed")),
+    }
+}
+
+/// Send via a split sink.
+pub async fn send_to_sink<T: Serialize>(
+    sink: &mut MessageSink,
+    msg: &T,
+) -> anyhow::Result<()> {
+    let data = bincode::serialize(msg)?;
+    sink.send(Bytes::from(data)).await?;
+    Ok(())
+}
+
+/// Receive from a split reader.
+pub async fn recv_from_reader<T: DeserializeOwned>(
+    reader: &mut MessageReader,
+) -> anyhow::Result<T> {
+    match reader.next().await {
         Some(Ok(bytes)) => Ok(bincode::deserialize(&bytes)?),
         Some(Err(e)) => Err(e.into()),
         None => Err(anyhow::anyhow!("connection closed")),
