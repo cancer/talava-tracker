@@ -618,6 +618,19 @@ fn triangulate_poses_multi(
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ModelType { MoveNet, SpinePose, RTMW3D }
 
+fn build_session(model_path: &str) -> Result<Session> {
+    let builder = Session::builder()?
+        .with_optimization_level(GraphOptimizationLevel::Level3)?;
+
+    #[cfg(feature = "cuda")]
+    let builder = {
+        eprintln!("[ort] Attempting CUDA execution provider...");
+        builder.with_execution_providers([ort::execution_providers::CUDAExecutionProvider::default().build()])?
+    };
+
+    builder.commit_from_file(model_path).context("Failed to load ONNX model")
+}
+
 struct PoseDetector {
     session: Session,
     model_type: ModelType,
@@ -625,10 +638,7 @@ struct PoseDetector {
 
 impl PoseDetector {
     fn new(model_path: &str, model_type: ModelType) -> Result<Self> {
-        let session = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .commit_from_file(model_path)
-            .context("Failed to load ONNX model")?;
+        let session = build_session(model_path)?;
         Ok(Self { session, model_type })
     }
 
@@ -955,6 +965,34 @@ fn remap_pose(pose: &Pose, crop: &CropRegion) -> Pose {
     Pose::new(keypoints)
 }
 
+/// Invalidate keypoints near image boundaries where model receptive field is clipped.
+fn sanitize_pose(pose: &Pose) -> Pose {
+    // Full boundary check (X and Y): limbs and shoulders
+    const FULL_BOUNDARY: &[usize] = &[
+        KP_LEFT_SHOULDER, KP_RIGHT_SHOULDER,
+        KP_LEFT_KNEE, KP_RIGHT_KNEE, KP_LEFT_ANKLE, KP_RIGHT_ANKLE,
+        KP_LEFT_BIG_TOE, KP_RIGHT_BIG_TOE, KP_LEFT_SMALL_TOE, KP_RIGHT_SMALL_TOE,
+        KP_LEFT_HEEL, KP_RIGHT_HEEL,
+    ];
+    // X-only boundary check: hips (Y direction allowed to be at edge for lower body)
+    const X_ONLY_BOUNDARY: &[usize] = &[KP_LEFT_HIP, KP_RIGHT_HIP];
+
+    let mut sanitized = pose.clone();
+    for &idx in FULL_BOUNDARY {
+        let kp = &mut sanitized.keypoints[idx];
+        if kp.x <= 0.02 || kp.x >= 0.98 || kp.y <= 0.02 || kp.y >= 0.98 {
+            kp.confidence = 0.0;
+        }
+    }
+    for &idx in X_ONLY_BOUNDARY {
+        let kp = &mut sanitized.keypoints[idx];
+        if kp.x <= 0.02 || kp.x >= 0.98 {
+            kp.confidence = 0.0;
+        }
+    }
+    sanitized
+}
+
 struct PersonDetector {
     session: Session,
     input_size: i32,
@@ -962,10 +1000,7 @@ struct PersonDetector {
 
 impl PersonDetector {
     fn new(model_path: &str, input_size: i32) -> Result<Self> {
-        let session = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .commit_from_file(model_path)
-            .context("Failed to load person detection model")?;
+        let session = build_session(model_path)?;
         Ok(Self { session, input_size })
     }
 
@@ -1700,6 +1735,7 @@ fn run_inference_loop(
     let mut cam_widths: Vec<u32> = Vec::new();
     let mut cam_heights: Vec<u32> = Vec::new();
     let mut num_cameras: usize = 0;
+    let mut cam_id_to_idx: std::collections::HashMap<u8, usize> = std::collections::HashMap::new();
 
     let mut body_tracker = BodyTracker::new(config.mirror_x, config.offset_y, config.foot_y_offset);
     let mut filters: [PoseFilter; TRACKER_COUNT] = make_filters(&config.filter);
@@ -1747,8 +1783,9 @@ fn run_inference_loop(
                     camera_params.clear();
                     cam_widths.clear();
                     cam_heights.clear();
+                    cam_id_to_idx.clear();
 
-                    for cam_cal in &cal.cameras {
+                    for (idx, cam_cal) in cal.cameras.iter().enumerate() {
                         let dc: [f64; 5] = [
                             cam_cal.dist_coeffs.get(0).copied().unwrap_or(0.0),
                             cam_cal.dist_coeffs.get(1).copied().unwrap_or(0.0),
@@ -1764,7 +1801,8 @@ fn run_inference_loop(
                         camera_params.push(cp);
                         cam_widths.push(cam_cal.width);
                         cam_heights.push(cam_cal.height);
-                        log!(logfile, "  Camera {}: {}x{}", cam_cal.camera_index, cam_cal.width, cam_cal.height);
+                        cam_id_to_idx.insert(cam_cal.camera_index as u8, idx);
+                        log!(logfile, "  Camera {} (idx {}): {}x{}", cam_cal.camera_index, idx, cam_cal.width, cam_cal.height);
                     }
 
                     num_cameras = cal.cameras.len();
@@ -1796,8 +1834,10 @@ fn run_inference_loop(
                 }
                 TcpEvent::FrameSet(frame_set) if calibrated => {
                     for decoded in &frame_set.frames {
-                        let cam_idx = decoded.camera_id as usize;
-                        if cam_idx >= num_cameras { continue; }
+                        let cam_idx = match cam_id_to_idx.get(&decoded.camera_id) {
+                            Some(&idx) => idx,
+                            None => continue,
+                        };
 
                         let width = decoded.width;
                         let height = decoded.height;
@@ -1861,6 +1901,7 @@ fn run_inference_loop(
 
                         pose = unletterbox_pose(&pose, &letterbox);
                         if !crop_region.is_full() { pose = remap_pose(&pose, &crop_region); }
+                        pose = sanitize_pose(&pose);
 
                         prev_poses[cam_idx] = Some(pose.clone());
                         poses_2d[cam_idx] = Some(pose);

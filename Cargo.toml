@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 default-run = "tracker_bevy"
 
+[features]
+default = []
+cuda = ["ort/cuda"]
+
 [dependencies]
 rosc = "0.10"      # OSCプロトコル（VMT連携）
 anyhow = "1.0"     # エラーハンドリング
