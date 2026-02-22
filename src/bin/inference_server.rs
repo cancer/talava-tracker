@@ -1646,9 +1646,10 @@ fn open_log_file() -> Result<LogFile> {
 macro_rules! log {
     ($logfile:expr, $($arg:tt)*) => {{
         let msg = format!($($arg)*);
-        println!("{}", msg);
+        eprintln!("{}", msg);
         if let Ok(mut f) = $logfile.lock() {
             let _ = writeln!(f, "{}", msg);
+            let _ = f.flush();
         }
     }};
 }
