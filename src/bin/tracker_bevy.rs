@@ -192,10 +192,12 @@ fn main() -> Result<()> {
         )?;
         let (w, h) = cam.resolution();
         log!(logfile, "Camera {}: {}x{}", cam_cal.camera_index, w, h);
-        // 歪み係数は無効化: キャリブレーションの歪み係数が異常に大きい場合
-        // (k2=-100等)、undistort_point()が収束せずリプロジェクション比較が破綻する。
-        // 歪み補正なしでも内部/外部パラメータによる三角測量は機能する。
-        let dc: [f64; 5] = [0.0; 5];
+        let dc: [f64; 5] = {
+            let d = &cam_cal.dist_coeffs;
+            if d.len() >= 5 { [d[0], d[1], d[2], d[3], d[4]] } else { [0.0; 5] }
+        };
+        log!(logfile, "  dist=[k1={:.3}, k2={:.3}, p1={:.3}, p2={:.3}, k3={:.3}]",
+            dc[0], dc[1], dc[2], dc[3], dc[4]);
         params.push(CameraParams::from_calibration(
             &cam_cal.intrinsic_matrix,
             &dc,

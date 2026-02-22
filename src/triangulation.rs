@@ -8,6 +8,13 @@ use crate::pose::{Keypoint, KeypointIndex, Pose};
 /// 120px at z=1.4m, fx=1273 → ~13cm 3D精度（フィルタ後6-7cm）
 const MAX_REPROJ_ERROR: f32 = 120.0;
 
+/// undistort_point()の収束診断情報
+pub struct UndistortDiag {
+    pub iterations: u32,
+    pub residual: f32,
+    pub reason: &'static str,
+}
+
 /// カメラパラメータ（射影行列 P = K[R|t]）
 #[derive(Debug, Clone)]
 pub struct CameraParams {
@@ -225,9 +232,80 @@ impl CameraParams {
         true
     }
 
+    /// 歪んだピクセル座標を歪み補正して理想ピクセル座標に変換（診断情報付き）
+    pub fn undistort_point_diag(&self, u_dist: f32, v_dist: f32) -> (f32, f32, UndistortDiag) {
+        let fx = self.intrinsic[(0, 0)];
+        let fy = self.intrinsic[(1, 1)];
+        let cx = self.intrinsic[(0, 2)];
+        let cy = self.intrinsic[(1, 2)];
+        let [k1, k2, p1, p2, k3] = self.dist_coeffs;
+
+        if k1 == 0.0 && k2 == 0.0 && p1 == 0.0 && p2 == 0.0 && k3 == 0.0 {
+            return (u_dist, v_dist, UndistortDiag { iterations: 0, residual: 0.0, reason: "no_coeffs" });
+        }
+
+        let xd = (u_dist - cx) / fx;
+        let yd = (v_dist - cy) / fy;
+        let mut x = xd;
+        let mut y = yd;
+        let mut best_x = x;
+        let mut best_y = y;
+        let mut best_residual = f32::MAX;
+        let mut iters = 0u32;
+        let mut reason = "max_iter";
+
+        for i in 0..30 {
+            iters = i + 1;
+            let r2 = x * x + y * y;
+            let r4 = r2 * r2;
+            let r6 = r4 * r2;
+            let radial = 1.0 + k1 * r2 + k2 * r4 + k3 * r6;
+
+            if radial <= 0.0 {
+                reason = "radial<=0";
+                break;
+            }
+            if x.abs() > 2.0 || y.abs() > 2.0 {
+                reason = "diverged";
+                break;
+            }
+
+            let dr_dr2 = k1 + 2.0 * k2 * r2 + 3.0 * k3 * r4;
+            let fx_val = x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x) - xd;
+            let fy_val = y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y - yd;
+            let residual = fx_val * fx_val + fy_val * fy_val;
+            if residual < best_residual {
+                best_residual = residual;
+                best_x = x;
+                best_y = y;
+            }
+            if residual < 1e-12 {
+                reason = "converged";
+                break;
+            }
+
+            let j00 = radial + 2.0 * x * x * dr_dr2 + 2.0 * p1 * y + 6.0 * p2 * x;
+            let j01 = 2.0 * x * y * dr_dr2 + 2.0 * p1 * x + 2.0 * p2 * y;
+            let j10 = j01;
+            let j11 = radial + 2.0 * y * y * dr_dr2 + 6.0 * p1 * y + 2.0 * p2 * x;
+            let det = j00 * j11 - j01 * j10;
+            if det.abs() < 1e-10 {
+                reason = "singular";
+                break;
+            }
+            let dx = -(j11 * fx_val - j01 * fy_val) / det;
+            let dy = -(-j10 * fx_val + j00 * fy_val) / det;
+            x += dx;
+            y += dy;
+        }
+
+        (best_x * fx + cx, best_y * fy + cy, UndistortDiag { iterations: iters, residual: best_residual, reason })
+    }
+
     /// 歪んだピクセル座標を歪み補正して理想ピクセル座標に変換
-    /// Newton-Raphson法による歪み補正（大きな歪み係数でも収束）
-    pub fn undistort_point(&self, u_dist: f32, v_dist: f32) -> (f32, f32) {
+    /// Newton-Raphson法による歪み補正
+    /// 収束しない場合（歪みモデルが観測位置で破綻）はNoneを返す
+    pub fn undistort_point(&self, u_dist: f32, v_dist: f32) -> Option<(f32, f32)> {
         let fx = self.intrinsic[(0, 0)];
         let fy = self.intrinsic[(1, 1)];
         let cx = self.intrinsic[(0, 2)];
@@ -236,7 +314,7 @@ impl CameraParams {
 
         // 歪み係数がゼロなら補正不要
         if k1 == 0.0 && k2 == 0.0 && p1 == 0.0 && p2 == 0.0 && k3 == 0.0 {
-            return (u_dist, v_dist);
+            return Some((u_dist, v_dist));
         }
 
         // ピクセル→正規化カメラ座標（歪みあり = ターゲット）
@@ -244,9 +322,6 @@ impl CameraParams {
         let yd = (v_dist - cy) / fy;
 
         // Newton-Raphson: 順方向歪みモデル f(x,y) = target を解く
-        // f_x(x,y) = x*R + 2*p1*x*y + p2*(r2 + 2*x^2)
-        // f_y(x,y) = y*R + p1*(r2 + 2*y^2) + 2*p2*x*y
-        // R = 1 + k1*r2 + k2*r4 + k3*r6
         let mut x = xd;
         let mut y = yd;
         let mut best_x = x;
@@ -258,9 +333,14 @@ impl CameraParams {
             let r4 = r2 * r2;
             let r6 = r4 * r2;
             let radial = 1.0 + k1 * r2 + k2 * r4 + k3 * r6;
+
+            // 防御: radialが非正（歪みモデル破綻）or 発散 → 打ち切り
+            if radial <= 0.0 || x.abs() > 2.0 || y.abs() > 2.0 {
+                break;
+            }
+
             let dr_dr2 = k1 + 2.0 * k2 * r2 + 3.0 * k3 * r4;
 
-            // 順方向歪み適用
             let fx_val = x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x) - xd;
             let fy_val = y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y - yd;
 
@@ -271,20 +351,18 @@ impl CameraParams {
                 best_y = y;
             }
 
-            // 十分収束したら終了
             if residual < 1e-12 {
                 break;
             }
 
-            // ヤコビアン
             let j00 = radial + 2.0 * x * x * dr_dr2 + 2.0 * p1 * y + 6.0 * p2 * x;
             let j01 = 2.0 * x * y * dr_dr2 + 2.0 * p1 * x + 2.0 * p2 * y;
-            let j10 = j01; // 対称
+            let j10 = j01;
             let j11 = radial + 2.0 * y * y * dr_dr2 + 6.0 * p1 * y + 2.0 * p2 * x;
 
             let det = j00 * j11 - j01 * j10;
             if det.abs() < 1e-10 {
-                break; // 特異ヤコビアン → best値を使用
+                break;
             }
 
             let dx = -(j11 * fx_val - j01 * fy_val) / det;
@@ -294,7 +372,12 @@ impl CameraParams {
             y += dy;
         }
 
-        (best_x * fx + cx, best_y * fy + cy)
+        // 収束判定: 残差が大きければ歪みモデルが観測位置で逆変換不能
+        if best_residual > 1e-6 {
+            return None;
+        }
+
+        Some((best_x * fx + cx, best_y * fy + cy))
     }
 }
 
@@ -491,6 +574,12 @@ pub fn triangulate_poses(
     // Pre-compute undistorted 2D observations: [kp_idx][cam_idx] = Some((u, v, conf))
     let mut observations: Vec<Vec<Option<(f32, f32, f32)>>> = Vec::with_capacity(KeypointIndex::COUNT);
     for kp_idx in 0..KeypointIndex::COUNT {
+        if verbose && kp_idx == KeypointIndex::LeftHip as usize {
+            let confs: Vec<String> = (0..n)
+                .map(|ci| format!("cam{}={:.2}", ci, poses_2d[ci].keypoints[kp_idx].confidence))
+                .collect();
+            eprintln!("L_Hip conf: [{}] thresh={:.2}", confs.join(", "), confidence_threshold);
+        }
         let mut cam_obs = Vec::with_capacity(n);
         for cam_idx in 0..n {
             let kp = &poses_2d[cam_idx].keypoints[kp_idx];
@@ -498,8 +587,20 @@ pub fn triangulate_poses(
                 let cam = cameras[cam_idx];
                 let u_dist = kp.x * cam.image_width;
                 let v_dist = kp.y * cam.image_height;
-                let (u, v) = cam.undistort_point(u_dist, v_dist);
-                cam_obs.push(Some((u, v, kp.confidence)));
+                let undist_result = if verbose && kp_idx == KeypointIndex::LeftHip as usize {
+                    let (u, v, diag) = cam.undistort_point_diag(u_dist, v_dist);
+                    let shift = ((u - u_dist).powi(2) + (v - v_dist).powi(2)).sqrt();
+                    eprintln!("undistort cam{}: ({:.1},{:.1}) -> ({:.1},{:.1}) shift={:.1}px iters={} res={:.2e} {}",
+                        cam_idx, u_dist, v_dist, u, v, shift, diag.iterations, diag.residual, diag.reason);
+                    if diag.residual > 1e-6 { None } else { Some((u, v)) }
+                } else {
+                    cam.undistort_point(u_dist, v_dist)
+                };
+                if let Some((u, v)) = undist_result {
+                    cam_obs.push(Some((u, v, kp.confidence)));
+                } else {
+                    cam_obs.push(None);
+                }
             } else {
                 cam_obs.push(None);
             }
@@ -1201,5 +1302,145 @@ mod tests {
         // 異なるアスペクト比 → false
         let mut cam_portrait = cam.clone();
         assert!(!cam_portrait.rescale_to(720, 1280));
+    }
+
+    /// undistort_pointの自己整合性テスト:
+    /// 既知のundistorted点 → forward distortion → undistort → 元に戻ることを確認
+    #[test]
+    fn test_undistort_self_consistency() {
+        // cam2の実パラメータ
+        let cam2 = CameraParams::from_calibration(
+            &[1850.2429622098766, 0.0, 934.0930788760338,
+              0.0, 1850.2429622098766, 739.8562994045762,
+              0.0, 0.0, 1.0],
+            &[-0.39992417354136867, 13.186446425053996,
+              0.003775300724089663, 0.0026782166512295457,
+              -146.2268800562624],
+            &[0.0, 0.0, 0.0], &[0.0, 0.0, 0.0], 1920, 1440,
+        );
+
+        // cam0の実パラメータ
+        let cam0 = CameraParams::from_calibration(
+            &[1679.9187810592534, 0.0, 969.069830884834,
+              0.0, 1679.9187810592534, 757.8433534772231,
+              0.0, 0.0, 1.0],
+            &[-0.888946246382631, 21.857890980938812,
+              0.022208264618406717, 0.0067931965772588315,
+              -110.49937416267605],
+            &[0.0, 0.0, 0.0], &[0.0, 0.0, 0.0], 1760, 1328,
+        );
+
+        // cam3の実パラメータ
+        let cam3 = CameraParams::from_calibration(
+            &[1446.842567940847, 0.0, 941.6566389289331,
+              0.0, 1446.842567940847, 540.9974048776236,
+              0.0, 0.0, 1.0],
+            &[-0.2407865820248437, 0.8556925072670779,
+              0.006731158239959777, 0.10231443330989601,
+              -0.43509920472643115],
+            &[0.0, 0.0, 0.0], &[0.0, 0.0, 0.0], 1920, 1080,
+        );
+
+        for (cam, name) in [(&cam0, "cam0"), (&cam2, "cam2"), (&cam3, "cam3")] {
+            let fx = cam.intrinsic[(0, 0)];
+            let fy = cam.intrinsic[(1, 1)];
+            let cx = cam.intrinsic[(0, 2)];
+            let cy = cam.intrinsic[(1, 2)];
+            let [k1, k2, p1, p2, k3] = cam.dist_coeffs;
+
+            // 複数のundistorted点をテスト（中心付近〜端付近）
+            let test_points_undist: Vec<(f32, f32)> = vec![
+                (cx, cy),             // 画像中心
+                (cx + 100.0, cy),     // 中心から右100px
+                (cx, cy + 200.0),     // 中心から下200px
+                (cx + 300.0, cy - 200.0), // 右上
+            ];
+
+            for (u_undist, v_undist) in &test_points_undist {
+                // undistorted → normalized
+                let x = (u_undist - cx) / fx;
+                let y = (v_undist - cy) / fy;
+                let r2 = x * x + y * y;
+                let r4 = r2 * r2;
+                let r6 = r4 * r2;
+                let radial = 1.0 + k1 * r2 + k2 * r4 + k3 * r6;
+
+                // forward distortion
+                let xd = x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x);
+                let yd = y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y;
+                let u_dist = xd * fx + cx;
+                let v_dist = yd * fy + cy;
+
+                // undistort
+                let (u_recovered, v_recovered, diag) = cam.undistort_point_diag(u_dist, v_dist);
+
+                let err = ((u_recovered - u_undist).powi(2) + (v_recovered - v_undist).powi(2)).sqrt();
+                eprintln!("{} undist({:.1},{:.1}) -> dist({:.1},{:.1}) -> recovered({:.1},{:.1}) err={:.3}px r={:.4} radial={:.4} iters={} res={:.2e} {}",
+                    name, u_undist, v_undist, u_dist, v_dist, u_recovered, v_recovered,
+                    err, r2.sqrt(), radial, diag.iterations, diag.residual, diag.reason);
+
+                assert!(err < 1.0,
+                    "{}: undistort round-trip error {:.3}px at ({:.1},{:.1}), radial={:.4}, diag: iters={} res={:.2e} {}",
+                    name, err, u_undist, v_undist, radial, diag.iterations, diag.residual, diag.reason);
+            }
+        }
+    }
+
+    /// 実際の観測点（distorted座標）をundistortした結果を検証
+    /// 前方model: undist → dist が一貫しているかを確認
+    #[test]
+    fn test_undistort_real_observations() {
+        let cam2 = CameraParams::from_calibration(
+            &[1850.2429622098766, 0.0, 934.0930788760338,
+              0.0, 1850.2429622098766, 739.8562994045762,
+              0.0, 0.0, 1.0],
+            &[-0.39992417354136867, 13.186446425053996,
+              0.003775300724089663, 0.0026782166512295457,
+              -146.2268800562624],
+            &[0.0, 0.0, 0.0], &[0.0, 0.0, 0.0], 1920, 1440,
+        );
+
+        let fx = cam2.intrinsic[(0, 0)];
+        let fy = cam2.intrinsic[(1, 1)];
+        let cx = cam2.intrinsic[(0, 2)];
+        let cy = cam2.intrinsic[(1, 2)];
+        let [k1, k2, p1, p2, k3] = cam2.dist_coeffs;
+
+        // 実行時ログの観測点（distorted座標）
+        let distorted_obs = [
+            (1573.3f32, 358.6f32, "hip_shift60"),
+            (1800.0, 411.3, "hip_shift111"),
+            (925.0, 500.0, "hip_shift1"),
+            (960.0, 813.3, "hip_shift0"),
+        ];
+
+        for (u_dist, v_dist, label) in &distorted_obs {
+            let xd = (u_dist - cx) / fx;
+            let yd = (v_dist - cy) / fy;
+            let r_dist = (xd * xd + yd * yd).sqrt();
+
+            let (u_undist, v_undist, diag) = cam2.undistort_point_diag(*u_dist, *v_dist);
+            let shift = ((u_undist - u_dist).powi(2) + (v_undist - v_dist).powi(2)).sqrt();
+
+            // undistortされた点でforward modelを適用して検証
+            let xu = (u_undist - cx) / fx;
+            let yu = (v_undist - cy) / fy;
+            let r2u = xu * xu + yu * yu;
+            let r4u = r2u * r2u;
+            let r6u = r4u * r2u;
+            let radial_at_undist = 1.0 + k1 * r2u + k2 * r4u + k3 * r6u;
+            let xd_verify = xu * radial_at_undist + 2.0 * p1 * xu * yu + p2 * (r2u + 2.0 * xu * xu);
+            let yd_verify = yu * radial_at_undist + p1 * (r2u + 2.0 * yu * yu) + 2.0 * p2 * xu * yu;
+            let u_verify = xd_verify * fx + cx;
+            let v_verify = yd_verify * fy + cy;
+
+            let verify_err = ((u_verify - u_dist).powi(2) + (v_verify - v_dist).powi(2)).sqrt();
+
+            eprintln!("{}: dist({:.1},{:.1}) r_dist={:.4} -> undist({:.1},{:.1}) shift={:.1}px",
+                label, u_dist, v_dist, r_dist, u_undist, v_undist, shift);
+            eprintln!("  verify: forward(undist) -> ({:.1},{:.1}) verify_err={:.1}px radial@undist={:.4}",
+                u_verify, v_verify, verify_err, radial_at_undist);
+            eprintln!("  diag: iters={} res={:.2e} {}", diag.iterations, diag.residual, diag.reason);
+        }
     }
 }
