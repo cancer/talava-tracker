@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use nalgebra::{Matrix3, Matrix3x4, Matrix4, Vector3, Vector4};
 use ndarray::Array4;
-use opencv::core::{AlgorithmHint, Mat, Rect, Scalar, Size, Vector, CV_32FC3};
+use opencv::core::{Mat, Rect, Scalar, Size, Vector, CV_32FC3};
 use opencv::prelude::*;
 use opencv::{imgcodecs, imgproc};
 use ort::session::builder::GraphOptimizationLevel;
@@ -817,7 +817,7 @@ fn unletterbox_pose(pose: &Pose, info: &LetterboxInfo) -> Pose {
 
 fn preprocess_for_movenet(frame: &Mat) -> Result<Array4<f32>> {
     let mut rgb = Mat::default();
-    imgproc::cvt_color(frame, &mut rgb, imgproc::COLOR_BGR2RGB, 0, AlgorithmHint::ALGO_HINT_DEFAULT)?;
+    imgproc::cvt_color_def(frame, &mut rgb, imgproc::COLOR_BGR2RGB)?;
     let mut resized = Mat::default();
     imgproc::resize(&rgb, &mut resized, Size::new(192, 192), 0.0, 0.0, imgproc::INTER_LINEAR)?;
     let mut float_mat = Mat::default();
@@ -849,7 +849,7 @@ fn preprocess_imagenet_nchw(frame: &Mat, width: i32, height: i32) -> Result<(Arr
     let pad_top = (height - new_h) / 2;
 
     let mut rgb = Mat::default();
-    imgproc::cvt_color(frame, &mut rgb, imgproc::COLOR_BGR2RGB, 0, AlgorithmHint::ALGO_HINT_DEFAULT)?;
+    imgproc::cvt_color_def(frame, &mut rgb, imgproc::COLOR_BGR2RGB)?;
     let mut resized = Mat::default();
     imgproc::resize(&rgb, &mut resized, Size::new(new_w, new_h), 0.0, 0.0, imgproc::INTER_LINEAR)?;
 
@@ -1052,7 +1052,7 @@ impl PersonDetector {
     fn preprocess(&self, frame: &Mat) -> Result<Array4<f32>> {
         let size = self.input_size;
         let mut rgb = Mat::default();
-        imgproc::cvt_color(frame, &mut rgb, imgproc::COLOR_BGR2RGB, 0, AlgorithmHint::ALGO_HINT_DEFAULT)?;
+        imgproc::cvt_color_def(frame, &mut rgb, imgproc::COLOR_BGR2RGB)?;
         let mut resized = Mat::default();
         imgproc::resize(&rgb, &mut resized, Size::new(size, size), 0.0, 0.0, imgproc::INTER_LINEAR)?;
         let mut float_mat = Mat::default();
