@@ -18,6 +18,11 @@ bevy = { version = "0.15", default-features = false }
 nalgebra = "0.33"  # 三角測量の線形代数
 signal-hook = "0.4.3"
 chrono = "0.4.43"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bincode = "1"
+bytes = "1"
+futures = "0.3"
 
 [[bin]]
 name = "bench_inference"
@@ -42,3 +47,11 @@ path = "src/bin/camera_probe.rs"
 [[bin]]
 name = "camera_view"
 path = "src/bin/camera_view.rs"
+
+[[bin]]
+name = "camera_server"
+path = "src/bin/camera_server.rs"
+
+[[bin]]
+name = "inference_server"
+path = "src/bin/inference_server.rs"
