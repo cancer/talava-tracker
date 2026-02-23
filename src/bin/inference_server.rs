@@ -1,30 +1,37 @@
 //! Inference server: receives JPEG frames over TCP, runs ONNX pose estimation,
 //! triangulates 3D poses, and sends tracker data via VMT/OSC.
-//!
-//! Self-contained: only imports from `talava_tracker::protocol`.
-//! All other functionality (pose detection, triangulation, tracking, VMT) is inline.
 
 use std::io::Write;
-use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use nalgebra::{Matrix3, Matrix3x4, Matrix4, Vector3, Vector4};
+use nalgebra::Vector4;
 use ndarray::Array4;
-use opencv::core::{Mat, Rect, Scalar, Size, Vector, CV_32FC3};
+use opencv::core::{Mat, Size, Vector, CV_32FC3};
 use opencv::prelude::*;
 use opencv::{imgcodecs, imgproc};
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;
-use rosc::{encoder, OscMessage, OscPacket, OscType};
 use serde::Deserialize;
 
+use talava_tracker::pose::{Keypoint, Pose};
+use talava_tracker::pose::preprocess::{
+    LetterboxInfo, preprocess_for_movenet, preprocess_for_spinepose, preprocess_for_rtmw3d,
+    unletterbox_pose,
+};
+use talava_tracker::pose::crop::{
+    BBox, CropRegion, bbox_from_keypoints, crop_for_pose, remap_pose,
+};
 use talava_tracker::protocol::{
     self, ClientMessage, ServerMessage,
 };
+use talava_tracker::triangulation::{
+    CameraParams, triangulate_point, reprojection_error,
+};
+use talava_tracker::vmt::{TrackerPose, VmtClient};
 
 // ===========================================================================
 // Config (reads inference_server.toml)
@@ -72,6 +79,8 @@ struct FilterConfig {
     #[serde(default = "default_rot_beta")]
     rotation_beta: f32,
     #[serde(default)]
+    lower_body_position_min_cutoff: Option<f32>,
+    #[serde(default)]
     lower_body_position_beta: Option<f32>,
 }
 
@@ -87,36 +96,40 @@ impl Default for FilterConfig {
             position_beta: default_pos_beta(),
             rotation_min_cutoff: default_rot_min_cutoff(),
             rotation_beta: default_rot_beta(),
+            lower_body_position_min_cutoff: None,
             lower_body_position_beta: None,
         }
     }
 }
 
 // ===========================================================================
-// Keypoint / Pose types (37 keypoints)
+// Keypoint indices (usize aliases for KeypointIndex enum values)
 // ===========================================================================
 
-const KP_COUNT: usize = 37;
+use talava_tracker::pose::keypoint::KeypointIndex;
 
-// Keypoint indices
-const KP_NOSE: usize = 0;
-const KP_LEFT_SHOULDER: usize = 5;
-const KP_RIGHT_SHOULDER: usize = 6;
-const KP_LEFT_HIP: usize = 11;
-const KP_RIGHT_HIP: usize = 12;
-const KP_LEFT_KNEE: usize = 13;
-const KP_RIGHT_KNEE: usize = 14;
-const KP_LEFT_ANKLE: usize = 15;
-const KP_RIGHT_ANKLE: usize = 16;
-const KP_HEAD: usize = 17;
-const KP_NECK: usize = 18;
-const KP_HIP: usize = 19;
-const KP_LEFT_BIG_TOE: usize = 20;
-const KP_RIGHT_BIG_TOE: usize = 21;
-const KP_LEFT_SMALL_TOE: usize = 22;
-const KP_RIGHT_SMALL_TOE: usize = 23;
-const KP_LEFT_HEEL: usize = 24;
-const KP_RIGHT_HEEL: usize = 25;
+#[allow(dead_code)]
+const KP_COUNT: usize = KeypointIndex::COUNT;
+
+#[allow(dead_code)]
+const KP_NOSE: usize = KeypointIndex::Nose as usize;
+const KP_LEFT_SHOULDER: usize = KeypointIndex::LeftShoulder as usize;
+const KP_RIGHT_SHOULDER: usize = KeypointIndex::RightShoulder as usize;
+const KP_LEFT_HIP: usize = KeypointIndex::LeftHip as usize;
+const KP_RIGHT_HIP: usize = KeypointIndex::RightHip as usize;
+const KP_LEFT_KNEE: usize = KeypointIndex::LeftKnee as usize;
+const KP_RIGHT_KNEE: usize = KeypointIndex::RightKnee as usize;
+const KP_LEFT_ANKLE: usize = KeypointIndex::LeftAnkle as usize;
+const KP_RIGHT_ANKLE: usize = KeypointIndex::RightAnkle as usize;
+const KP_HEAD: usize = KeypointIndex::Head as usize;
+const KP_NECK: usize = KeypointIndex::Neck as usize;
+const KP_HIP: usize = KeypointIndex::Hip as usize;
+const KP_LEFT_BIG_TOE: usize = KeypointIndex::LeftBigToe as usize;
+const KP_RIGHT_BIG_TOE: usize = KeypointIndex::RightBigToe as usize;
+const KP_LEFT_SMALL_TOE: usize = KeypointIndex::LeftSmallToe as usize;
+const KP_RIGHT_SMALL_TOE: usize = KeypointIndex::RightSmallToe as usize;
+const KP_LEFT_HEEL: usize = KeypointIndex::LeftHeel as usize;
+const KP_RIGHT_HEEL: usize = KeypointIndex::RightHeel as usize;
 
 const KP_NAMES: &[&str] = &[
     "Nose","LEye","REye","LEar","REar","LShoulder","RShoulder","LElbow","RElbow",
@@ -125,301 +138,13 @@ const KP_NAMES: &[&str] = &[
     "26","27","28","29","30","31","32","33","34","35","36",
 ];
 
-#[derive(Debug, Clone, Copy, Default)]
-struct Keypoint {
-    x: f32,
-    y: f32,
-    z: f32,
-    confidence: f32,
-}
-
-impl Keypoint {
-    fn new(x: f32, y: f32, confidence: f32) -> Self {
-        Self { x, y, z: 0.0, confidence }
-    }
-    fn new_3d(x: f32, y: f32, z: f32, confidence: f32) -> Self {
-        Self { x, y, z, confidence }
-    }
-    fn is_valid(&self, threshold: f32) -> bool {
-        self.confidence >= threshold
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Pose {
-    keypoints: [Keypoint; KP_COUNT],
-}
-
-impl Pose {
-    fn new(keypoints: [Keypoint; KP_COUNT]) -> Self {
-        Self { keypoints }
-    }
-    fn get(&self, idx: usize) -> &Keypoint {
-        &self.keypoints[idx]
-    }
-}
-
-impl Default for Pose {
-    fn default() -> Self {
-        Self { keypoints: [Keypoint::default(); KP_COUNT] }
-    }
-}
-
 // ===========================================================================
-// TrackerPose (position + rotation)
-// ===========================================================================
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct TrackerPose {
-    position: [f32; 3],
-    rotation: [f32; 4],
-}
-
-impl TrackerPose {
-    fn new(position: [f32; 3], rotation: [f32; 4]) -> Self {
-        Self { position, rotation }
-    }
-}
-
-// ===========================================================================
-// Camera parameters + Triangulation
+// Triangulation helpers (uses library CameraParams, triangulate_point, reprojection_error)
 // ===========================================================================
 
 const MAX_REPROJ_ERROR: f32 = 120.0;
 const MAX_HIP_Z_JUMP: f32 = 0.3;
-
-#[derive(Debug, Clone)]
-struct CameraParams {
-    projection: Matrix3x4<f32>,
-    image_width: f32,
-    image_height: f32,
-    intrinsic: Matrix3<f32>,
-    dist_coeffs: [f32; 5],
-}
-
-impl CameraParams {
-    fn from_calibration(
-        intrinsic: &[f64; 9],
-        dist_coeffs: &[f64; 5],
-        rvec: &[f64; 3],
-        tvec: &[f64; 3],
-        width: u32,
-        height: u32,
-    ) -> Self {
-        let k = Matrix3::new(
-            intrinsic[0] as f32, intrinsic[1] as f32, intrinsic[2] as f32,
-            intrinsic[3] as f32, intrinsic[4] as f32, intrinsic[5] as f32,
-            intrinsic[6] as f32, intrinsic[7] as f32, intrinsic[8] as f32,
-        );
-
-        // Rodrigues -> rotation matrix
-        let theta = (rvec[0] * rvec[0] + rvec[1] * rvec[1] + rvec[2] * rvec[2]).sqrt();
-        let r = if theta < 1e-10 {
-            Matrix3::<f32>::identity()
-        } else {
-            let kx = (rvec[0] / theta) as f32;
-            let ky = (rvec[1] / theta) as f32;
-            let kz = (rvec[2] / theta) as f32;
-            let ct = (theta as f32).cos();
-            let st = (theta as f32).sin();
-            let vt = 1.0 - ct;
-            Matrix3::new(
-                ct + kx * kx * vt,      kx * ky * vt - kz * st, kx * kz * vt + ky * st,
-                ky * kx * vt + kz * st, ct + ky * ky * vt,      ky * kz * vt - kx * st,
-                kz * kx * vt - ky * st, kz * ky * vt + kx * st, ct + kz * kz * vt,
-            )
-        };
-
-        let t = Vector3::new(tvec[0] as f32, tvec[1] as f32, tvec[2] as f32);
-
-        let mut rt = Matrix3x4::zeros();
-        for i in 0..3 {
-            for j in 0..3 {
-                rt[(i, j)] = r[(i, j)];
-            }
-            rt[(i, 3)] = t[i];
-        }
-
-        let projection = k * rt;
-        let dc: [f32; 5] = [
-            dist_coeffs[0] as f32, dist_coeffs[1] as f32,
-            dist_coeffs[2] as f32, dist_coeffs[3] as f32,
-            dist_coeffs[4] as f32,
-        ];
-
-        Self {
-            projection,
-            image_width: width as f32,
-            image_height: height as f32,
-            intrinsic: k,
-            dist_coeffs: dc,
-        }
-    }
-
-    fn rescale_to(&mut self, actual_width: u32, actual_height: u32) -> bool {
-        let cal_w = self.image_width;
-        let cal_h = self.image_height;
-        let act_w = actual_width as f32;
-        let act_h = actual_height as f32;
-
-        if (cal_w - act_w).abs() < 1.0 && (cal_h - act_h).abs() < 1.0 {
-            return true;
-        }
-
-        let cal_ratio = cal_w / cal_h;
-        let act_ratio = act_w / act_h;
-        if (cal_ratio - act_ratio).abs() / cal_ratio > 0.05 {
-            return false;
-        }
-
-        let sx = act_w / cal_w;
-        let sy = act_h / cal_h;
-
-        for j in 0..4 {
-            self.projection[(0, j)] *= sx;
-            self.projection[(1, j)] *= sy;
-        }
-
-        self.intrinsic[(0, 0)] *= sx;
-        self.intrinsic[(0, 2)] *= sx;
-        self.intrinsic[(1, 1)] *= sy;
-        self.intrinsic[(1, 2)] *= sy;
-
-        self.image_width = act_w;
-        self.image_height = act_h;
-        true
-    }
-
-    /// Newton-Raphson undistortion
-    fn undistort_point(&self, u_dist: f32, v_dist: f32) -> (f32, f32) {
-        let fx = self.intrinsic[(0, 0)];
-        let fy = self.intrinsic[(1, 1)];
-        let cx = self.intrinsic[(0, 2)];
-        let cy = self.intrinsic[(1, 2)];
-        let [k1, k2, p1, p2, k3] = self.dist_coeffs;
-
-        if k1 == 0.0 && k2 == 0.0 && p1 == 0.0 && p2 == 0.0 && k3 == 0.0 {
-            return (u_dist, v_dist);
-        }
-
-        let xd = (u_dist - cx) / fx;
-        let yd = (v_dist - cy) / fy;
-
-        let mut x = xd;
-        let mut y = yd;
-        let mut best_x = x;
-        let mut best_y = y;
-        let mut best_residual = f32::MAX;
-
-        for _ in 0..30 {
-            let r2 = x * x + y * y;
-            let r4 = r2 * r2;
-            let r6 = r4 * r2;
-            let radial = 1.0 + k1 * r2 + k2 * r4 + k3 * r6;
-            let dr_dr2 = k1 + 2.0 * k2 * r2 + 3.0 * k3 * r4;
-
-            let fx_val = x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x) - xd;
-            let fy_val = y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y - yd;
-
-            let residual = fx_val * fx_val + fy_val * fy_val;
-            if residual < best_residual {
-                best_residual = residual;
-                best_x = x;
-                best_y = y;
-            }
-
-            if residual < 1e-12 {
-                break;
-            }
-
-            let j00 = radial + 2.0 * x * x * dr_dr2 + 2.0 * p1 * y + 6.0 * p2 * x;
-            let j01 = 2.0 * x * y * dr_dr2 + 2.0 * p1 * x + 2.0 * p2 * y;
-            let j10 = j01;
-            let j11 = radial + 2.0 * y * y * dr_dr2 + 6.0 * p1 * y + 2.0 * p2 * x;
-
-            let det = j00 * j11 - j01 * j10;
-            if det.abs() < 1e-10 {
-                break;
-            }
-
-            let dx = -(j11 * fx_val - j01 * fy_val) / det;
-            let dy = -(-j10 * fx_val + j00 * fy_val) / det;
-
-            x += dx;
-            y += dy;
-        }
-
-        (best_x * fx + cx, best_y * fy + cy)
-    }
-}
-
-/// DLT triangulation of a single 3D point from N camera observations
-fn triangulate_point(cameras: &[&CameraParams], points_2d: &[(f32, f32)]) -> (f32, f32, f32) {
-    let n = cameras.len();
-    assert!(n >= 2);
-
-    let mut a = Matrix4::zeros();
-
-    for i in 0..n {
-        let p = &cameras[i].projection;
-        let (u, v) = points_2d[i];
-
-        let row1 = Vector4::new(
-            u * p[(2, 0)] - p[(0, 0)],
-            u * p[(2, 1)] - p[(0, 1)],
-            u * p[(2, 2)] - p[(0, 2)],
-            u * p[(2, 3)] - p[(0, 3)],
-        );
-        let row2 = Vector4::new(
-            v * p[(2, 0)] - p[(1, 0)],
-            v * p[(2, 1)] - p[(1, 1)],
-            v * p[(2, 2)] - p[(1, 2)],
-            v * p[(2, 3)] - p[(1, 3)],
-        );
-
-        a += row1 * row1.transpose();
-        a += row2 * row2.transpose();
-    }
-
-    let eigen = a.symmetric_eigen();
-    let mut min_idx = 0;
-    let mut min_val = eigen.eigenvalues[0].abs();
-    for i in 1..4 {
-        let v = eigen.eigenvalues[i].abs();
-        if v < min_val {
-            min_val = v;
-            min_idx = i;
-        }
-    }
-
-    let x = eigen.eigenvectors.column(min_idx);
-    let w = x[3];
-    if w.abs() < 1e-10 {
-        return (0.0, 0.0, 0.0);
-    }
-
-    (x[0] / w, x[1] / w, x[2] / w)
-}
-
-fn reprojection_error(
-    cameras: &[&CameraParams],
-    points_2d: &[(f32, f32)],
-    point_3d: &Vector4<f32>,
-) -> f32 {
-    let mut max_err = 0.0f32;
-    for i in 0..cameras.len() {
-        let projected = cameras[i].projection * point_3d;
-        if projected[2].abs() < 1e-6 {
-            return f32::MAX;
-        }
-        let u_proj = projected[0] / projected[2];
-        let v_proj = projected[1] / projected[2];
-        let (u_obs, v_obs) = points_2d[i];
-        let err = ((u_proj - u_obs).powi(2) + (v_proj - v_obs).powi(2)).sqrt();
-        max_err = max_err.max(err);
-    }
-    max_err
-}
+const MAX_HIP_Z_REJECT_STREAK: u32 = 5;
 
 fn find_hip_reference_pair(
     cameras: &[&CameraParams],
@@ -484,12 +209,40 @@ fn find_hip_reference_pair(
 }
 
 /// Triangulate 3D pose from N camera 2D observations
+/// Check hip z-jump and update state. Returns `true` if the frame should be rejected.
+fn check_hip_z_jump(
+    current_hip_z: Option<f32>,
+    prev_hip_z: &mut Option<f32>,
+    reject_count: &mut u32,
+) -> bool {
+    if let Some(cur_z) = current_hip_z {
+        if let Some(pz) = *prev_hip_z {
+            let z_jump = (cur_z - pz).abs();
+            if z_jump > MAX_HIP_Z_JUMP {
+                *reject_count += 1;
+                if *reject_count >= MAX_HIP_Z_REJECT_STREAK {
+                    eprintln!("z-jump reject streak reached {}, resetting prev_hip_z to {:.3}", *reject_count, cur_z);
+                    *prev_hip_z = Some(cur_z);
+                    *reject_count = 0;
+                } else {
+                    return true; // reject
+                }
+            } else {
+                *reject_count = 0;
+            }
+        }
+        *prev_hip_z = Some(cur_z);
+    }
+    false
+}
+
 fn triangulate_poses_multi(
     cameras: &[&CameraParams],
     poses_2d: &[&Pose],
     confidence_threshold: f32,
     prev_hip_ref_pair: &mut Option<(usize, usize)>,
     prev_hip_z: &mut Option<f32>,
+    prev_hip_z_reject_count: &mut u32,
 ) -> Pose {
     assert_eq!(cameras.len(), poses_2d.len());
     let n = cameras.len();
@@ -608,14 +361,8 @@ fn triangulate_poses_multi(
         None
     };
 
-    if let Some(cur_z) = current_hip_z {
-        if let Some(pz) = *prev_hip_z {
-            let z_jump = (cur_z - pz).abs();
-            if z_jump > MAX_HIP_Z_JUMP {
-                return Pose::new([Keypoint::default(); KP_COUNT]);
-            }
-        }
-        *prev_hip_z = Some(cur_z);
+    if check_hip_z_jump(current_hip_z, prev_hip_z, prev_hip_z_reject_count) {
+        return Pose::new([Keypoint::default(); KP_COUNT]);
     }
 
     Pose::new(keypoints)
@@ -781,198 +528,6 @@ impl PoseDetector {
         }
         Ok(Pose::new(keypoints))
     }
-}
-
-// ===========================================================================
-// Preprocessing
-// ===========================================================================
-
-#[derive(Debug, Clone, Copy)]
-struct LetterboxInfo {
-    pad_left: f32,
-    pad_top: f32,
-    content_width: f32,
-    content_height: f32,
-}
-
-impl LetterboxInfo {
-    fn identity() -> Self {
-        Self { pad_left: 0.0, pad_top: 0.0, content_width: 1.0, content_height: 1.0 }
-    }
-}
-
-fn unletterbox_pose(pose: &Pose, info: &LetterboxInfo) -> Pose {
-    let mut keypoints = [Keypoint::default(); KP_COUNT];
-    for i in 0..KP_COUNT {
-        let kp = &pose.keypoints[i];
-        keypoints[i] = Keypoint {
-            x: (kp.x - info.pad_left) / info.content_width,
-            y: (kp.y - info.pad_top) / info.content_height,
-            z: kp.z,
-            confidence: kp.confidence,
-        };
-    }
-    Pose::new(keypoints)
-}
-
-fn preprocess_for_movenet(frame: &Mat) -> Result<Array4<f32>> {
-    let mut rgb = Mat::default();
-    imgproc::cvt_color_def(frame, &mut rgb, imgproc::COLOR_BGR2RGB)?;
-    let mut resized = Mat::default();
-    imgproc::resize(&rgb, &mut resized, Size::new(192, 192), 0.0, 0.0, imgproc::INTER_LINEAR)?;
-    let mut float_mat = Mat::default();
-    resized.convert_to(&mut float_mat, CV_32FC3, 1.0, 0.0)?;
-
-    let (h, w) = (192usize, 192usize);
-    let mut tensor = Array4::<f32>::zeros((1, h, w, 3));
-    let dst = tensor.as_slice_mut().unwrap();
-    let row_floats = w * 3;
-    let data = float_mat.data_bytes()?;
-    let step = float_mat.mat_step().get(0);
-    for y in 0..h {
-        let src = unsafe { std::slice::from_raw_parts(data.as_ptr().add(y * step) as *const f32, row_floats) };
-        dst[y * row_floats..(y + 1) * row_floats].copy_from_slice(src);
-    }
-    Ok(tensor)
-}
-
-fn preprocess_imagenet_nchw(frame: &Mat, width: i32, height: i32) -> Result<(Array4<f32>, LetterboxInfo)> {
-    let frame_w = frame.cols() as f32;
-    let frame_h = frame.rows() as f32;
-    let target_w = width as f32;
-    let target_h = height as f32;
-
-    let scale = (target_w / frame_w).min(target_h / frame_h);
-    let new_w = (frame_w * scale).round() as i32;
-    let new_h = (frame_h * scale).round() as i32;
-    let pad_left = (width - new_w) / 2;
-    let pad_top = (height - new_h) / 2;
-
-    let mut rgb = Mat::default();
-    imgproc::cvt_color_def(frame, &mut rgb, imgproc::COLOR_BGR2RGB)?;
-    let mut resized = Mat::default();
-    imgproc::resize(&rgb, &mut resized, Size::new(new_w, new_h), 0.0, 0.0, imgproc::INTER_LINEAR)?;
-
-    let mean_rgb = Scalar::new(123.675, 116.28, 103.53, 0.0);
-    let mut padded = Mat::default();
-    opencv::core::copy_make_border(
-        &resized, &mut padded,
-        pad_top, height - new_h - pad_top,
-        pad_left, width - new_w - pad_left,
-        opencv::core::BORDER_CONSTANT, mean_rgb,
-    )?;
-
-    let mut float_mat = Mat::default();
-    padded.convert_to(&mut float_mat, CV_32FC3, 1.0, 0.0)?;
-
-    let (h, w) = (height as usize, width as usize);
-    let mean = [123.675f32, 116.28, 103.53];
-    let inv_std = [1.0 / 58.395f32, 1.0 / 57.12, 1.0 / 57.375];
-    let mut tensor = Array4::<f32>::zeros((1, 3, h, w));
-    let dst = tensor.as_slice_mut().unwrap();
-    let ch_stride = h * w;
-    let data = float_mat.data_bytes()?;
-    let step = float_mat.mat_step().get(0);
-    for y_idx in 0..h {
-        let row_ptr = unsafe {
-            std::slice::from_raw_parts(data.as_ptr().add(y_idx * step) as *const f32, w * 3)
-        };
-        let row_offset = y_idx * w;
-        for x_idx in 0..w {
-            let src_base = x_idx * 3;
-            let dst_base = row_offset + x_idx;
-            dst[dst_base] = (row_ptr[src_base] - mean[0]) * inv_std[0];
-            dst[ch_stride + dst_base] = (row_ptr[src_base + 1] - mean[1]) * inv_std[1];
-            dst[2 * ch_stride + dst_base] = (row_ptr[src_base + 2] - mean[2]) * inv_std[2];
-        }
-    }
-
-    let letterbox = LetterboxInfo {
-        pad_left: pad_left as f32 / target_w,
-        pad_top: pad_top as f32 / target_h,
-        content_width: new_w as f32 / target_w,
-        content_height: new_h as f32 / target_h,
-    };
-
-    Ok((tensor, letterbox))
-}
-
-fn preprocess_for_spinepose(frame: &Mat) -> Result<(Array4<f32>, LetterboxInfo)> {
-    preprocess_imagenet_nchw(frame, 192, 256)
-}
-
-fn preprocess_for_rtmw3d(frame: &Mat) -> Result<(Array4<f32>, LetterboxInfo)> {
-    preprocess_imagenet_nchw(frame, 288, 384)
-}
-
-// ===========================================================================
-// Person detection + Crop
-// ===========================================================================
-
-#[derive(Debug, Clone, Copy)]
-struct BBox { x: f32, y: f32, width: f32, height: f32 }
-
-#[derive(Debug, Clone, Copy)]
-struct CropRegion { x: f32, y: f32, width: f32, height: f32 }
-
-impl CropRegion {
-    fn full() -> Self { Self { x: 0.0, y: 0.0, width: 1.0, height: 1.0 } }
-    fn is_full(&self) -> bool { self.width >= 1.0 && self.height >= 1.0 }
-}
-
-fn bbox_from_keypoints(pose: &Pose, frame_w: u32, frame_h: u32, conf_thresh: f32) -> Option<BBox> {
-    let mut min_x = f32::MAX; let mut min_y = f32::MAX;
-    let mut max_x = f32::MIN; let mut max_y = f32::MIN;
-    let mut count = 0u32;
-    for kp in &pose.keypoints {
-        if kp.confidence >= conf_thresh {
-            let px = kp.x * frame_w as f32;
-            let py = kp.y * frame_h as f32;
-            min_x = min_x.min(px); min_y = min_y.min(py);
-            max_x = max_x.max(px); max_y = max_y.max(py);
-            count += 1;
-        }
-    }
-    if count < 2 { return None; }
-    Some(BBox { x: min_x, y: min_y, width: max_x - min_x, height: max_y - min_y })
-}
-
-fn crop_for_pose(frame: &Mat, bbox: &BBox, frame_w: u32, frame_h: u32) -> Result<(Mat, CropRegion)> {
-    let expand = 1.25;
-    let cx = bbox.x + bbox.width / 2.0;
-    let cy = bbox.y + bbox.height / 2.0;
-    let mut w = bbox.width * expand;
-    let mut h = bbox.height * expand;
-    let target_ratio = 4.0 / 3.0;
-    let current_ratio = h / w;
-    if current_ratio < target_ratio { h = w * target_ratio; }
-    else { w = h / target_ratio; }
-
-    let mut x = cx - w / 2.0;
-    let mut y = cy - h / 2.0;
-    let fw = frame_w as f32;
-    let fh = frame_h as f32;
-    x = x.max(0.0); y = y.max(0.0);
-    w = w.min(fw - x); h = h.min(fh - y);
-
-    let roi = Rect::new(x as i32, y as i32, (w as i32).max(1), (h as i32).max(1));
-    let cropped = Mat::roi(frame, roi)?;
-    let crop_region = CropRegion { x: x / fw, y: y / fh, width: w / fw, height: h / fh };
-    Ok((cropped.try_clone()?, crop_region))
-}
-
-fn remap_pose(pose: &Pose, crop: &CropRegion) -> Pose {
-    let mut keypoints = [Keypoint::default(); KP_COUNT];
-    for i in 0..KP_COUNT {
-        let kp = &pose.keypoints[i];
-        keypoints[i] = Keypoint {
-            x: crop.x + kp.x * crop.width,
-            y: crop.y + kp.y * crop.height,
-            z: kp.z,
-            confidence: kp.confidence,
-        };
-    }
-    Pose::new(keypoints)
 }
 
 /// Invalidate keypoints near image boundaries where model receptive field is clipped.
@@ -1147,8 +702,9 @@ impl PoseFilter {
     }
 
     fn from_config_lower_body(config: &FilterConfig) -> Self {
+        let min_cutoff = config.lower_body_position_min_cutoff.unwrap_or(config.position_min_cutoff);
         let beta = config.lower_body_position_beta.unwrap_or(config.position_beta);
-        Self::new(config.position_min_cutoff, beta, config.rotation_min_cutoff, config.rotation_beta)
+        Self::new(min_cutoff, beta, config.rotation_min_cutoff, config.rotation_beta)
     }
 
     fn apply(&mut self, pose: TrackerPose) -> TrackerPose {
@@ -1274,17 +830,17 @@ impl Lerper {
 // ===========================================================================
 
 const CONFIDENCE_THRESHOLD: f32 = 0.3;
+const BODY_CONFIDENCE_THRESHOLD: f32 = 0.2;
 
 struct BodyCalibration {
     hip_x: f32, hip_y: f32,
-    shoulder_y: f32,
-    torso_height: f32,
     hip_z: f32,
     yaw_shoulder: f32,
     yaw_left_foot: f32, yaw_right_foot: f32,
     left_knee_offset: Option<(f32, f32)>,
     right_knee_offset: Option<(f32, f32)>,
     yaw_left_knee: f32, yaw_right_knee: f32,
+    pitch_left_knee: f32, pitch_right_knee: f32,
     tilt_angle: f32,
 }
 
@@ -1312,20 +868,20 @@ impl BodyTracker {
     fn is_calibrated(&self) -> bool { self.calibration.is_some() }
 
     fn compute_tilt_angle(pose: &Pose) -> f32 {
-        let lh = pose.get(KP_LEFT_HIP);
-        let rh = pose.get(KP_RIGHT_HIP);
-        if !lh.is_valid(0.2) || !rh.is_valid(0.2) { return 0.0; }
+        let lh = pose.get_by_index(KP_LEFT_HIP);
+        let rh = pose.get_by_index(KP_RIGHT_HIP);
+        if !lh.is_valid(BODY_CONFIDENCE_THRESHOLD) || !rh.is_valid(BODY_CONFIDENCE_THRESHOLD) { return 0.0; }
         let hip_y = (lh.y + rh.y) / 2.0;
         let hip_z = (lh.z + rh.z) / 2.0;
 
-        let la = pose.get(KP_LEFT_ANKLE);
-        let ra = pose.get(KP_RIGHT_ANKLE);
-        let lk = pose.get(KP_LEFT_KNEE);
-        let rk = pose.get(KP_RIGHT_KNEE);
+        let la = pose.get_by_index(KP_LEFT_ANKLE);
+        let ra = pose.get_by_index(KP_RIGHT_ANKLE);
+        let lk = pose.get_by_index(KP_LEFT_KNEE);
+        let rk = pose.get_by_index(KP_RIGHT_KNEE);
 
-        let (lower_y, lower_z) = if la.is_valid(0.2) && ra.is_valid(0.2) {
+        let (lower_y, lower_z) = if la.is_valid(BODY_CONFIDENCE_THRESHOLD) && ra.is_valid(BODY_CONFIDENCE_THRESHOLD) {
             ((la.y + ra.y) / 2.0, (la.z + ra.z) / 2.0)
-        } else if lk.is_valid(0.2) && rk.is_valid(0.2) {
+        } else if lk.is_valid(BODY_CONFIDENCE_THRESHOLD) && rk.is_valid(BODY_CONFIDENCE_THRESHOLD) {
             ((lk.y + rk.y) / 2.0, (lk.z + rk.z) / 2.0)
         } else { return 0.0; };
 
@@ -1334,9 +890,9 @@ impl BodyTracker {
 
     fn rotate_pose_yz(pose: &Pose, tilt: f32) -> Pose {
         let (sin_t, cos_t) = tilt.sin_cos();
-        let lh = pose.get(KP_LEFT_HIP);
-        let rh = pose.get(KP_RIGHT_HIP);
-        let ref_z = if lh.is_valid(0.2) && rh.is_valid(0.2) {
+        let lh = pose.get_by_index(KP_LEFT_HIP);
+        let rh = pose.get_by_index(KP_RIGHT_HIP);
+        let ref_z = if lh.is_valid(BODY_CONFIDENCE_THRESHOLD) && rh.is_valid(BODY_CONFIDENCE_THRESHOLD) {
             (lh.z + rh.z) / 2.0
         } else { 0.0 };
 
@@ -1355,38 +911,35 @@ impl BodyTracker {
         let rotated = Self::rotate_pose_yz(pose, tilt_angle);
         let pose = &rotated;
 
-        let lh = pose.get(KP_LEFT_HIP);
-        let rh = pose.get(KP_RIGHT_HIP);
-        if !lh.is_valid(0.2) || !rh.is_valid(0.2) { return false; }
+        let lh = pose.get_by_index(KP_LEFT_HIP);
+        let rh = pose.get_by_index(KP_RIGHT_HIP);
+        if !lh.is_valid(BODY_CONFIDENCE_THRESHOLD) || !rh.is_valid(BODY_CONFIDENCE_THRESHOLD) { return false; }
 
         let hip_x = (lh.x + rh.x) / 2.0;
         let hip_y = (lh.y + rh.y) / 2.0;
         let hip_z = (lh.z + rh.z) / 2.0;
 
-        let ls = pose.get(KP_LEFT_SHOULDER);
-        let rs = pose.get(KP_RIGHT_SHOULDER);
-        let shoulder_y = if ls.is_valid(0.2) && rs.is_valid(0.2) {
-            (ls.y + rs.y) / 2.0
-        } else { 0.5 };
-
-        let torso_height = self.compute_torso_height(pose).unwrap_or(0.0);
         let yaw_shoulder = self.compute_shoulder_yaw(pose);
         let yaw_left_foot = self.compute_foot_yaw(pose, KP_LEFT_KNEE, KP_LEFT_ANKLE);
         let yaw_right_foot = self.compute_foot_yaw(pose, KP_RIGHT_KNEE, KP_RIGHT_ANKLE);
 
-        let lk = pose.get(KP_LEFT_KNEE);
-        let left_knee_offset = if lk.is_valid(0.2) { Some((lk.x - hip_x, lk.y - hip_y)) } else { None };
-        let rk = pose.get(KP_RIGHT_KNEE);
-        let right_knee_offset = if rk.is_valid(0.2) { Some((rk.x - hip_x, rk.y - hip_y)) } else { None };
+        let lk = pose.get_by_index(KP_LEFT_KNEE);
+        let left_knee_offset = if lk.is_valid(BODY_CONFIDENCE_THRESHOLD) { Some((lk.x - hip_x, lk.y - hip_y)) } else { None };
+        let rk = pose.get_by_index(KP_RIGHT_KNEE);
+        let right_knee_offset = if rk.is_valid(BODY_CONFIDENCE_THRESHOLD) { Some((rk.x - hip_x, rk.y - hip_y)) } else { None };
 
         let yaw_left_knee = self.compute_knee_yaw(pose, KP_LEFT_HIP, KP_LEFT_KNEE);
         let yaw_right_knee = self.compute_knee_yaw(pose, KP_RIGHT_HIP, KP_RIGHT_KNEE);
+        let pitch_left_knee = self.compute_knee_pitch(pose, KP_LEFT_HIP, KP_LEFT_KNEE);
+        let pitch_right_knee = self.compute_knee_pitch(pose, KP_RIGHT_HIP, KP_RIGHT_KNEE);
 
         self.calibration = Some(BodyCalibration {
-            hip_x, hip_y, shoulder_y, torso_height, hip_z,
+            hip_x, hip_y, hip_z,
             yaw_shoulder, yaw_left_foot, yaw_right_foot,
             left_knee_offset, right_knee_offset,
-            yaw_left_knee, yaw_right_knee, tilt_angle,
+            yaw_left_knee, yaw_right_knee,
+            pitch_left_knee, pitch_right_knee,
+            tilt_angle,
         });
         true
     }
@@ -1399,9 +952,9 @@ impl BodyTracker {
             &rotated
         } else { pose };
 
-        let lh = pose.get(KP_LEFT_HIP);
-        let rh = pose.get(KP_RIGHT_HIP);
-        let hip_center = if lh.is_valid(0.2) && rh.is_valid(0.2) {
+        let lh = pose.get_by_index(KP_LEFT_HIP);
+        let rh = pose.get_by_index(KP_RIGHT_HIP);
+        let hip_center = if lh.is_valid(BODY_CONFIDENCE_THRESHOLD) && rh.is_valid(BODY_CONFIDENCE_THRESHOLD) {
             Some(((lh.x + rh.x) / 2.0, (lh.y + rh.y) / 2.0))
         } else { None };
 
@@ -1443,23 +996,10 @@ impl BodyTracker {
         [pos_x, pos_y, pos_z]
     }
 
-    fn compute_torso_height(&self, pose: &Pose) -> Option<f32> {
-        let ls = pose.get(KP_LEFT_SHOULDER);
-        let rs = pose.get(KP_RIGHT_SHOULDER);
-        let lh = pose.get(KP_LEFT_HIP);
-        let rh = pose.get(KP_RIGHT_HIP);
-        if !ls.is_valid(0.2) || !rs.is_valid(0.2) || !lh.is_valid(0.2) || !rh.is_valid(0.2) {
-            return None;
-        }
-        let shoulder_y = (ls.y + rs.y) / 2.0;
-        let hip_y = (lh.y + rh.y) / 2.0;
-        Some((hip_y - shoulder_y).abs())
-    }
-
     fn estimate_depth(&self, pose: &Pose) -> f32 {
-        let lh = pose.get(KP_LEFT_HIP);
-        let rh = pose.get(KP_RIGHT_HIP);
-        if lh.is_valid(0.2) && rh.is_valid(0.2) && (lh.z.abs() > 0.001 || rh.z.abs() > 0.001) {
+        let lh = pose.get_by_index(KP_LEFT_HIP);
+        let rh = pose.get_by_index(KP_RIGHT_HIP);
+        if lh.is_valid(BODY_CONFIDENCE_THRESHOLD) && rh.is_valid(BODY_CONFIDENCE_THRESHOLD) && (lh.z.abs() > 0.001 || rh.z.abs() > 0.001) {
             let hip_z = (lh.z + rh.z) / 2.0;
             let ref_z = self.calibration.as_ref().map_or(0.0, |c| c.hip_z);
             return ref_z - hip_z;
@@ -1468,17 +1008,17 @@ impl BodyTracker {
     }
 
     fn keypoint_depth(&self, pose: &Pose, kp_idx: usize, fallback: f32) -> f32 {
-        let kp = pose.get(kp_idx);
-        if kp.is_valid(0.2) && kp.z.abs() > 0.001 {
+        let kp = pose.get_by_index(kp_idx);
+        if kp.is_valid(BODY_CONFIDENCE_THRESHOLD) && kp.z.abs() > 0.001 {
             let ref_z = self.calibration.as_ref().map_or(0.0, |c| c.hip_z);
             ref_z - kp.z
         } else { fallback }
     }
 
     fn compute_shoulder_yaw(&self, pose: &Pose) -> f32 {
-        let ls = pose.get(KP_LEFT_SHOULDER);
-        let rs = pose.get(KP_RIGHT_SHOULDER);
-        if ls.is_valid(0.2) && rs.is_valid(0.2) {
+        let ls = pose.get_by_index(KP_LEFT_SHOULDER);
+        let rs = pose.get_by_index(KP_RIGHT_SHOULDER);
+        if ls.is_valid(BODY_CONFIDENCE_THRESHOLD) && rs.is_valid(BODY_CONFIDENCE_THRESHOLD) {
             let dx = if self.mirror_x { rs.x - ls.x } else { ls.x - rs.x };
             let dy = rs.y - ls.y;
             f32::atan2(dy, dx)
@@ -1486,9 +1026,9 @@ impl BodyTracker {
     }
 
     fn compute_foot_yaw(&self, pose: &Pose, knee_idx: usize, ankle_idx: usize) -> f32 {
-        let knee = pose.get(knee_idx);
-        let ankle = pose.get(ankle_idx);
-        if knee.is_valid(0.2) && ankle.is_valid(0.2) {
+        let knee = pose.get_by_index(knee_idx);
+        let ankle = pose.get_by_index(ankle_idx);
+        if knee.is_valid(BODY_CONFIDENCE_THRESHOLD) && ankle.is_valid(BODY_CONFIDENCE_THRESHOLD) {
             let raw_dx = ankle.x - knee.x;
             let dx = if self.mirror_x { raw_dx } else { -raw_dx };
             let dy = ankle.y - knee.y;
@@ -1497,13 +1037,23 @@ impl BodyTracker {
     }
 
     fn compute_knee_yaw(&self, pose: &Pose, hip_idx: usize, knee_idx: usize) -> f32 {
-        let hip = pose.get(hip_idx);
-        let knee = pose.get(knee_idx);
-        if hip.is_valid(0.2) && knee.is_valid(0.2) {
+        let hip = pose.get_by_index(hip_idx);
+        let knee = pose.get_by_index(knee_idx);
+        if hip.is_valid(BODY_CONFIDENCE_THRESHOLD) && knee.is_valid(BODY_CONFIDENCE_THRESHOLD) {
             let raw_dx = knee.x - hip.x;
             let dx = if self.mirror_x { raw_dx } else { -raw_dx };
             let dy = knee.y - hip.y;
             f32::atan2(dx, dy)
+        } else { 0.0 }
+    }
+
+    fn compute_knee_pitch(&self, pose: &Pose, hip_idx: usize, knee_idx: usize) -> f32 {
+        let hip = pose.get_by_index(hip_idx);
+        let knee = pose.get_by_index(knee_idx);
+        if hip.is_valid(BODY_CONFIDENCE_THRESHOLD) && knee.is_valid(BODY_CONFIDENCE_THRESHOLD) {
+            let dz = knee.z - hip.z;
+            let dy = knee.y - hip.y;
+            f32::atan2(dz, dy)
         } else { 0.0 }
     }
 
@@ -1538,10 +1088,10 @@ impl BodyTracker {
         knee_idx: usize, ankle_idx: usize, is_left: bool,
     ) -> Option<TrackerPose> {
         let (hip_x, hip_y) = hip_center?;
-        let knee = pose.get(knee_idx);
-        let ankle = pose.get(ankle_idx);
-        let ankle_valid = ankle.is_valid(0.2);
-        let knee_valid = knee.is_valid(0.2);
+        let knee = pose.get_by_index(knee_idx);
+        let ankle = pose.get_by_index(ankle_idx);
+        let ankle_valid = ankle.is_valid(BODY_CONFIDENCE_THRESHOLD);
+        let knee_valid = knee.is_valid(BODY_CONFIDENCE_THRESHOLD);
         let (ax, ay) = if ankle_valid { (ankle.x, ankle.y) }
             else if knee_valid { (knee.x, knee.y) }
             else { return None; };
@@ -1560,10 +1110,10 @@ impl BodyTracker {
 
     fn compute_chest(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32) -> Option<TrackerPose> {
         let (hip_x, hip_y) = hip_center?;
-        let ls = pose.get(KP_LEFT_SHOULDER);
-        let rs = pose.get(KP_RIGHT_SHOULDER);
-        let ls_valid = ls.is_valid(0.2);
-        let rs_valid = rs.is_valid(0.2);
+        let ls = pose.get_by_index(KP_LEFT_SHOULDER);
+        let rs = pose.get_by_index(KP_RIGHT_SHOULDER);
+        let ls_valid = ls.is_valid(BODY_CONFIDENCE_THRESHOLD);
+        let rs_valid = rs.is_valid(BODY_CONFIDENCE_THRESHOLD);
         if !ls_valid && !rs_valid { return None; }
 
         let shoulder_y = match (ls_valid, rs_valid) {
@@ -1585,9 +1135,9 @@ impl BodyTracker {
         hip_idx: usize, knee_idx: usize, is_left: bool,
     ) -> Option<TrackerPose> {
         let (hip_x, hip_y) = hip_center?;
-        let knee = pose.get(knee_idx);
+        let knee = pose.get_by_index(knee_idx);
 
-        let (kx, ky, has_keypoint) = if knee.is_valid(0.2) {
+        let (kx, ky, has_keypoint) = if knee.is_valid(BODY_CONFIDENCE_THRESHOLD) {
             (knee.x, knee.y, true)
         } else if let Some(cal) = &self.calibration {
             let offset = if is_left { cal.left_knee_offset } else { cal.right_knee_offset };
@@ -1596,45 +1146,19 @@ impl BodyTracker {
         } else { return None; };
 
         let position = self.convert_position(kx, ky, hip_x, hip_y, pos_z);
-        let yaw = if has_keypoint {
+        let (yaw, pitch) = if has_keypoint {
             let ref_yaw = self.calibration.as_ref().map_or(0.0, |c| {
                 if is_left { c.yaw_left_knee } else { c.yaw_right_knee }
             });
-            self.compute_knee_yaw(pose, hip_idx, knee_idx) - ref_yaw
-        } else { 0.0 };
-        Some(TrackerPose::new(position, Self::yaw_pitch_to_quaternion(yaw, 0.0)))
-    }
-}
-
-// ===========================================================================
-// VMT (OSC sending)
-// ===========================================================================
-
-struct VmtClient {
-    socket: UdpSocket,
-    target_addr: String,
-}
-
-impl VmtClient {
-    fn new(target_addr: &str) -> Result<Self> {
-        let socket = UdpSocket::bind("0.0.0.0:0")?;
-        Ok(Self { socket, target_addr: target_addr.to_string() })
-    }
-
-    fn send(&self, index: i32, enable: i32, pose: &TrackerPose) -> Result<()> {
-        let msg = OscMessage {
-            addr: "/VMT/Room/Unity".to_string(),
-            args: vec![
-                OscType::Int(index), OscType::Int(enable), OscType::Float(0.0),
-                OscType::Float(pose.position[0]), OscType::Float(pose.position[1]),
-                OscType::Float(pose.position[2]), OscType::Float(pose.rotation[0]),
-                OscType::Float(pose.rotation[1]), OscType::Float(pose.rotation[2]),
-                OscType::Float(pose.rotation[3]),
-            ],
-        };
-        let data = encoder::encode(&OscPacket::Message(msg))?;
-        self.socket.send_to(&data, &self.target_addr)?;
-        Ok(())
+            let ref_pitch = self.calibration.as_ref().map_or(0.0, |c| {
+                if is_left { c.pitch_left_knee } else { c.pitch_right_knee }
+            });
+            (
+                self.compute_knee_yaw(pose, hip_idx, knee_idx) - ref_yaw,
+                self.compute_knee_pitch(pose, hip_idx, knee_idx) - ref_pitch,
+            )
+        } else { (0.0, 0.0) };
+        Some(TrackerPose::new(position, Self::yaw_pitch_to_quaternion(yaw, pitch)))
     }
 }
 
@@ -1659,7 +1183,6 @@ macro_rules! log {
         eprintln!("{}", msg);
         if let Ok(mut f) = $logfile.lock() {
             let _ = writeln!(f, "{}", msg);
-            let _ = f.flush();
         }
     }};
 }
@@ -1672,12 +1195,12 @@ const TRACKER_COUNT: usize = 6;
 const TRACKER_INDICES: [i32; TRACKER_COUNT] = [0, 1, 2, 3, 4, 5];
 const TRIANGULATION_TIMEOUT_MS: f32 = 100.0;
 
-struct DecodedFrame { camera_id: u8, width: u32, height: u32, mat: Mat }
-struct DecodedFrameSet { #[allow(dead_code)] timestamp_us: u64, frames: Vec<DecodedFrame> }
+struct RawFrame { camera_id: u8, width: u32, height: u32, jpeg_data: Vec<u8> }
+struct RawFrameSet { #[allow(dead_code)] timestamp_us: u64, frames: Vec<RawFrame> }
 
 enum TcpEvent {
     CalibrationReceived(protocol::CalibrationData),
-    FrameSet(DecodedFrameSet),
+    FrameSet(RawFrameSet),
     TriggerPoseCalibration,
 }
 
@@ -1707,14 +1230,13 @@ async fn tcp_receive_loop(
                         protocol::send_to_sink(&mut sink, &ServerMessage::Ready).await?;
                     }
                     ClientMessage::FrameSet { timestamp_us, frames } => {
-                        let decoded: Vec<DecodedFrame> = frames.into_iter().filter_map(|f| {
-                            let buf = Vector::<u8>::from_iter(f.jpeg_data.into_iter());
-                            let mat = imgcodecs::imdecode(&buf, imgcodecs::IMREAD_COLOR).ok()?;
-                            if mat.empty() { return None; }
-                            Some(DecodedFrame { camera_id: f.camera_id, width: f.width as u32, height: f.height as u32, mat })
+                        let raw_frames: Vec<RawFrame> = frames.into_iter().map(|f| {
+                            RawFrame { camera_id: f.camera_id, width: f.width as u32, height: f.height as u32, jpeg_data: f.jpeg_data }
                         }).collect();
-                        if !decoded.is_empty() {
-                            let _ = tx.try_send(TcpEvent::FrameSet(DecodedFrameSet { timestamp_us, frames: decoded }));
+                        if !raw_frames.is_empty() {
+                            if tx.try_send(TcpEvent::FrameSet(RawFrameSet { timestamp_us, frames: raw_frames })).is_err() {
+                                eprintln!("[warn] frame dropped: channel full");
+                            }
                         }
                     }
                     ClientMessage::TriggerPoseCalibration => {
@@ -1782,6 +1304,7 @@ fn run_inference_loop(
     // Triangulation state
     let mut prev_hip_ref_pair: Option<(usize, usize)> = None;
     let mut prev_hip_z: Option<f32> = None;
+    let mut prev_hip_z_reject_count: u32 = 0;
 
     // Calibration state
     let mut cal_deadline: Option<Instant> = None;
@@ -1794,6 +1317,10 @@ fn run_inference_loop(
     let mut fps_frame_count: u32 = 0;
     let mut fps_inference_count: u32 = 0;
     let mut fps_timer = Instant::now();
+    let mut fps_reject_velocity: u32 = 0;
+    let mut fps_reject_limb: u32 = 0;
+    let mut fps_reject_zjump: u32 = 0;
+    let mut fps_no_pose: u32 = 0;
 
     let mut pose_3d: Option<Pose> = None;
     let detector_mode = config.detector.clone();
@@ -1828,7 +1355,7 @@ fn run_inference_loop(
             }
         }
 
-        let event = match rx.recv_timeout(Duration::from_millis(16)) {
+        let event = match rx.recv_timeout(Duration::from_millis(1)) {
             Ok(ev) => Some(ev),
             Err(mpsc::RecvTimeoutError::Timeout) => None,
             Err(mpsc::RecvTimeoutError::Disconnected) => { log!(logfile, "TCP channel disconnected"); break; }
@@ -1895,25 +1422,32 @@ fn run_inference_loop(
                     pose_3d = None;
                     prev_hip_ref_pair = None;
                     prev_hip_z = None;
+                    prev_hip_z_reject_count = 0;
 
                     log!(logfile, "Ready for inference ({} cameras)", num_cameras);
                 }
                 TcpEvent::FrameSet(frame_set) if calibrated => {
-                    for decoded in &frame_set.frames {
-                        let cam_idx = match cam_id_to_idx.get(&decoded.camera_id) {
+                    for raw_frame in &frame_set.frames {
+                        let cam_idx = match cam_id_to_idx.get(&raw_frame.camera_id) {
                             Some(&idx) => idx,
                             None => {
-                                if verbose { log!(logfile, "[verbose] unknown camera_id={}, skipping", decoded.camera_id); }
+                                if verbose { log!(logfile, "[verbose] unknown camera_id={}, skipping", raw_frame.camera_id); }
                                 continue;
                             }
                         };
 
-                        let width = decoded.width;
-                        let height = decoded.height;
+                        let buf = Vector::<u8>::from_iter(raw_frame.jpeg_data.iter().copied());
+                        let mat = match imgcodecs::imdecode(&buf, imgcodecs::IMREAD_COLOR) {
+                            Ok(m) if !m.empty() => m,
+                            _ => continue,
+                        };
+
+                        let width = raw_frame.width;
+                        let height = raw_frame.height;
 
                         if verbose {
-                            let mat_rows = decoded.mat.rows();
-                            let mat_cols = decoded.mat.cols();
+                            let mat_rows = mat.rows();
+                            let mat_cols = mat.cols();
                             log!(logfile, "[verbose] cam{}: decoded={}x{} (expected {}x{})",
                                 cam_idx, mat_cols, mat_rows, width, height);
                         }
@@ -1934,29 +1468,29 @@ fn run_inference_loop(
                                 {
                                     Some(bbox) => {
                                         if verbose { log!(logfile, "[verbose] cam{}: keypoint crop x={} y={} w={} h={}", cam_idx, bbox.x, bbox.y, bbox.width, bbox.height); }
-                                        match crop_for_pose(&decoded.mat, &bbox, width, height) {
+                                        match crop_for_pose(&mat, &bbox, width, height) {
                                             Ok(v) => v,
-                                            Err(_) => (decoded.mat.clone(), CropRegion::full()),
+                                            Err(_) => (mat.clone(), CropRegion::full()),
                                         }
                                     }
                                     None => {
                                         if verbose { log!(logfile, "[verbose] cam{}: no keypoint bbox, full frame", cam_idx); }
-                                        (decoded.mat.clone(), CropRegion::full())
+                                        (mat.clone(), CropRegion::full())
                                     }
                                 }
                             }
                             "yolo" => {
                                 if let Some(ref mut pd) = person_detector {
-                                    match pd.detect(&decoded.mat) {
-                                        Ok(Some(bbox)) => match crop_for_pose(&decoded.mat, &bbox, width, height) {
+                                    match pd.detect(&mat) {
+                                        Ok(Some(bbox)) => match crop_for_pose(&mat, &bbox, width, height) {
                                             Ok(v) => v,
-                                            Err(_) => (decoded.mat.clone(), CropRegion::full()),
+                                            Err(_) => (mat.clone(), CropRegion::full()),
                                         },
-                                        _ => (decoded.mat.clone(), CropRegion::full()),
+                                        _ => (mat.clone(), CropRegion::full()),
                                     }
-                                } else { (decoded.mat.clone(), CropRegion::full()) }
+                                } else { (mat.clone(), CropRegion::full()) }
                             }
-                            _ => (decoded.mat.clone(), CropRegion::full()),
+                            _ => (mat.clone(), CropRegion::full()),
                         };
 
                         // Preprocess
@@ -2068,10 +1602,18 @@ fn run_inference_loop(
                             }
 
                             if available_poses.len() >= 2 {
+                                let zjump_count_before = prev_hip_z_reject_count;
                                 let mut tri_pose = triangulate_poses_multi(
                                     &available_params, &available_poses, CONFIDENCE_THRESHOLD,
                                     &mut prev_hip_ref_pair, &mut prev_hip_z,
+                                    &mut prev_hip_z_reject_count,
                                 );
+                                if prev_hip_z_reject_count > zjump_count_before {
+                                    fps_reject_zjump += 1;
+                                }
+                                if zjump_count_before > 0 && prev_hip_z_reject_count == 0 {
+                                    log!(logfile, "z-jump reject streak reset (was {}), hip_z={:?}", zjump_count_before, prev_hip_z);
+                                }
 
                                 if verbose {
                                     log!(logfile, "[verbose] tri: ref_pair={:?} hip_z={:?}", prev_hip_ref_pair, prev_hip_z);
@@ -2127,9 +1669,9 @@ fn run_inference_loop(
         // --- Auto-calibration ---
         if !auto_cal_triggered && !body_tracker.is_calibrated() && cal_deadline.is_none() {
             let hip_z = pose_3d.as_ref().and_then(|p| {
-                let lh = p.get(KP_LEFT_HIP);
-                let rh = p.get(KP_RIGHT_HIP);
-                if lh.is_valid(0.2) && rh.is_valid(0.2) { Some((lh.z + rh.z) / 2.0) } else { None }
+                let lh = p.get_by_index(KP_LEFT_HIP);
+                let rh = p.get_by_index(KP_RIGHT_HIP);
+                if lh.is_valid(BODY_CONFIDENCE_THRESHOLD) && rh.is_valid(BODY_CONFIDENCE_THRESHOLD) { Some((lh.z + rh.z) / 2.0) } else { None }
             });
             if let Some(z) = hip_z {
                 let now = Instant::now();
@@ -2177,9 +1719,9 @@ fn run_inference_loop(
         // --- Compute trackers ---
         let tracker_names = ["hip", "L_foot", "R_foot", "chest", "L_knee", "R_knee"];
         if let Some(ref pose) = pose_3d {
-            let lh = pose.get(KP_LEFT_HIP);
-            let rh = pose.get(KP_RIGHT_HIP);
-            let hip_valid = if lh.is_valid(0.2) && rh.is_valid(0.2) {
+            let lh = pose.get_by_index(KP_LEFT_HIP);
+            let rh = pose.get_by_index(KP_RIGHT_HIP);
+            let hip_valid = if lh.is_valid(BODY_CONFIDENCE_THRESHOLD) && rh.is_valid(BODY_CONFIDENCE_THRESHOLD) {
                 let hx = (lh.x + rh.x) / 2.0;
                 let hy = (lh.y + rh.y) / 2.0;
                 let hz = (lh.z + rh.z) / 2.0;
@@ -2245,6 +1787,9 @@ fn run_inference_loop(
                                 None => (false, 0.0),
                             }
                         } else { (true, 0.0) };
+
+                        if !velocity_ok { fps_reject_velocity += 1; }
+                        if !limb_ok { fps_reject_limb += 1; }
 
                         if verbose && (!velocity_ok || !limb_ok) {
                             log!(logfile, "[verbose] {}: reject vel_ok={} (d={:.3}) limb_ok={} (d={:.3}) reject_count={}",
@@ -2334,6 +1879,7 @@ fn run_inference_loop(
                 }
             }
         } else {
+            fps_no_pose += 1;
             let dt = last_inference_time.elapsed().as_secs_f32();
             if verbose { log!(logfile, "[verbose] no pose_3d, interpolating (mode={}, dt={:.3}s)", interp_mode, dt); }
             match interp_mode.as_str() {
@@ -2378,18 +1924,26 @@ fn run_inference_loop(
             for (cam_idx, prev) in prev_poses.iter().enumerate() {
                 if let Some(ref p) = prev {
                     let confs: Vec<String> = diag_kps.iter()
-                        .map(|(name, idx)| format!("{}={:.2}", name, p.get(*idx).confidence))
+                        .map(|(name, idx)| format!("{}={:.2}", name, p.get_by_index(*idx).confidence))
                         .collect();
                     cam_diag.push_str(&format!(" cam{}[{}]", cam_idx, confs.join(",")));
                 }
             }
-            log!(logfile, "FPS: {:.1} (infer: {}) | {}{}",
+            log!(logfile, "FPS: {:.1} (infer: {}) reject: vel={} limb={} zjump={} no_pose={} | {}{}",
                 fps_frame_count as f32 / elapsed, fps_inference_count,
+                fps_reject_velocity, fps_reject_limb, fps_reject_zjump, fps_no_pose,
                 if parts.is_empty() { "no pose".to_string() } else { parts.join(" ") },
                 cam_diag,
             );
+            if let Ok(mut f) = logfile.lock() {
+                let _ = f.flush();
+            }
             fps_frame_count = 0;
             fps_inference_count = 0;
+            fps_reject_velocity = 0;
+            fps_reject_limb = 0;
+            fps_reject_zjump = 0;
+            fps_no_pose = 0;
             fps_timer = Instant::now();
         }
     }
@@ -2474,9 +2028,10 @@ async fn main() -> Result<()> {
 
     loop {
         let (tcp_stream, addr) = listener.accept().await?;
+        tcp_stream.set_nodelay(true)?;
         log!(logfile, "Client connected: {}", addr);
 
-        let (tx, rx) = mpsc::sync_channel::<TcpEvent>(4);
+        let (tx, rx) = mpsc::sync_channel::<TcpEvent>(16);
         let (out_tx, out_rx) = tokio::sync::mpsc::channel::<ServerMessage>(4);
 
         let tcp_task = tokio::spawn(async move {
@@ -2494,5 +2049,646 @@ async fn main() -> Result<()> {
 
         tcp_task.abort();
         log!(logfile, "Client disconnected, waiting for next connection...");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_z_jump_first_frame_no_reject() {
+        let mut prev_z: Option<f32> = None;
+        let mut reject_count: u32 = 0;
+        // First frame: no previous value, should not reject
+        let rejected = check_hip_z_jump(Some(1.0), &mut prev_z, &mut reject_count);
+        assert!(!rejected);
+        assert_eq!(prev_z, Some(1.0));
+        assert_eq!(reject_count, 0);
+    }
+
+    #[test]
+    fn test_z_jump_small_movement_no_reject() {
+        let mut prev_z: Option<f32> = Some(1.0);
+        let mut reject_count: u32 = 0;
+        // Small movement within threshold
+        let rejected = check_hip_z_jump(Some(1.2), &mut prev_z, &mut reject_count);
+        assert!(!rejected);
+        assert_eq!(prev_z, Some(1.2));
+        assert_eq!(reject_count, 0);
+    }
+
+    #[test]
+    fn test_z_jump_large_movement_rejects() {
+        let mut prev_z: Option<f32> = Some(1.0);
+        let mut reject_count: u32 = 0;
+        // Large movement exceeding MAX_HIP_Z_JUMP (0.3)
+        let rejected = check_hip_z_jump(Some(1.5), &mut prev_z, &mut reject_count);
+        assert!(rejected);
+        assert_eq!(prev_z, Some(1.0)); // prev_z unchanged
+        assert_eq!(reject_count, 1);
+    }
+
+    #[test]
+    fn test_z_jump_streak_reset_after_max_rejects() {
+        let mut prev_z: Option<f32> = Some(1.0);
+        let mut reject_count: u32 = 0;
+        let new_z = 2.0; // Large jump
+
+        // Reject frames 1 through MAX_HIP_Z_REJECT_STREAK-1
+        for i in 1..MAX_HIP_Z_REJECT_STREAK {
+            let rejected = check_hip_z_jump(Some(new_z), &mut prev_z, &mut reject_count);
+            assert!(rejected, "frame {} should be rejected", i);
+            assert_eq!(prev_z, Some(1.0), "prev_z should stay at old value during streak");
+            assert_eq!(reject_count, i);
+        }
+
+        // Frame at MAX_HIP_Z_REJECT_STREAK: should reset and accept
+        let rejected = check_hip_z_jump(Some(new_z), &mut prev_z, &mut reject_count);
+        assert!(!rejected, "should accept after streak reaches max");
+        assert_eq!(prev_z, Some(new_z), "prev_z should be updated to new value");
+        assert_eq!(reject_count, 0, "reject count should be reset");
+    }
+
+    #[test]
+    fn test_z_jump_streak_resets_on_normal_frame() {
+        let mut prev_z: Option<f32> = Some(1.0);
+        let mut reject_count: u32 = 3; // mid-streak
+
+        // Normal frame within threshold resets the count
+        let rejected = check_hip_z_jump(Some(1.1), &mut prev_z, &mut reject_count);
+        assert!(!rejected);
+        assert_eq!(reject_count, 0);
+        assert_eq!(prev_z, Some(1.1));
+    }
+
+    #[test]
+    fn test_z_jump_none_hip_z_no_reject() {
+        let mut prev_z: Option<f32> = Some(1.0);
+        let mut reject_count: u32 = 0;
+        // No hip detected: should not reject, prev_z unchanged
+        let rejected = check_hip_z_jump(None, &mut prev_z, &mut reject_count);
+        assert!(!rejected);
+        assert_eq!(prev_z, Some(1.0));
+        assert_eq!(reject_count, 0);
+    }
+
+    #[test]
+    fn test_z_jump_recovery_after_reset() {
+        let mut prev_z: Option<f32> = Some(1.0);
+        let mut reject_count: u32 = 0;
+        let new_z = 2.0;
+
+        // Exhaust streak to trigger reset
+        for _ in 0..MAX_HIP_Z_REJECT_STREAK {
+            check_hip_z_jump(Some(new_z), &mut prev_z, &mut reject_count);
+        }
+        assert_eq!(prev_z, Some(new_z));
+
+        // Now normal operation resumes from new position
+        let rejected = check_hip_z_jump(Some(2.1), &mut prev_z, &mut reject_count);
+        assert!(!rejected);
+        assert_eq!(prev_z, Some(2.1));
+        assert_eq!(reject_count, 0);
+    }
+
+    #[test]
+    fn test_undistort_identity() {
+        let cp = CameraParams::from_calibration(
+            &[500.0, 0.0, 320.0, 0.0, 500.0, 240.0, 0.0, 0.0, 1.0],
+            &[0.0; 5], &[0.0; 3], &[0.0; 3], 640, 480,
+        );
+        let (u, v) = cp.undistort_point(400.0, 300.0);
+        assert!((u - 400.0).abs() < 0.01, "u: expected 400.0, got {}", u);
+        assert!((v - 300.0).abs() < 0.01, "v: expected 300.0, got {}", v);
+    }
+
+    #[test]
+    fn test_triangulate_known_point() {
+        let cam1 = CameraParams::from_config(55.0, 640, 480, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
+        let cam2 = CameraParams::from_config(55.0, 640, 480, [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
+
+        let target = nalgebra::Vector4::new(0.3, -0.2, 2.5, 1.0);
+        let proj1 = cam1.projection * target;
+        let proj2 = cam2.projection * target;
+        let uv1 = (proj1[0] / proj1[2], proj1[1] / proj1[2]);
+        let uv2 = (proj2[0] / proj2[2], proj2[1] / proj2[2]);
+
+        let (x, y, z) = triangulate_point(&[&cam1, &cam2], &[uv1, uv2]);
+        assert!((x - 0.3).abs() < 0.01, "x: expected 0.3, got {}", x);
+        assert!((y - (-0.2)).abs() < 0.01, "y: expected -0.2, got {}", y);
+        assert!((z - 2.5).abs() < 0.01, "z: expected 2.5, got {}", z);
+    }
+
+    #[test]
+    fn test_one_euro_filter_constant() {
+        let mut filter = ScalarFilter::new(1.0, 0.0, 1.0);
+        let dt = 1.0 / 30.0;
+        let value = 5.0;
+        let mut last = 0.0;
+        for _ in 0..100 {
+            last = filter.filter(value, dt);
+        }
+        assert!((last - value).abs() < 0.01, "filter should converge to {}, got {}", value, last);
+    }
+
+    #[test]
+    fn test_z_jump_reject_and_recover() {
+        let mut prev_z: Option<f32> = Some(1.0);
+        let mut reject_count: u32 = 0;
+
+        // Large jump should be rejected
+        assert!(check_hip_z_jump(Some(2.0), &mut prev_z, &mut reject_count));
+        assert_eq!(reject_count, 1);
+
+        // Continue rejecting until streak
+        for _ in 1..MAX_HIP_Z_REJECT_STREAK - 1 {
+            assert!(check_hip_z_jump(Some(2.0), &mut prev_z, &mut reject_count));
+        }
+        assert_eq!(reject_count, MAX_HIP_Z_REJECT_STREAK - 1);
+
+        // Streak max → reset and accept
+        assert!(!check_hip_z_jump(Some(2.0), &mut prev_z, &mut reject_count));
+        assert_eq!(prev_z, Some(2.0));
+        assert_eq!(reject_count, 0);
+
+        // Normal movement from new position accepted
+        assert!(!check_hip_z_jump(Some(2.1), &mut prev_z, &mut reject_count));
+        assert_eq!(prev_z, Some(2.1));
+    }
+
+    // ===================================================================
+    // Helper: build a Pose with specific keypoints set
+    // ===================================================================
+
+    fn make_pose(entries: &[(usize, f32, f32, f32, f32)]) -> Pose {
+        let mut pose = Pose::default();
+        for &(idx, x, y, z, conf) in entries {
+            pose.keypoints[idx] = Keypoint::new_3d(x, y, z, conf);
+        }
+        pose
+    }
+
+    fn standing_pose() -> Pose {
+        make_pose(&[
+            (KP_LEFT_HIP,       0.45, 0.50, 1.0, 0.9),
+            (KP_RIGHT_HIP,      0.55, 0.50, 1.0, 0.9),
+            (KP_LEFT_SHOULDER,   0.42, 0.30, 1.0, 0.9),
+            (KP_RIGHT_SHOULDER,  0.58, 0.30, 1.0, 0.9),
+            (KP_LEFT_KNEE,      0.44, 0.65, 1.0, 0.9),
+            (KP_RIGHT_KNEE,     0.56, 0.65, 1.0, 0.9),
+            (KP_LEFT_ANKLE,     0.43, 0.80, 1.0, 0.9),
+            (KP_RIGHT_ANKLE,    0.57, 0.80, 1.0, 0.9),
+        ])
+    }
+
+    // ===================================================================
+    // BodyTracker::compute() tests
+    // ===================================================================
+
+    #[test]
+    fn test_body_compute_uncalibrated_all_keypoints() {
+        let bt = BodyTracker::new(false, 0.0, 0.0);
+        let pose = standing_pose();
+        let result = bt.compute(&pose);
+
+        // hip should exist (both hips valid)
+        assert!(result.hip.is_some(), "hip should be present");
+        // left/right foot should exist (ankles valid)
+        assert!(result.left_foot.is_some(), "left_foot should be present");
+        assert!(result.right_foot.is_some(), "right_foot should be present");
+        // chest should exist (shoulders valid)
+        assert!(result.chest.is_some(), "chest should be present");
+        // knees should exist
+        assert!(result.left_knee.is_some(), "left_knee should be present");
+        assert!(result.right_knee.is_some(), "right_knee should be present");
+    }
+
+    #[test]
+    fn test_body_compute_uncalibrated_positions() {
+        let bt = BodyTracker::new(false, 0.0, 0.0);
+        let pose = standing_pose();
+        let result = bt.compute(&pose);
+
+        let hip = result.hip.unwrap();
+        // Uncalibrated: ref=(0.5,0.5), hip_center=(0.5,0.5)
+        // convert_position: global=(0.5-0.5, 0.5-0.5)=(0,0), pos_x=0+(0.5-0.5)=0, pos_y=0+0=0
+        assert!((hip.position[0]).abs() < 0.01, "hip x={}", hip.position[0]);
+        assert!((hip.position[1]).abs() < 0.01, "hip y={}", hip.position[1]);
+
+        // Feet: ankles at y=0.8, hip at y=0.5
+        // pos_y = 0 + (0 + (0.5 - 0.8)) = -0.3
+        let lf = result.left_foot.unwrap();
+        assert!((lf.position[1] - (-0.3)).abs() < 0.01, "left_foot y={}", lf.position[1]);
+    }
+
+    #[test]
+    fn test_body_compute_no_hips_returns_all_none() {
+        let bt = BodyTracker::new(false, 0.0, 0.0);
+        // Pose with no hip keypoints
+        let pose = make_pose(&[
+            (KP_LEFT_SHOULDER,  0.42, 0.30, 0.0, 0.9),
+            (KP_RIGHT_SHOULDER, 0.58, 0.30, 0.0, 0.9),
+            (KP_LEFT_ANKLE,     0.43, 0.80, 0.0, 0.9),
+            (KP_RIGHT_ANKLE,    0.57, 0.80, 0.0, 0.9),
+        ]);
+        let result = bt.compute(&pose);
+
+        assert!(result.hip.is_none(), "hip should be None without hip keypoints");
+        assert!(result.left_foot.is_none(), "left_foot requires hip_center");
+        assert!(result.right_foot.is_none(), "right_foot requires hip_center");
+        assert!(result.chest.is_none(), "chest requires hip_center");
+        assert!(result.left_knee.is_none(), "left_knee requires hip_center");
+        assert!(result.right_knee.is_none(), "right_knee requires hip_center");
+    }
+
+    #[test]
+    fn test_body_compute_missing_ankle_falls_back_to_knee() {
+        let bt = BodyTracker::new(false, 0.0, 0.0);
+        // Left ankle missing, left knee present
+        let pose = make_pose(&[
+            (KP_LEFT_HIP,       0.45, 0.50, 1.0, 0.9),
+            (KP_RIGHT_HIP,      0.55, 0.50, 1.0, 0.9),
+            (KP_LEFT_KNEE,      0.44, 0.65, 1.0, 0.9),
+            (KP_RIGHT_KNEE,     0.56, 0.65, 1.0, 0.9),
+            (KP_RIGHT_ANKLE,    0.57, 0.80, 1.0, 0.9),
+            // KP_LEFT_ANKLE intentionally omitted
+        ]);
+        let result = bt.compute(&pose);
+
+        // Left foot should fall back to knee position
+        assert!(result.left_foot.is_some(), "left_foot should use knee as fallback");
+        let lf = result.left_foot.unwrap();
+        // knee at x=0.44, hip_center at x=0.5
+        // convert_position: ref=(0.5,0.5), global=(0.5-0.5)=0, pos_x=0+(0.5-0.44)=0.06
+        assert!((lf.position[0] - 0.06).abs() < 0.01, "left_foot x={}", lf.position[0]);
+    }
+
+    #[test]
+    fn test_body_compute_missing_ankle_and_knee_returns_none() {
+        let bt = BodyTracker::new(false, 0.0, 0.0);
+        let pose = make_pose(&[
+            (KP_LEFT_HIP,       0.45, 0.50, 1.0, 0.9),
+            (KP_RIGHT_HIP,      0.55, 0.50, 1.0, 0.9),
+            (KP_LEFT_SHOULDER,   0.42, 0.30, 1.0, 0.9),
+            (KP_RIGHT_SHOULDER,  0.58, 0.30, 1.0, 0.9),
+            // Left knee and ankle both omitted
+            (KP_RIGHT_KNEE,     0.56, 0.65, 1.0, 0.9),
+            (KP_RIGHT_ANKLE,    0.57, 0.80, 1.0, 0.9),
+        ]);
+        let result = bt.compute(&pose);
+
+        assert!(result.left_foot.is_none(), "left_foot should be None without ankle and knee");
+        assert!(result.right_foot.is_some(), "right_foot should be present");
+    }
+
+    #[test]
+    fn test_body_compute_mirror_x() {
+        let bt_normal = BodyTracker::new(false, 0.0, 0.0);
+        let bt_mirror = BodyTracker::new(true, 0.0, 0.0);
+        let pose = standing_pose();
+
+        let normal = bt_normal.compute(&pose);
+        let mirror = bt_mirror.compute(&pose);
+
+        let nh = normal.hip.unwrap();
+        let mh = mirror.hip.unwrap();
+        // mirror_x flips the sign of pos_x
+        assert!(
+            (nh.position[0] + mh.position[0]).abs() < 0.01,
+            "mirror hip x should be negated: normal={}, mirror={}",
+            nh.position[0], mh.position[0]
+        );
+        // y should be identical
+        assert!(
+            (nh.position[1] - mh.position[1]).abs() < 0.01,
+            "mirror hip y should be same: normal={}, mirror={}",
+            nh.position[1], mh.position[1]
+        );
+    }
+
+    #[test]
+    fn test_body_compute_offset_y() {
+        let bt = BodyTracker::new(false, 0.5, 0.0);
+        let pose = standing_pose();
+        let result = bt.compute(&pose);
+
+        let hip = result.hip.unwrap();
+        // offset_y=0.5 is added to all y positions
+        assert!((hip.position[1] - 0.5).abs() < 0.01, "hip y with offset={}", hip.position[1]);
+    }
+
+    #[test]
+    fn test_body_compute_foot_y_offset() {
+        let bt = BodyTracker::new(false, 0.0, 0.1);
+        let pose = standing_pose();
+        let result = bt.compute(&pose);
+
+        let bt_no_offset = BodyTracker::new(false, 0.0, 0.0);
+        let result_no_offset = bt_no_offset.compute(&pose);
+
+        let lf = result.left_foot.unwrap();
+        let lf_no = result_no_offset.left_foot.unwrap();
+        assert!(
+            (lf.position[1] - lf_no.position[1] - 0.1).abs() < 0.01,
+            "foot_y_offset should add 0.1: with={}, without={}",
+            lf.position[1], lf_no.position[1]
+        );
+    }
+
+    #[test]
+    fn test_body_calibrate_and_compute() {
+        let mut bt = BodyTracker::new(false, 0.0, 0.0);
+        let calibration_pose = standing_pose();
+        assert!(bt.calibrate(&calibration_pose), "calibration should succeed");
+        assert!(bt.is_calibrated());
+
+        // Compute with the same pose as calibration: all positions should be ~0
+        let result = bt.compute(&calibration_pose);
+        let hip = result.hip.unwrap();
+        assert!((hip.position[0]).abs() < 0.01, "calibrated hip x={}", hip.position[0]);
+        assert!((hip.position[1]).abs() < 0.01, "calibrated hip y={}", hip.position[1]);
+
+        // Yaw should be ~0 (same pose as calibration)
+        assert!((hip.rotation[1]).abs() < 0.01, "calibrated hip yaw={}", hip.rotation[1]);
+    }
+
+    #[test]
+    fn test_body_calibrate_shifts_position() {
+        let mut bt = BodyTracker::new(false, 0.0, 0.0);
+        let calibration_pose = standing_pose();
+        bt.calibrate(&calibration_pose);
+
+        // Shifted pose: person moved right by 0.1
+        let shifted = make_pose(&[
+            (KP_LEFT_HIP,       0.55, 0.50, 1.0, 0.9),
+            (KP_RIGHT_HIP,      0.65, 0.50, 1.0, 0.9),
+            (KP_LEFT_SHOULDER,   0.52, 0.30, 1.0, 0.9),
+            (KP_RIGHT_SHOULDER,  0.68, 0.30, 1.0, 0.9),
+            (KP_LEFT_KNEE,      0.54, 0.65, 1.0, 0.9),
+            (KP_RIGHT_KNEE,     0.66, 0.65, 1.0, 0.9),
+            (KP_LEFT_ANKLE,     0.53, 0.80, 1.0, 0.9),
+            (KP_RIGHT_ANKLE,    0.67, 0.80, 1.0, 0.9),
+        ]);
+        let result = bt.compute(&shifted);
+        let hip = result.hip.unwrap();
+        // Person moved right by 0.1 in image → hip_center=(0.6, 0.5)
+        // convert_position: ref=(0.5,0.5), global=(0.5-0.6)=(-0.1, 0.5-0.5=0)
+        // pos_x = -0.1 + (0.6 - 0.6) = -0.1
+        assert!((hip.position[0] - (-0.1)).abs() < 0.02, "shifted hip x={}", hip.position[0]);
+    }
+
+    #[test]
+    fn test_body_calibrate_fails_without_hips() {
+        let mut bt = BodyTracker::new(false, 0.0, 0.0);
+        let pose = make_pose(&[
+            (KP_LEFT_SHOULDER,  0.42, 0.30, 0.0, 0.9),
+            (KP_RIGHT_SHOULDER, 0.58, 0.30, 0.0, 0.9),
+        ]);
+        assert!(!bt.calibrate(&pose), "calibrate should fail without hips");
+        assert!(!bt.is_calibrated());
+    }
+
+    #[test]
+    fn test_body_compute_depth_from_z() {
+        let bt = BodyTracker::new(false, 0.0, 0.0);
+        let pose = make_pose(&[
+            (KP_LEFT_HIP,   0.45, 0.50, 2.0, 0.9),
+            (KP_RIGHT_HIP,  0.55, 0.50, 2.0, 0.9),
+            (KP_LEFT_SHOULDER,  0.42, 0.30, 2.0, 0.9),
+            (KP_RIGHT_SHOULDER, 0.58, 0.30, 2.0, 0.9),
+            (KP_LEFT_ANKLE, 0.43, 0.80, 2.5, 0.9),
+            (KP_RIGHT_ANKLE, 0.57, 0.80, 1.5, 0.9),
+        ]);
+        let result = bt.compute(&pose);
+
+        // Uncalibrated: estimate_depth = ref_z(0) - hip_z(2.0) = -2.0
+        let hip = result.hip.unwrap();
+        assert!((hip.position[2] - (-2.0)).abs() < 0.01, "hip z={}", hip.position[2]);
+
+        // Left ankle z=2.5 → keypoint_depth = 0 - 2.5 = -2.5
+        let lf = result.left_foot.unwrap();
+        assert!((lf.position[2] - (-2.5)).abs() < 0.01, "left_foot z={}", lf.position[2]);
+    }
+
+    #[test]
+    fn test_body_compute_depth_calibrated() {
+        let mut bt = BodyTracker::new(false, 0.0, 0.0);
+        let cal_pose = make_pose(&[
+            (KP_LEFT_HIP,   0.45, 0.50, 2.0, 0.9),
+            (KP_RIGHT_HIP,  0.55, 0.50, 2.0, 0.9),
+            (KP_LEFT_SHOULDER,  0.42, 0.30, 2.0, 0.9),
+            (KP_RIGHT_SHOULDER, 0.58, 0.30, 2.0, 0.9),
+            (KP_LEFT_KNEE,  0.44, 0.65, 2.0, 0.9),
+            (KP_RIGHT_KNEE, 0.56, 0.65, 2.0, 0.9),
+            (KP_LEFT_ANKLE, 0.43, 0.80, 2.0, 0.9),
+            (KP_RIGHT_ANKLE, 0.57, 0.80, 2.0, 0.9),
+        ]);
+        bt.calibrate(&cal_pose);
+
+        // Same pose → z should be 0 (ref_z - current_z = 2.0 - 2.0 = 0)
+        let result = bt.compute(&cal_pose);
+        let hip = result.hip.unwrap();
+        assert!((hip.position[2]).abs() < 0.01, "calibrated hip z={}", hip.position[2]);
+
+        // Person moved closer: z=1.5 → ref_z(2.0) - 1.5 = 0.5
+        let closer_pose = make_pose(&[
+            (KP_LEFT_HIP,   0.45, 0.50, 1.5, 0.9),
+            (KP_RIGHT_HIP,  0.55, 0.50, 1.5, 0.9),
+            (KP_LEFT_SHOULDER,  0.42, 0.30, 1.5, 0.9),
+            (KP_RIGHT_SHOULDER, 0.58, 0.30, 1.5, 0.9),
+            (KP_LEFT_KNEE,  0.44, 0.65, 1.5, 0.9),
+            (KP_RIGHT_KNEE, 0.56, 0.65, 1.5, 0.9),
+            (KP_LEFT_ANKLE, 0.43, 0.80, 1.5, 0.9),
+            (KP_RIGHT_ANKLE, 0.57, 0.80, 1.5, 0.9),
+        ]);
+        let result = bt.compute(&closer_pose);
+        let hip = result.hip.unwrap();
+        assert!((hip.position[2] - 0.5).abs() < 0.01, "closer hip z={}", hip.position[2]);
+    }
+
+    // ===================================================================
+    // reject_duplicate_pair tests
+    // ===================================================================
+
+    #[test]
+    fn test_reject_duplicate_pair_close_positions() {
+        let mut left = Some(TrackerPose::new([0.1, 0.2, 0.0], [0.0, 0.0, 0.0, 1.0]));
+        let mut right = Some(TrackerPose::new([0.12, 0.21, 0.0], [0.0, 0.0, 0.0, 1.0]));
+        // distance = sqrt(0.02^2 + 0.01^2) ≈ 0.022 < 0.05
+        BodyTracker::reject_duplicate_pair(&mut left, &mut right);
+        assert!(left.is_none(), "close pair should be rejected");
+        assert!(right.is_none(), "close pair should be rejected");
+    }
+
+    #[test]
+    fn test_reject_duplicate_pair_distant_positions() {
+        let mut left = Some(TrackerPose::new([0.1, 0.2, 0.0], [0.0, 0.0, 0.0, 1.0]));
+        let mut right = Some(TrackerPose::new([0.3, 0.4, 0.0], [0.0, 0.0, 0.0, 1.0]));
+        // distance = sqrt(0.2^2 + 0.2^2) ≈ 0.283 > 0.05
+        BodyTracker::reject_duplicate_pair(&mut left, &mut right);
+        assert!(left.is_some(), "distant pair should be kept");
+        assert!(right.is_some(), "distant pair should be kept");
+    }
+
+    #[test]
+    fn test_reject_duplicate_pair_one_none() {
+        let mut left = Some(TrackerPose::new([0.1, 0.2, 0.0], [0.0, 0.0, 0.0, 1.0]));
+        let mut right: Option<TrackerPose> = None;
+        BodyTracker::reject_duplicate_pair(&mut left, &mut right);
+        assert!(left.is_some(), "should not touch when one is None");
+    }
+
+    // ===================================================================
+    // convert_position tests
+    // ===================================================================
+
+    #[test]
+    fn test_convert_position_uncalibrated() {
+        let bt = BodyTracker::new(false, 0.0, 0.0);
+        // hip at (0.5, 0.5), point at (0.3, 0.7)
+        let pos = bt.convert_position(0.3, 0.7, 0.5, 0.5, 0.0);
+        // ref=(0.5,0.5), global=(0.5-0.5,0.5-0.5)=(0,0)
+        // pos_x = 0 + (0.5-0.3) = 0.2
+        // pos_y = 0 + (0 + (0.5-0.7)) = -0.2
+        assert!((pos[0] - 0.2).abs() < 0.001, "x={}", pos[0]);
+        assert!((pos[1] - (-0.2)).abs() < 0.001, "y={}", pos[1]);
+        assert!((pos[2]).abs() < 0.001, "z={}", pos[2]);
+    }
+
+    #[test]
+    fn test_convert_position_mirror_x() {
+        let bt = BodyTracker::new(true, 0.0, 0.0);
+        let pos = bt.convert_position(0.3, 0.7, 0.5, 0.5, 0.0);
+        // pos_x before mirror = 0.2, after mirror = -0.2
+        assert!((pos[0] - (-0.2)).abs() < 0.001, "mirror x={}", pos[0]);
+    }
+
+    // ===================================================================
+    // sanitize_pose tests
+    // ===================================================================
+
+    #[test]
+    fn test_sanitize_pose_boundary_x_low() {
+        let pose = make_pose(&[
+            (KP_LEFT_ANKLE, 0.01, 0.50, 0.0, 0.9),  // x < 0.02 → zeroed
+            (KP_RIGHT_ANKLE, 0.50, 0.50, 0.0, 0.9),  // normal
+        ]);
+        let s = sanitize_pose(&pose);
+        assert_eq!(s.keypoints[KP_LEFT_ANKLE].confidence, 0.0, "left ankle should be zeroed");
+        assert_eq!(s.keypoints[KP_RIGHT_ANKLE].confidence, 0.9, "right ankle should be kept");
+    }
+
+    #[test]
+    fn test_sanitize_pose_boundary_x_high() {
+        let pose = make_pose(&[
+            (KP_LEFT_SHOULDER, 0.99, 0.50, 0.0, 0.9),  // x > 0.98 → zeroed
+        ]);
+        let s = sanitize_pose(&pose);
+        assert_eq!(s.keypoints[KP_LEFT_SHOULDER].confidence, 0.0);
+    }
+
+    #[test]
+    fn test_sanitize_pose_boundary_y_low() {
+        let pose = make_pose(&[
+            (KP_LEFT_KNEE, 0.50, 0.01, 0.0, 0.9),  // y < 0.02 → zeroed (full boundary)
+        ]);
+        let s = sanitize_pose(&pose);
+        assert_eq!(s.keypoints[KP_LEFT_KNEE].confidence, 0.0);
+    }
+
+    #[test]
+    fn test_sanitize_pose_boundary_y_high() {
+        let pose = make_pose(&[
+            (KP_RIGHT_KNEE, 0.50, 0.99, 0.0, 0.9),  // y > 0.98 → zeroed (full boundary)
+        ]);
+        let s = sanitize_pose(&pose);
+        assert_eq!(s.keypoints[KP_RIGHT_KNEE].confidence, 0.0);
+    }
+
+    #[test]
+    fn test_sanitize_pose_hip_x_only_boundary() {
+        // Hips use X-only boundary: Y edges should NOT zero confidence
+        let pose = make_pose(&[
+            (KP_LEFT_HIP, 0.50, 0.01, 0.0, 0.9),   // y=0.01 but hip is X-only → kept
+            (KP_RIGHT_HIP, 0.01, 0.50, 0.0, 0.9),   // x=0.01 → zeroed
+        ]);
+        let s = sanitize_pose(&pose);
+        assert_eq!(s.keypoints[KP_LEFT_HIP].confidence, 0.9, "hip y-edge should be kept");
+        assert_eq!(s.keypoints[KP_RIGHT_HIP].confidence, 0.0, "hip x-edge should be zeroed");
+    }
+
+    #[test]
+    fn test_sanitize_pose_inside_boundary_kept() {
+        let pose = make_pose(&[
+            (KP_LEFT_ANKLE,  0.10, 0.50, 0.0, 0.9),
+            (KP_RIGHT_ANKLE, 0.90, 0.50, 0.0, 0.9),
+            (KP_LEFT_HIP,   0.30, 0.50, 0.0, 0.9),
+            (KP_RIGHT_HIP,  0.70, 0.50, 0.0, 0.9),
+        ]);
+        let s = sanitize_pose(&pose);
+        assert_eq!(s.keypoints[KP_LEFT_ANKLE].confidence, 0.9);
+        assert_eq!(s.keypoints[KP_RIGHT_ANKLE].confidence, 0.9);
+        assert_eq!(s.keypoints[KP_LEFT_HIP].confidence, 0.9);
+        assert_eq!(s.keypoints[KP_RIGHT_HIP].confidence, 0.9);
+    }
+
+    // ===================================================================
+    // yaw_to_quaternion / yaw_pitch_to_quaternion tests
+    // ===================================================================
+
+    #[test]
+    fn test_yaw_to_quaternion_zero() {
+        let q = BodyTracker::yaw_to_quaternion(0.0);
+        // [0, sin(0), 0, cos(0)] = [0, 0, 0, 1]
+        assert!((q[0]).abs() < 0.001);
+        assert!((q[1]).abs() < 0.001);
+        assert!((q[2]).abs() < 0.001);
+        assert!((q[3] - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_yaw_to_quaternion_90deg() {
+        let q = BodyTracker::yaw_to_quaternion(std::f32::consts::FRAC_PI_2);
+        // [0, sin(pi/4), 0, cos(pi/4)] ≈ [0, 0.707, 0, 0.707]
+        assert!((q[1] - 0.707).abs() < 0.01, "q[1]={}", q[1]);
+        assert!((q[3] - 0.707).abs() < 0.01, "q[3]={}", q[3]);
+    }
+
+    #[test]
+    fn test_yaw_pitch_to_quaternion_zero() {
+        let q = BodyTracker::yaw_pitch_to_quaternion(0.0, 0.0);
+        assert!((q[3] - 1.0).abs() < 0.001, "identity quaternion w={}", q[3]);
+    }
+
+    // ===================================================================
+    // compute_tilt_angle / rotate_pose_yz tests
+    // ===================================================================
+
+    #[test]
+    fn test_compute_tilt_angle_flat() {
+        // Hips and ankles at same z → tilt ≈ 0
+        let pose = make_pose(&[
+            (KP_LEFT_HIP,   0.45, 0.50, 1.0, 0.9),
+            (KP_RIGHT_HIP,  0.55, 0.50, 1.0, 0.9),
+            (KP_LEFT_ANKLE,  0.43, 0.80, 1.0, 0.9),
+            (KP_RIGHT_ANKLE, 0.57, 0.80, 1.0, 0.9),
+        ]);
+        let tilt = BodyTracker::compute_tilt_angle(&pose);
+        assert!(tilt.abs() < 0.01, "flat tilt={}", tilt);
+    }
+
+    #[test]
+    fn test_compute_tilt_angle_tilted() {
+        // Ankles further in z than hips → nonzero tilt
+        let pose = make_pose(&[
+            (KP_LEFT_HIP,   0.45, 0.50, 1.0, 0.9),
+            (KP_RIGHT_HIP,  0.55, 0.50, 1.0, 0.9),
+            (KP_LEFT_ANKLE,  0.43, 0.80, 2.0, 0.9),
+            (KP_RIGHT_ANKLE, 0.57, 0.80, 2.0, 0.9),
+        ]);
+        let tilt = BodyTracker::compute_tilt_angle(&pose);
+        // atan2(2.0 - 1.0, 0.8 - 0.5) = atan2(1.0, 0.3) ≈ 1.28
+        assert!(tilt > 0.5, "tilted tilt={}", tilt);
     }
 }

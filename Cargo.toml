@@ -6,7 +6,8 @@ default-run = "tracker_bevy"
 
 [features]
 default = ["desktop"]
-desktop = ["opencv/videoio", "opencv/aruco", "opencv/calib3d", "opencv/objdetect", "dep:minifb", "dep:bevy", "dep:signal-hook"]
+imgproc = ["opencv/imgproc", "opencv/imgcodecs"]
+desktop = ["imgproc", "opencv/videoio", "opencv/aruco", "opencv/calib3d", "opencv/objdetect", "dep:minifb", "dep:bevy", "dep:signal-hook"]
 cuda = ["ort/cuda"]
 
 [dependencies]
@@ -63,3 +64,4 @@ path = "src/bin/camera_server.rs"
 [[bin]]
 name = "inference_server"
 path = "src/bin/inference_server.rs"
+required-features = ["imgproc"]

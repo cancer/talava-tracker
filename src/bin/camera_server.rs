@@ -165,9 +165,9 @@ fn collect_frames(cameras: &[CameraThread], timeout: Duration) -> Option<Vec<(i3
         let mut all_ready = true;
         for (i, cam) in cameras.iter().enumerate() {
             if frames[i].is_none() {
-                let lock = cam.latest_frame.lock().unwrap();
-                if let Some(ref f) = *lock {
-                    frames[i] = Some((cam.camera_index, cam.width, cam.height, f.clone()));
+                let mut lock = cam.latest_frame.lock().unwrap();
+                if let Some(f) = lock.take() {
+                    frames[i] = Some((cam.camera_index, cam.width, cam.height, f));
                 } else {
                     all_ready = false;
                 }
@@ -422,6 +422,7 @@ async fn main() -> Result<()> {
         log!(logfile, "[tcp] connecting to {}...", config.server_addr);
         match tokio::net::TcpStream::connect(&config.server_addr).await {
             Ok(tcp) => {
+                tcp.set_nodelay(true)?;
                 log!(logfile, "[tcp] connected");
                 let stream = protocol::message_stream(tcp);
                 if let Err(e) = run_session(

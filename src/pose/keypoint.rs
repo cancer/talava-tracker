@@ -150,6 +150,11 @@ impl Pose {
         &self.keypoints[index as usize]
     }
 
+    /// usizeインデックスでキーポイントを取得
+    pub fn get_by_index(&self, index: usize) -> &Keypoint {
+        &self.keypoints[index]
+    }
+
     /// 全キーポイントの平均信頼度
     pub fn average_confidence(&self) -> f32 {
         let sum: f32 = self.keypoints.iter().map(|k| k.confidence).sum();

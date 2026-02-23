@@ -15,9 +15,9 @@ pub struct CameraParams {
     pub image_width: f32,
     pub image_height: f32,
     /// 内部パラメータ行列（歪み補正用）
-    intrinsic: Matrix3<f32>,
+    pub intrinsic: Matrix3<f32>,
     /// 歪み係数 [k1, k2, p1, p2, k3]
-    dist_coeffs: [f32; 5],
+    pub dist_coeffs: [f32; 5],
 }
 
 impl CameraParams {
@@ -302,7 +302,7 @@ impl CameraParams {
 ///
 /// N台のカメラの2D観測から3D座標を推定。
 /// 各カメラについて x × (P · X) = 0 の形で2行追加し、SVDで解く。
-fn triangulate_point(cameras: &[&CameraParams], points_2d: &[(f32, f32)]) -> (f32, f32, f32) {
+pub fn triangulate_point(cameras: &[&CameraParams], points_2d: &[(f32, f32)]) -> (f32, f32, f32) {
     let n = cameras.len();
     assert!(n >= 2);
 
@@ -354,7 +354,7 @@ fn triangulate_point(cameras: &[&CameraParams], points_2d: &[(f32, f32)]) -> (f3
 }
 
 /// 3D点のリプロジェクションエラーを計算
-fn reprojection_error(
+pub fn reprojection_error(
     cameras: &[&CameraParams],
     points_2d: &[(f32, f32)],
     point_3d: &Vector4<f32>,
