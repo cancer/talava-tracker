@@ -1434,6 +1434,13 @@ fn run_inference_loop(
                 }
                 TcpEvent::FrameSet(frame_set) if calibrated => {
                     frame_received_at = Instant::now();
+                    // Network delay estimation: local SystemTime - camera_server SystemTime
+                    // Absolute value includes clock offset; DRIFT over time indicates buffering
+                    let local_us = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as i64;
+                    let camera_us = frame_set.timestamp_us as i64;
+                    let clock_delta_ms = (local_us - camera_us) as f64 / 1000.0;
+                    log!(logfile, "NET: delta={:.0}ms (camera_ts={})", clock_delta_ms, frame_set.timestamp_us);
                     for raw_frame in &frame_set.frames {
                         let cam_idx = match cam_id_to_idx.get(&raw_frame.camera_id) {
                             Some(&idx) => idx,
