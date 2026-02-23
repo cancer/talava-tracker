@@ -1199,6 +1199,9 @@ const VMT_SEND_HZ: f32 = 90.0;
 struct InferenceResult {
     poses: [Option<TrackerPose>; TRACKER_COUNT],
     stale: [bool; TRACKER_COUNT],
+    frame_received_at: Instant,
+    infer_done_at: Instant,
+    result_sent_at: Instant,
 }
 
 struct RawFrame { camera_id: u8, width: u32, height: u32, jpeg_data: Vec<u8> }
@@ -1329,6 +1332,8 @@ fn run_inference_loop(
 
     let mut pose_3d: Option<Pose> = None;
     let detector_mode = config.detector.clone();
+    let mut frame_received_at = Instant::now();
+    let mut infer_done_at = Instant::now();
 
     log!(logfile, "Waiting for calibration data from client...");
 
@@ -1428,6 +1433,7 @@ fn run_inference_loop(
                     log!(logfile, "Ready for inference ({} cameras)", num_cameras);
                 }
                 TcpEvent::FrameSet(frame_set) if calibrated => {
+                    frame_received_at = Instant::now();
                     for raw_frame in &frame_set.frames {
                         let cam_idx = match cam_id_to_idx.get(&raw_frame.camera_id) {
                             Some(&idx) => idx,
@@ -1648,6 +1654,7 @@ fn run_inference_loop(
                                 }
 
                                 pose_3d = Some(tri_pose);
+                                infer_done_at = Instant::now();
                             }
 
                             for p in poses_2d.iter_mut() { *p = None; }
@@ -1707,9 +1714,13 @@ fn run_inference_loop(
                         filters = make_filters(&config.filter);
                         last_poses = [None; TRACKER_COUNT];
                         // Send reset signal to VMT loop (all-None result)
+                        let now = Instant::now();
                         let _ = result_tx.try_send(InferenceResult {
                             poses: [None; TRACKER_COUNT],
                             stale: [false; TRACKER_COUNT],
+                            frame_received_at: now,
+                            infer_done_at: now,
+                            result_sent_at: now,
                         });
                         log!(logfile, "Calibrated!");
                     } else {
@@ -1855,6 +1866,9 @@ fn run_inference_loop(
             let result = InferenceResult {
                 poses: last_poses,
                 stale,
+                frame_received_at,
+                infer_done_at,
+                result_sent_at: Instant::now(),
             };
             let _ = result_tx.try_send(result);
         }
@@ -1924,6 +1938,11 @@ fn vmt_send_loop(
     let mut vmt_send_count: u32 = 0;
     let mut vmt_fps_timer = Instant::now();
 
+    // Latency tracking
+    let mut latency_sum_ms: f32 = 0.0;
+    let mut latency_count: u32 = 0;
+    let mut latency_max_ms: f32 = 0.0;
+
     loop {
         let tick_start = Instant::now();
 
@@ -1938,8 +1957,23 @@ fn vmt_send_loop(
                         lerpers = std::array::from_fn(|_| Lerper::new());
                         last_sent_poses = [None; TRACKER_COUNT];
                         last_inference_time = Instant::now();
+                        latency_sum_ms = 0.0;
+                        latency_count = 0;
+                        latency_max_ms = 0.0;
                         continue;
                     }
+
+                    // Measure pipeline latency
+                    let vmt_received_at = Instant::now();
+                    let total_ms = vmt_received_at.duration_since(result.frame_received_at).as_secs_f32() * 1000.0;
+                    let infer_ms = result.infer_done_at.duration_since(result.frame_received_at).as_secs_f32() * 1000.0;
+                    let filter_ms = result.result_sent_at.duration_since(result.infer_done_at).as_secs_f32() * 1000.0;
+                    let channel_ms = vmt_received_at.duration_since(result.result_sent_at).as_secs_f32() * 1000.0;
+                    latency_sum_ms += total_ms;
+                    latency_count += 1;
+                    if total_ms > latency_max_ms { latency_max_ms = total_ms; }
+                    log!(logfile, "LAT: total={:.0}ms (infer={:.0} filter={:.0} ch={:.0})",
+                        total_ms, infer_ms, filter_ms, channel_ms);
 
                     let dt = last_inference_time.elapsed().as_secs_f32();
                     let lerp_t = (dt / (1.0 / 30.0)).min(1.0);
@@ -1994,9 +2028,14 @@ fn vmt_send_loop(
         // 3. VMT FPS logging
         let vmt_elapsed = vmt_fps_timer.elapsed().as_secs_f32();
         if vmt_elapsed >= 10.0 {
-            log!(logfile, "VMT: {:.1} Hz", vmt_send_count as f32 / vmt_elapsed);
+            let avg_lat = if latency_count > 0 { latency_sum_ms / latency_count as f32 } else { 0.0 };
+            log!(logfile, "VMT: {:.1} Hz | lat avg={:.0}ms max={:.0}ms (n={})",
+                vmt_send_count as f32 / vmt_elapsed, avg_lat, latency_max_ms, latency_count);
             vmt_send_count = 0;
             vmt_fps_timer = Instant::now();
+            latency_sum_ms = 0.0;
+            latency_count = 0;
+            latency_max_ms = 0.0;
         }
 
         // 4. Sleep to maintain target rate
