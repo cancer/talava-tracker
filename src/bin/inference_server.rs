@@ -2466,8 +2466,10 @@ async fn main() -> Result<()> {
         });
     }
 
-    let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
-    log!(logfile, "Listening on {}", config.listen_addr);
+    let bind_addr: std::net::SocketAddr = config.listen_addr.parse()
+        .context("invalid listen_addr")?;
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    log!(logfile, "Listening on {}", bind_addr);
     log!(logfile, "");
 
     loop {
