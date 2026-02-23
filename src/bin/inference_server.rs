@@ -2,7 +2,7 @@
 //! triangulates 3D poses, and sends tracker data via VMT/OSC.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1208,6 +1208,7 @@ async fn tcp_receive_loop(
     stream: tokio::net::TcpStream,
     tx: mpsc::SyncSender<TcpEvent>,
     mut out_rx: tokio::sync::mpsc::Receiver<ServerMessage>,
+    frame_drop_count: Arc<AtomicU32>,
 ) -> Result<()> {
     use futures::StreamExt as _;
 
@@ -1235,7 +1236,7 @@ async fn tcp_receive_loop(
                         }).collect();
                         if !raw_frames.is_empty() {
                             if tx.try_send(TcpEvent::FrameSet(RawFrameSet { timestamp_us, frames: raw_frames })).is_err() {
-                                eprintln!("[warn] frame dropped: channel full");
+                                frame_drop_count.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
@@ -1280,6 +1281,7 @@ fn run_inference_loop(
     out_tx: &tokio::sync::mpsc::Sender<ServerMessage>,
     trigger_log_send: &AtomicBool,
     trigger_calibration: &AtomicBool,
+    frame_drop_count: &AtomicU32,
 ) {
     let mut camera_params: Vec<CameraParams> = Vec::new();
     let mut calibrated = false;
@@ -1929,8 +1931,9 @@ fn run_inference_loop(
                     cam_diag.push_str(&format!(" cam{}[{}]", cam_idx, confs.join(",")));
                 }
             }
-            log!(logfile, "FPS: {:.1} (infer: {}) reject: vel={} limb={} zjump={} no_pose={} | {}{}",
-                fps_frame_count as f32 / elapsed, fps_inference_count,
+            let drops = frame_drop_count.swap(0, Ordering::Relaxed);
+            log!(logfile, "FPS: {:.1} (infer: {} drop: {}) reject: vel={} limb={} zjump={} no_pose={} | {}{}",
+                fps_frame_count as f32 / elapsed, fps_inference_count, drops,
                 fps_reject_velocity, fps_reject_limb, fps_reject_zjump, fps_no_pose,
                 if parts.is_empty() { "no pose".to_string() } else { parts.join(" ") },
                 cam_diag,
@@ -2033,9 +2036,11 @@ async fn main() -> Result<()> {
 
         let (tx, rx) = mpsc::sync_channel::<TcpEvent>(16);
         let (out_tx, out_rx) = tokio::sync::mpsc::channel::<ServerMessage>(4);
+        let frame_drop_count = Arc::new(AtomicU32::new(0));
+        let frame_drop_count2 = Arc::clone(&frame_drop_count);
 
         let tcp_task = tokio::spawn(async move {
-            if let Err(e) = tcp_receive_loop(tcp_stream, tx, out_rx).await {
+            if let Err(e) = tcp_receive_loop(tcp_stream, tx, out_rx, frame_drop_count2).await {
                 eprintln!("TCP error: {}", e);
             }
         });
@@ -2044,6 +2049,7 @@ async fn main() -> Result<()> {
             run_inference_loop(
                 &rx, &config, &mut detector, &mut person_detector, model_type, &vmt,
                 &logfile, config.verbose, &log_path, &out_tx, &trigger_log_send, &trigger_calibration,
+                &frame_drop_count,
             );
         });
 
