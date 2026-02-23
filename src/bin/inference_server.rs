@@ -1194,6 +1194,12 @@ macro_rules! log {
 const TRACKER_COUNT: usize = 6;
 const TRACKER_INDICES: [i32; TRACKER_COUNT] = [0, 1, 2, 3, 4, 5];
 const TRIANGULATION_TIMEOUT_MS: f32 = 100.0;
+const VMT_SEND_HZ: f32 = 90.0;
+
+struct InferenceResult {
+    poses: [Option<TrackerPose>; TRACKER_COUNT],
+    stale: [bool; TRACKER_COUNT],
+}
 
 struct RawFrame { camera_id: u8, width: u32, height: u32, jpeg_data: Vec<u8> }
 struct RawFrameSet { #[allow(dead_code)] timestamp_us: u64, frames: Vec<RawFrame> }
@@ -1274,7 +1280,7 @@ fn run_inference_loop(
     detector: &mut PoseDetector,
     person_detector: &mut Option<PersonDetector>,
     model_type: ModelType,
-    vmt: &VmtClient,
+    result_tx: &mpsc::SyncSender<InferenceResult>,
     logfile: &LogFile,
     verbose: bool,
     log_path: &str,
@@ -1295,13 +1301,10 @@ fn run_inference_loop(
 
     let mut body_tracker = BodyTracker::new(config.mirror_x, config.offset_y, config.foot_y_offset);
     let mut filters: [PoseFilter; TRACKER_COUNT] = make_filters(&config.filter);
-    let mut extrapolators: [Extrapolator; TRACKER_COUNT] = std::array::from_fn(|_| Extrapolator::new());
-    let mut lerpers: [Lerper; TRACKER_COUNT] = std::array::from_fn(|_| Lerper::new());
     let mut last_poses: [Option<TrackerPose>; TRACKER_COUNT] = [None; TRACKER_COUNT];
     let mut last_update_times: [Instant; TRACKER_COUNT] = [Instant::now(); TRACKER_COUNT];
     let mut stale: [bool; TRACKER_COUNT] = [false; TRACKER_COUNT];
     let mut reject_count: [u32; TRACKER_COUNT] = [0; TRACKER_COUNT];
-    let mut last_inference_time = Instant::now();
 
     // Triangulation state
     let mut prev_hip_ref_pair: Option<(usize, usize)> = None;
@@ -1326,7 +1329,6 @@ fn run_inference_loop(
 
     let mut pose_3d: Option<Pose> = None;
     let detector_mode = config.detector.clone();
-    let interp_mode = config.interpolation_mode.clone();
 
     log!(logfile, "Waiting for calibration data from client...");
 
@@ -1409,13 +1411,10 @@ fn run_inference_loop(
                     // Reset tracker state
                     body_tracker = BodyTracker::new(config.mirror_x, config.offset_y, config.foot_y_offset);
                     filters = make_filters(&config.filter);
-                    extrapolators = std::array::from_fn(|_| Extrapolator::new());
-                    lerpers = std::array::from_fn(|_| Lerper::new());
                     last_poses = [None; TRACKER_COUNT];
                     last_update_times = [Instant::now(); TRACKER_COUNT];
                     stale = [false; TRACKER_COUNT];
                     reject_count = [0; TRACKER_COUNT];
-                    last_inference_time = Instant::now();
                     auto_cal_triggered = false;
                     first_hip_time = None;
                     last_hip_time = None;
@@ -1706,9 +1705,12 @@ fn run_inference_loop(
                 if let Some(ref pose) = pose_3d {
                     if body_tracker.calibrate(pose) {
                         filters = make_filters(&config.filter);
-                        extrapolators = std::array::from_fn(|_| Extrapolator::new());
-                        lerpers = std::array::from_fn(|_| Lerper::new());
                         last_poses = [None; TRACKER_COUNT];
+                        // Send reset signal to VMT loop (all-None result)
+                        let _ = result_tx.try_send(InferenceResult {
+                            poses: [None; TRACKER_COUNT],
+                            stale: [false; TRACKER_COUNT],
+                        });
                         log!(logfile, "Calibrated!");
                     } else {
                         log!(logfile, "Calibration failed: hip not detected");
@@ -1754,8 +1756,6 @@ fn run_inference_loop(
                     log!(logfile, "[verbose] body_tracker raw: {}", raw_strs.join(" "));
                 }
 
-                let dt = last_inference_time.elapsed().as_secs_f32();
-                let lerp_t = (dt / (1.0 / 30.0)).min(1.0);
                 let now = Instant::now();
                 let max_displacement = 0.4;
                 let max_limb_dist = 1.5;
@@ -1806,8 +1806,6 @@ fn run_inference_loop(
                                     p.position[0], p.position[1], p.position[2],
                                     smoothed.position[0], smoothed.position[1], smoothed.position[2]);
                             }
-                            extrapolators[i].update(smoothed);
-                            lerpers[i].update(smoothed, lerp_t);
                             last_poses[i] = Some(smoothed);
                             last_update_times[i] = now;
                             stale[i] = false;
@@ -1823,11 +1821,7 @@ fn run_inference_loop(
                                 if z_ok {
                                     if verbose { log!(logfile, "[verbose] {}: reset after {} rejects (z_ok)", tracker_names[i], reject_count[i]); }
                                     filters[i].reset();
-                                    extrapolators[i] = Extrapolator::new();
-                                    lerpers[i] = Lerper::new();
                                     let smoothed = filters[i].apply(p);
-                                    extrapolators[i].update(smoothed);
-                                    lerpers[i].update(smoothed, lerp_t);
                                     last_poses[i] = Some(smoothed);
                                     last_update_times[i] = now;
                                     stale[i] = false;
@@ -1850,62 +1844,19 @@ fn run_inference_loop(
                             if verbose { log!(logfile, "[verbose] {}: went stale ({:.1}s)", tracker_names[i], stale_time); }
                             stale[i] = true;
                             filters[i].reset();
-                            extrapolators[i] = Extrapolator::new();
-                            lerpers[i] = Lerper::new();
                         }
                     }
                 }
-                last_inference_time = now;
             }
         }
 
-        // --- Send VMT ---
+        // --- Send result to VMT loop ---
         if pose_3d.is_some() {
-            if verbose {
-                let vmt_strs: Vec<String> = (0..TRACKER_COUNT)
-                    .filter(|&i| !stale[i] && last_poses[i].is_some())
-                    .map(|i| {
-                        let p = last_poses[i].as_ref().unwrap();
-                        format!("{}({:.3},{:.3},{:.3} q=[{:.3},{:.3},{:.3},{:.3}])",
-                            tracker_names[i],
-                            p.position[0], p.position[1], p.position[2],
-                            p.rotation[0], p.rotation[1], p.rotation[2], p.rotation[3])
-                    }).collect();
-                if !vmt_strs.is_empty() {
-                    log!(logfile, "[verbose] vmt send: {}", vmt_strs.join(" "));
-                }
-            }
-            for i in 0..TRACKER_COUNT {
-                if !stale[i] {
-                    if let Some(ref p) = last_poses[i] { let _ = vmt.send(TRACKER_INDICES[i], 1, p); }
-                }
-            }
-        } else {
-            fps_no_pose += 1;
-            let dt = last_inference_time.elapsed().as_secs_f32();
-            if verbose { log!(logfile, "[verbose] no pose_3d, interpolating (mode={}, dt={:.3}s)", interp_mode, dt); }
-            match interp_mode.as_str() {
-                "extrapolate" => {
-                    for i in 0..TRACKER_COUNT {
-                        if let Some(predicted) = extrapolators[i].predict(dt) {
-                            let _ = vmt.send(TRACKER_INDICES[i], 1, &predicted);
-                        }
-                    }
-                }
-                "lerp" => {
-                    let t = (dt / (1.0 / 30.0)).min(1.0);
-                    for i in 0..TRACKER_COUNT {
-                        if let Some(interpolated) = lerpers[i].interpolate(t) {
-                            let _ = vmt.send(TRACKER_INDICES[i], 1, &interpolated);
-                        }
-                    }
-                }
-                _ => {
-                    for i in 0..TRACKER_COUNT {
-                        if let Some(ref p) = last_poses[i] { let _ = vmt.send(TRACKER_INDICES[i], 1, p); }
-                    }
-                }
-            }
+            let result = InferenceResult {
+                poses: last_poses,
+                stale,
+            };
+            let _ = result_tx.try_send(result);
         }
 
         // --- FPS logging ---
@@ -1953,6 +1904,110 @@ fn run_inference_loop(
 }
 
 // ===========================================================================
+// VMT send loop (90Hz)
+// ===========================================================================
+
+fn vmt_send_loop(
+    result_rx: &mpsc::Receiver<InferenceResult>,
+    vmt: &VmtClient,
+    logfile: &LogFile,
+    interp_mode: &str,
+) {
+    let mut extrapolators: [Extrapolator; TRACKER_COUNT] = std::array::from_fn(|_| Extrapolator::new());
+    let mut lerpers: [Lerper; TRACKER_COUNT] = std::array::from_fn(|_| Lerper::new());
+    let mut last_sent_poses: [Option<TrackerPose>; TRACKER_COUNT] = [None; TRACKER_COUNT];
+    let mut last_inference_time = Instant::now();
+
+    let tick = Duration::from_micros((1_000_000.0 / VMT_SEND_HZ) as u64);
+
+    // FPS counter for VMT send rate
+    let mut vmt_send_count: u32 = 0;
+    let mut vmt_fps_timer = Instant::now();
+
+    loop {
+        let tick_start = Instant::now();
+
+        // 1. Drain all available inference results (non-blocking)
+        let mut disconnected = false;
+        loop {
+            match result_rx.try_recv() {
+                Ok(result) => {
+                    // Check for reset signal (all poses None = calibration reset)
+                    if result.poses.iter().all(|p| p.is_none()) {
+                        extrapolators = std::array::from_fn(|_| Extrapolator::new());
+                        lerpers = std::array::from_fn(|_| Lerper::new());
+                        last_sent_poses = [None; TRACKER_COUNT];
+                        last_inference_time = Instant::now();
+                        continue;
+                    }
+
+                    let dt = last_inference_time.elapsed().as_secs_f32();
+                    let lerp_t = (dt / (1.0 / 30.0)).min(1.0);
+                    for i in 0..TRACKER_COUNT {
+                        if let Some(p) = result.poses[i] {
+                            if !result.stale[i] {
+                                extrapolators[i].update(p);
+                                lerpers[i].update(p, lerp_t);
+                                last_sent_poses[i] = Some(p);
+                            }
+                        }
+                    }
+                    last_inference_time = Instant::now();
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => { disconnected = true; break; }
+            }
+        }
+        if disconnected { break; }
+
+        // 2. Send VMT data (interpolated)
+        let dt = last_inference_time.elapsed().as_secs_f32();
+        let has_any_pose = last_sent_poses.iter().any(|p| p.is_some());
+        if has_any_pose {
+            match interp_mode {
+                "extrapolate" => {
+                    for i in 0..TRACKER_COUNT {
+                        if let Some(predicted) = extrapolators[i].predict(dt) {
+                            let _ = vmt.send(TRACKER_INDICES[i], 1, &predicted);
+                        }
+                    }
+                }
+                "lerp" => {
+                    let t = (dt / (1.0 / 30.0)).min(1.0);
+                    for i in 0..TRACKER_COUNT {
+                        if let Some(interpolated) = lerpers[i].interpolate(t) {
+                            let _ = vmt.send(TRACKER_INDICES[i], 1, &interpolated);
+                        }
+                    }
+                }
+                _ => {
+                    for i in 0..TRACKER_COUNT {
+                        if let Some(ref p) = last_sent_poses[i] {
+                            let _ = vmt.send(TRACKER_INDICES[i], 1, p);
+                        }
+                    }
+                }
+            }
+            vmt_send_count += 1;
+        }
+
+        // 3. VMT FPS logging
+        let vmt_elapsed = vmt_fps_timer.elapsed().as_secs_f32();
+        if vmt_elapsed >= 10.0 {
+            log!(logfile, "VMT: {:.1} Hz", vmt_send_count as f32 / vmt_elapsed);
+            vmt_send_count = 0;
+            vmt_fps_timer = Instant::now();
+        }
+
+        // 4. Sleep to maintain target rate
+        let elapsed = tick_start.elapsed();
+        if elapsed < tick {
+            std::thread::sleep(tick - elapsed);
+        }
+    }
+}
+
+// ===========================================================================
 // Main
 // ===========================================================================
 
@@ -1960,7 +2015,7 @@ fn run_inference_loop(
 async fn main() -> Result<()> {
     let config_str = std::fs::read_to_string("inference_server.toml")
         .context("failed to read inference_server.toml")?;
-    let config: Config = toml::from_str(&config_str)?;
+    let mut config: Config = toml::from_str(&config_str)?;
     let (logfile, log_path) = open_log_file()?;
 
     log!(logfile, "Inference Server ({})", env!("GIT_VERSION"));
@@ -2029,12 +2084,15 @@ async fn main() -> Result<()> {
     log!(logfile, "Listening on {}", bind_addr);
     log!(logfile, "");
 
+    let interp_mode = config.interpolation_mode.clone();
+
     loop {
         let (tcp_stream, addr) = listener.accept().await?;
         tcp_stream.set_nodelay(true)?;
         log!(logfile, "Client connected: {}", addr);
 
         let (tx, rx) = mpsc::sync_channel::<TcpEvent>(16);
+        let (result_tx, result_rx) = mpsc::sync_channel::<InferenceResult>(4);
         let (out_tx, out_rx) = tokio::sync::mpsc::channel::<ServerMessage>(4);
         let frame_drop_count = Arc::new(AtomicU32::new(0));
         let frame_drop_count2 = Arc::clone(&frame_drop_count);
@@ -2045,13 +2103,34 @@ async fn main() -> Result<()> {
             }
         });
 
-        tokio::task::block_in_place(|| {
+        // Spawn inference thread (owns detector, person_detector for the duration)
+        let infer_logfile = Arc::clone(&logfile);
+        let infer_log_path = log_path.clone();
+        let infer_trigger_log = Arc::clone(&trigger_log_send);
+        let infer_trigger_cal = Arc::clone(&trigger_calibration);
+        let infer_frame_drop = Arc::clone(&frame_drop_count);
+        let inference_handle = std::thread::spawn(move || {
             run_inference_loop(
-                &rx, &config, &mut detector, &mut person_detector, model_type, &vmt,
-                &logfile, config.verbose, &log_path, &out_tx, &trigger_log_send, &trigger_calibration,
-                &frame_drop_count,
+                &rx, &config, &mut detector, &mut person_detector, model_type, &result_tx,
+                &infer_logfile, config.verbose, &infer_log_path, &out_tx,
+                &infer_trigger_log, &infer_trigger_cal, &infer_frame_drop,
             );
+            // Return ownership back
+            (config, detector, person_detector)
         });
+
+        // VMT send loop runs on main thread (block_in_place to avoid starving tokio)
+        let vmt_logfile = Arc::clone(&logfile);
+        let vmt_interp = interp_mode.clone();
+        tokio::task::block_in_place(|| {
+            vmt_send_loop(&result_rx, &vmt, &vmt_logfile, &vmt_interp);
+        });
+
+        // Wait for inference thread to finish and reclaim ownership
+        let (cfg, det, pdet) = inference_handle.join().expect("inference thread panicked");
+        config = cfg;
+        detector = det;
+        person_detector = pdet;
 
         tcp_task.abort();
         log!(logfile, "Client disconnected, waiting for next connection...");
