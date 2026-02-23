@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use opencv::core::{AlgorithmHint, Mat, Vector};
+use opencv::core::{Mat, Vector};
 use opencv::prelude::*;
 use opencv::videoio::{self, VideoCapture, CAP_ANY};
 use opencv::{imgcodecs, imgproc};
@@ -143,7 +143,7 @@ fn jpeg_encode(frame: &Mat, quality: i32) -> Result<Vec<u8>> {
     // imencode expects BGR 8UC3; convert BGRA if needed
     let mat = if frame.channels() == 4 {
         let mut bgr = Mat::default();
-        imgproc::cvt_color(frame, &mut bgr, imgproc::COLOR_BGRA2BGR, 0, AlgorithmHint::ALGO_HINT_DEFAULT)?;
+        imgproc::cvt_color_def(frame, &mut bgr, imgproc::COLOR_BGRA2BGR)?;
         bgr
     } else {
         frame.clone()

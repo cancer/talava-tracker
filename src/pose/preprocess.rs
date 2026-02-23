@@ -1,7 +1,7 @@
 use anyhow::Result;
 use ndarray::Array4;
 use opencv::{
-    core::{AlgorithmHint, Mat, Scalar, Size, CV_32FC3},
+    core::{Mat, Scalar, Size, CV_32FC3},
     imgproc,
     prelude::*,
 };
@@ -19,7 +19,7 @@ pub const MOVENET_INPUT_SIZE: i32 = 192;
 pub fn preprocess_for_movenet(frame: &Mat) -> Result<Array4<f32>> {
     // BGR -> RGB
     let mut rgb = Mat::default();
-    imgproc::cvt_color(frame, &mut rgb, imgproc::COLOR_BGR2RGB, 0, AlgorithmHint::ALGO_HINT_DEFAULT)?;
+    imgproc::cvt_color_def(frame, &mut rgb, imgproc::COLOR_BGR2RGB)?;
 
     // 192x192 にリサイズ
     let mut resized = Mat::default();
@@ -124,7 +124,7 @@ fn preprocess_imagenet_nchw(frame: &Mat, width: i32, height: i32) -> Result<(Arr
 
     // BGR -> RGB
     let mut rgb = Mat::default();
-    imgproc::cvt_color(frame, &mut rgb, imgproc::COLOR_BGR2RGB, 0, AlgorithmHint::ALGO_HINT_DEFAULT)?;
+    imgproc::cvt_color_def(frame, &mut rgb, imgproc::COLOR_BGR2RGB)?;
 
     // アスペクト比保持リサイズ
     let mut resized = Mat::default();
