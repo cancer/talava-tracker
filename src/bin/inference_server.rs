@@ -2137,7 +2137,7 @@ async fn main() -> Result<()> {
         tcp_stream.set_nodelay(true)?;
         log!(logfile, "Client connected: {}", addr);
 
-        let (tx, rx) = mpsc::sync_channel::<TcpEvent>(16);
+        let (tx, rx) = mpsc::sync_channel::<TcpEvent>(1);
         let (result_tx, result_rx) = mpsc::sync_channel::<InferenceResult>(4);
         let (out_tx, out_rx) = tokio::sync::mpsc::channel::<ServerMessage>(4);
         let frame_drop_count = Arc::new(AtomicU32::new(0));
