@@ -1851,7 +1851,7 @@ fn run_inference_loop(
         }
 
         // --- Send result to VMT loop ---
-        if pose_3d.is_some() {
+        if pose_3d.take().is_some() {
             let result = InferenceResult {
                 poses: last_poses,
                 stale,
