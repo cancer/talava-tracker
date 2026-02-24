@@ -268,6 +268,9 @@ async fn run_session(
     let mut fps_counter: u32 = 0;
     let mut fps_timer = Instant::now();
     let frame_timeout = Duration::from_millis(50);
+    let mut sync_sum_ms: f64 = 0.0;
+    let mut encode_sum_ms: f64 = 0.0;
+    let mut send_sum_ms: f64 = 0.0;
 
     let result: Result<()> = async {
         loop {
@@ -330,13 +333,18 @@ async fn run_session(
                 },
             )
             .await?;
+            let send_elapsed = send_start.elapsed();
+
+            sync_sum_ms += sync_elapsed.as_secs_f64() * 1000.0;
+            encode_sum_ms += encode_elapsed.as_secs_f64() * 1000.0;
+            send_sum_ms += send_elapsed.as_secs_f64() * 1000.0;
 
             if verbose {
                 log!(logfile,
                     "[verbose] frameset: sync={:.1}ms encode={:.1}ms send={:.1}ms payload={}KB ts={}",
                     sync_elapsed.as_secs_f64() * 1000.0,
                     encode_elapsed.as_secs_f64() * 1000.0,
-                    send_start.elapsed().as_secs_f64() * 1000.0,
+                    send_elapsed.as_secs_f64() * 1000.0,
                     total_payload / 1024,
                     timestamp_us,
                 );
@@ -344,9 +352,14 @@ async fn run_session(
 
             fps_counter += 1;
             if fps_timer.elapsed() >= Duration::from_secs(1) {
-                log!(logfile, "[fps] {fps_counter}");
+                let n = fps_counter as f64;
+                log!(logfile, "[fps] {} (sync={:.1}ms encode={:.1}ms send={:.1}ms)",
+                    fps_counter, sync_sum_ms / n, encode_sum_ms / n, send_sum_ms / n);
                 fps_counter = 0;
                 fps_timer = Instant::now();
+                sync_sum_ms = 0.0;
+                encode_sum_ms = 0.0;
+                send_sum_ms = 0.0;
             }
         }
     }.await;

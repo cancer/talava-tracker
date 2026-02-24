@@ -1199,6 +1199,7 @@ const VMT_SEND_HZ: f32 = 90.0;
 struct InferenceResult {
     poses: [Option<TrackerPose>; TRACKER_COUNT],
     stale: [bool; TRACKER_COUNT],
+    camera_timestamp_us: u64,
     frame_received_at: Instant,
     infer_done_at: Instant,
     result_sent_at: Instant,
@@ -1334,6 +1335,7 @@ fn run_inference_loop(
     let detector_mode = config.detector.clone();
     let mut frame_received_at = Instant::now();
     let mut infer_done_at = Instant::now();
+    let mut current_camera_ts: u64 = 0;
 
     log!(logfile, "Waiting for calibration data from client...");
 
@@ -1434,6 +1436,7 @@ fn run_inference_loop(
                 }
                 TcpEvent::FrameSet(frame_set) if calibrated => {
                     frame_received_at = Instant::now();
+                    current_camera_ts = frame_set.timestamp_us;
                     // Network delay estimation: local SystemTime - camera_server SystemTime
                     // Absolute value includes clock offset; DRIFT over time indicates buffering
                     let local_us = std::time::SystemTime::now()
@@ -1725,6 +1728,7 @@ fn run_inference_loop(
                         let _ = result_tx.try_send(InferenceResult {
                             poses: [None; TRACKER_COUNT],
                             stale: [false; TRACKER_COUNT],
+                            camera_timestamp_us: 0,
                             frame_received_at: now,
                             infer_done_at: now,
                             result_sent_at: now,
@@ -1873,6 +1877,7 @@ fn run_inference_loop(
             let result = InferenceResult {
                 poses: last_poses,
                 stale,
+                camera_timestamp_us: current_camera_ts,
                 frame_received_at,
                 infer_done_at,
                 result_sent_at: Instant::now(),
@@ -1976,11 +1981,15 @@ fn vmt_send_loop(
                     let infer_ms = result.infer_done_at.duration_since(result.frame_received_at).as_secs_f32() * 1000.0;
                     let filter_ms = result.result_sent_at.duration_since(result.infer_done_at).as_secs_f32() * 1000.0;
                     let channel_ms = vmt_received_at.duration_since(result.result_sent_at).as_secs_f32() * 1000.0;
+                    // End-to-end: camera_server timestamp -> VMT send (includes clock offset as constant)
+                    let now_us = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as i64;
+                    let e2e_ms = (now_us - result.camera_timestamp_us as i64) as f32 / 1000.0;
                     latency_sum_ms += total_ms;
                     latency_count += 1;
                     if total_ms > latency_max_ms { latency_max_ms = total_ms; }
-                    log!(logfile, "LAT: total={:.0}ms (infer={:.0} filter={:.0} ch={:.0})",
-                        total_ms, infer_ms, filter_ms, channel_ms);
+                    log!(logfile, "LAT: e2e={:.0}ms total={:.0}ms (infer={:.0} filter={:.0} ch={:.0})",
+                        e2e_ms, total_ms, infer_ms, filter_ms, channel_ms);
 
                     let dt = last_inference_time.elapsed().as_secs_f32();
                     let lerp_t = (dt / (1.0 / 30.0)).min(1.0);
