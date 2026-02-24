@@ -6,7 +6,7 @@ default-run = "tracker_bevy"
 
 [features]
 default = ["desktop"]
-imgproc = ["opencv/imgproc", "opencv/imgcodecs"]
+imgproc = ["dep:opencv"]
 desktop = ["imgproc", "opencv/videoio", "opencv/aruco", "opencv/calib3d", "opencv/objdetect", "dep:minifb", "dep:bevy", "dep:signal-hook"]
 cuda = ["ort/cuda"]
 
@@ -15,7 +15,8 @@ rosc = "0.10"      # OSCプロトコル（VMT連携）
 anyhow = "1.0"     # エラーハンドリング
 ort = { version = "2.0.0-rc.9", default-features = false, features = ["std", "ndarray", "tracing", "download-binaries", "copy-dylibs", "tls-rustls"] } # ONNX Runtime
 ndarray = "0.17"   # テンソル操作
-opencv = { version = "0.93", default-features = false, features = ["imgproc", "imgcodecs"] }
+opencv = { version = "0.93", default-features = false, features = ["imgproc", "imgcodecs"], optional = true }
+image = "0.25"
 minifb = { version = "0.27", optional = true }
 toml = "0.9.11"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -67,4 +68,4 @@ path = "src/bin/camera_server.rs"
 [[bin]]
 name = "inference_server"
 path = "src/bin/inference_server.rs"
-required-features = ["imgproc"]
+required-features = []

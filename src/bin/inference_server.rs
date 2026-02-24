@@ -7,24 +7,17 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use image::{RgbImage, imageops::FilterType};
 use nalgebra::Vector4;
 use ndarray::Array4;
-use opencv::core::{Mat, Size, Vector, CV_32FC3};
-use opencv::prelude::*;
-use opencv::{imgcodecs, imgproc};
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;
 use serde::Deserialize;
 
 use talava_tracker::pose::{Keypoint, Pose};
-use talava_tracker::pose::preprocess::{
-    LetterboxInfo, preprocess_for_movenet, preprocess_for_spinepose, preprocess_for_rtmw3d,
-    unletterbox_pose,
-};
-use talava_tracker::pose::crop::{
-    BBox, CropRegion, bbox_from_keypoints, crop_for_pose, remap_pose,
-};
+use talava_tracker::pose::preprocess::{LetterboxInfo, unletterbox_pose};
+use talava_tracker::pose::crop::{BBox, CropRegion, bbox_from_keypoints, remap_pose};
 use talava_tracker::protocol::{
     self, ClientMessage, ServerMessage,
 };
@@ -375,6 +368,97 @@ fn triangulate_poses_multi(
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ModelType { MoveNet, SpinePose, RTMW3D }
 
+// ---------------------------------------------------------------------------
+// Image processing helpers (pure Rust, no opencv)
+// ---------------------------------------------------------------------------
+
+fn crop_for_pose_img(img: &RgbImage, bbox: &BBox, frame_w: u32, frame_h: u32) -> (RgbImage, CropRegion) {
+    let expand = 1.25f32;
+    let cx = bbox.x + bbox.width / 2.0;
+    let cy = bbox.y + bbox.height / 2.0;
+    let mut w = bbox.width * expand;
+    let mut h = bbox.height * expand;
+
+    let target_ratio = 4.0 / 3.0;
+    let current_ratio = h / w;
+    if current_ratio < target_ratio { h = w * target_ratio; } else { w = h / target_ratio; }
+
+    let fw = frame_w as f32;
+    let fh = frame_h as f32;
+    let x = (cx - w / 2.0).max(0.0);
+    let y = (cy - h / 2.0).max(0.0);
+    w = w.min(fw - x);
+    h = h.min(fh - y);
+
+    let rx = x as u32;
+    let ry = y as u32;
+    let rw = (w as u32).max(1).min(img.width().saturating_sub(rx));
+    let rh = (h as u32).max(1).min(img.height().saturating_sub(ry));
+
+    let cropped = image::imageops::crop_imm(img, rx, ry, rw, rh).to_image();
+    let crop_region = CropRegion { x: x / fw, y: y / fh, width: w / fw, height: h / fh };
+    (cropped, crop_region)
+}
+
+fn preprocess_movenet(img: &RgbImage) -> Array4<f32> {
+    let resized = image::imageops::resize(img, 192, 192, FilterType::Triangle);
+    let mut tensor = Array4::<f32>::zeros((1, 192, 192, 3));
+    for y in 0..192usize {
+        for x in 0..192usize {
+            let p = resized.get_pixel(x as u32, y as u32);
+            tensor[[0, y, x, 0]] = p[0] as f32;
+            tensor[[0, y, x, 1]] = p[1] as f32;
+            tensor[[0, y, x, 2]] = p[2] as f32;
+        }
+    }
+    tensor
+}
+
+fn preprocess_imagenet_nchw(img: &RgbImage, target_w: u32, target_h: u32) -> (Array4<f32>, LetterboxInfo) {
+    let frame_w = img.width() as f32;
+    let frame_h = img.height() as f32;
+    let tw = target_w as f32;
+    let th = target_h as f32;
+
+    let scale = (tw / frame_w).min(th / frame_h);
+    let new_w = (frame_w * scale).round() as u32;
+    let new_h = (frame_h * scale).round() as u32;
+    let pad_left = (target_w - new_w) / 2;
+    let pad_top = (target_h - new_h) / 2;
+
+    let resized = image::imageops::resize(img, new_w, new_h, FilterType::Triangle);
+
+    // ImageNet mean (RGB): 123.675, 116.28, 103.53 → rounded to u8 for padding
+    let mean_pixel = image::Rgb([124u8, 116u8, 104u8]);
+    let mut padded = RgbImage::from_pixel(target_w, target_h, mean_pixel);
+    image::imageops::overlay(&mut padded, &resized, pad_left as i64, pad_top as i64);
+
+    let mean = [123.675f32, 116.28, 103.53];
+    let inv_std = [1.0 / 58.395f32, 1.0 / 57.12, 1.0 / 57.375];
+    let (w, h) = (target_w as usize, target_h as usize);
+    let mut tensor = Array4::<f32>::zeros((1, 3, h, w));
+    for y in 0..h {
+        for x in 0..w {
+            let p = padded.get_pixel(x as u32, y as u32);
+            tensor[[0, 0, y, x]] = (p[0] as f32 - mean[0]) * inv_std[0];
+            tensor[[0, 1, y, x]] = (p[1] as f32 - mean[1]) * inv_std[1];
+            tensor[[0, 2, y, x]] = (p[2] as f32 - mean[2]) * inv_std[2];
+        }
+    }
+
+    let letterbox = LetterboxInfo {
+        pad_left: pad_left as f32 / tw,
+        pad_top: pad_top as f32 / th,
+        content_width: new_w as f32 / tw,
+        content_height: new_h as f32 / th,
+    };
+    (tensor, letterbox)
+}
+
+// ---------------------------------------------------------------------------
+// Model types + ONNX inference
+// ---------------------------------------------------------------------------
+
 fn build_session(model_path: &str) -> Result<Session> {
     let builder = Session::builder()?
         .with_optimization_level(GraphOptimizationLevel::Level3)?;
@@ -587,10 +671,10 @@ impl PersonDetector {
         Ok(Self { session, input_size })
     }
 
-    fn detect(&mut self, frame: &Mat) -> Result<Option<BBox>> {
-        let frame_w = frame.cols();
-        let frame_h = frame.rows();
-        let input = self.preprocess(frame)?;
+    fn detect(&mut self, frame: &RgbImage) -> Result<Option<BBox>> {
+        let frame_w = frame.width();
+        let frame_h = frame.height();
+        let input = self.preprocess(frame);
         let input_tensor = Tensor::from_array(input)?;
         let outputs = self.session
             .run(ort::inputs!["images" => input_tensor])
@@ -622,28 +706,20 @@ impl PersonDetector {
         }))
     }
 
-    fn preprocess(&self, frame: &Mat) -> Result<Array4<f32>> {
-        let size = self.input_size;
-        let mut rgb = Mat::default();
-        imgproc::cvt_color_def(frame, &mut rgb, imgproc::COLOR_BGR2RGB)?;
-        let mut resized = Mat::default();
-        imgproc::resize(&rgb, &mut resized, Size::new(size, size), 0.0, 0.0, imgproc::INTER_LINEAR)?;
-        let mut float_mat = Mat::default();
-        resized.convert_to(&mut float_mat, CV_32FC3, 1.0, 0.0)?;
-
-        let s = size as usize;
-        let mut tensor = Array4::<f32>::zeros((1, 3, s, s));
-        let data = float_mat.data_bytes()?;
-        let step = float_mat.mat_step().get(0);
-        for y in 0..s {
-            let row_ptr = unsafe { std::slice::from_raw_parts(data.as_ptr().add(y * step) as *const f32, s * 3) };
-            for x in 0..s {
-                for c in 0..3 {
-                    tensor[[0, c, y, x]] = row_ptr[x * 3 + c] / 255.0;
-                }
+    fn preprocess(&self, frame: &RgbImage) -> Array4<f32> {
+        let s = self.input_size as u32;
+        let resized = image::imageops::resize(frame, s, s, FilterType::Triangle);
+        let sz = s as usize;
+        let mut tensor = Array4::<f32>::zeros((1, 3, sz, sz));
+        for y in 0..sz {
+            for x in 0..sz {
+                let p = resized.get_pixel(x as u32, y as u32);
+                tensor[[0, 0, y, x]] = p[0] as f32 / 255.0;
+                tensor[[0, 1, y, x]] = p[1] as f32 / 255.0;
+                tensor[[0, 2, y, x]] = p[2] as f32 / 255.0;
             }
         }
-        Ok(tensor)
+        tensor
     }
 }
 
@@ -1471,20 +1547,17 @@ fn run_inference_loop(
                             }
                         };
 
-                        let buf = Vector::<u8>::from_iter(raw_frame.jpeg_data.iter().copied());
-                        let mat = match imgcodecs::imdecode(&buf, imgcodecs::IMREAD_COLOR) {
-                            Ok(m) if !m.empty() => m,
-                            _ => continue,
+                        let img: RgbImage = match image::load_from_memory(&raw_frame.jpeg_data) {
+                            Ok(dyn_img) => dyn_img.into_rgb8(),
+                            Err(_) => continue,
                         };
 
                         let width = raw_frame.width;
                         let height = raw_frame.height;
 
                         if verbose {
-                            let mat_rows = mat.rows();
-                            let mat_cols = mat.cols();
                             log!(logfile, "[verbose] cam{}: decoded={}x{} (expected {}x{})",
-                                cam_idx, mat_cols, mat_rows, width, height);
+                                cam_idx, img.width(), img.height(), width, height);
                         }
 
                         if width != cam_widths[cam_idx] || height != cam_heights[cam_idx] {
@@ -1503,45 +1576,30 @@ fn run_inference_loop(
                                 {
                                     Some(bbox) => {
                                         if verbose { log!(logfile, "[verbose] cam{}: keypoint crop x={} y={} w={} h={}", cam_idx, bbox.x, bbox.y, bbox.width, bbox.height); }
-                                        match crop_for_pose(&mat, &bbox, width, height) {
-                                            Ok(v) => v,
-                                            Err(_) => (mat.clone(), CropRegion::full()),
-                                        }
+                                        crop_for_pose_img(&img, &bbox, width, height)
                                     }
                                     None => {
                                         if verbose { log!(logfile, "[verbose] cam{}: no keypoint bbox, full frame", cam_idx); }
-                                        (mat.clone(), CropRegion::full())
+                                        (img.clone(), CropRegion::full())
                                     }
                                 }
                             }
                             "yolo" => {
                                 if let Some(ref mut pd) = person_detector {
-                                    match pd.detect(&mat) {
-                                        Ok(Some(bbox)) => match crop_for_pose(&mat, &bbox, width, height) {
-                                            Ok(v) => v,
-                                            Err(_) => (mat.clone(), CropRegion::full()),
-                                        },
-                                        _ => (mat.clone(), CropRegion::full()),
+                                    match pd.detect(&img) {
+                                        Ok(Some(bbox)) => crop_for_pose_img(&img, &bbox, width, height),
+                                        _ => (img.clone(), CropRegion::full()),
                                     }
-                                } else { (mat.clone(), CropRegion::full()) }
+                                } else { (img.clone(), CropRegion::full()) }
                             }
-                            _ => (mat.clone(), CropRegion::full()),
+                            _ => (img.clone(), CropRegion::full()),
                         };
 
                         // Preprocess
                         let (input, letterbox) = match model_type {
-                            ModelType::MoveNet => match preprocess_for_movenet(&input_frame) {
-                                Ok(v) => (v, LetterboxInfo::identity()),
-                                Err(e) => { log!(logfile, "preprocess error: {}", e); continue; }
-                            },
-                            ModelType::SpinePose => match preprocess_for_spinepose(&input_frame) {
-                                Ok(v) => v,
-                                Err(e) => { log!(logfile, "preprocess error: {}", e); continue; }
-                            },
-                            ModelType::RTMW3D => match preprocess_for_rtmw3d(&input_frame) {
-                                Ok(v) => v,
-                                Err(e) => { log!(logfile, "preprocess error: {}", e); continue; }
-                            },
+                            ModelType::MoveNet => (preprocess_movenet(&input_frame), LetterboxInfo::identity()),
+                            ModelType::SpinePose => preprocess_imagenet_nchw(&input_frame, 192, 256),
+                            ModelType::RTMW3D => preprocess_imagenet_nchw(&input_frame, 288, 384),
                         };
 
                         if verbose {
