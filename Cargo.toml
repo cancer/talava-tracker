@@ -33,6 +33,9 @@ futures = "0.3"
 [target.'cfg(target_os = "macos")'.dependencies]
 ort = { version = "2.0.0-rc.9", features = ["coreml"] }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+ort = { version = "2.0.0-rc.9", features = ["directml"] }
+
 [[bin]]
 name = "bench_inference"
 path = "src/bin/bench_inference.rs"

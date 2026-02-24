@@ -382,7 +382,25 @@ fn build_session(model_path: &str) -> Result<Session> {
     #[cfg(feature = "cuda")]
     let builder = {
         eprintln!("[ort] Attempting CUDA execution provider...");
-        builder.with_execution_providers([ort::execution_providers::CUDAExecutionProvider::default().build()])?
+        match builder.with_execution_providers([ort::execution_providers::CUDAExecutionProvider::default().build()]) {
+            Ok(b) => { eprintln!("[ort] CUDA execution provider registered"); b }
+            Err(e) => {
+                eprintln!("[ort] CUDA not available, falling back to CPU: {e}");
+                Session::builder()?.with_optimization_level(GraphOptimizationLevel::Level3)?
+            }
+        }
+    };
+
+    #[cfg(all(target_os = "windows", not(feature = "cuda")))]
+    let builder = {
+        eprintln!("[ort] Attempting DirectML execution provider...");
+        match builder.with_execution_providers([ort::execution_providers::DirectMLExecutionProvider::default().build()]) {
+            Ok(b) => { eprintln!("[ort] DirectML execution provider registered"); b }
+            Err(e) => {
+                eprintln!("[ort] DirectML not available, falling back to CPU: {e}");
+                Session::builder()?.with_optimization_level(GraphOptimizationLevel::Level3)?
+            }
+        }
     };
 
     builder.commit_from_file(model_path).context("Failed to load ONNX model")
