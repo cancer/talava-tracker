@@ -1,7 +1,10 @@
+#[cfg(feature = "imgproc")]
 use anyhow::Result;
+#[cfg(feature = "imgproc")]
 use ndarray::Array4;
+#[cfg(feature = "imgproc")]
 use opencv::{
-    core::{AlgorithmHint, Mat, Scalar, Size, CV_32FC3},
+    core::{Mat, Scalar, Size, CV_32FC3},
     imgproc,
     prelude::*,
 };
@@ -9,6 +12,7 @@ use opencv::{
 use super::keypoint::{Keypoint, KeypointIndex, Pose};
 
 /// MoveNet用の入力サイズ
+#[cfg(feature = "imgproc")]
 pub const MOVENET_INPUT_SIZE: i32 = 192;
 
 /// OpenCV Mat を MoveNet用の入力テンソルに変換
@@ -16,10 +20,11 @@ pub const MOVENET_INPUT_SIZE: i32 = 192;
 /// - BGR -> RGB
 /// - 192x192 にリサイズ
 /// - [1, 192, 192, 3] の f32 テンソルに変換 (0.0-255.0)
+#[cfg(feature = "imgproc")]
 pub fn preprocess_for_movenet(frame: &Mat) -> Result<Array4<f32>> {
     // BGR -> RGB
     let mut rgb = Mat::default();
-    imgproc::cvt_color(frame, &mut rgb, imgproc::COLOR_BGR2RGB, 0, AlgorithmHint::ALGO_HINT_DEFAULT)?;
+    imgproc::cvt_color_def(frame, &mut rgb, imgproc::COLOR_BGR2RGB)?;
 
     // 192x192 にリサイズ
     let mut resized = Mat::default();
@@ -58,11 +63,15 @@ pub fn preprocess_for_movenet(frame: &Mat) -> Result<Array4<f32>> {
 }
 
 /// SpinePose入力サイズ
+#[cfg(feature = "imgproc")]
 pub const SPINEPOSE_INPUT_HEIGHT: i32 = 256;
+#[cfg(feature = "imgproc")]
 pub const SPINEPOSE_INPUT_WIDTH: i32 = 192;
 
 /// RTMW3D入力サイズ
+#[cfg(feature = "imgproc")]
 pub const RTMW3D_INPUT_HEIGHT: i32 = 384;
+#[cfg(feature = "imgproc")]
 pub const RTMW3D_INPUT_WIDTH: i32 = 288;
 
 /// レターボックス情報（推論後にキーポイント座標を元の画像空間に戻すために使用）
@@ -107,6 +116,7 @@ pub fn unletterbox_pose(pose: &Pose, info: &LetterboxInfo) -> Pose {
 /// ImageNet正規化 + NCHW変換の共通処理（レターボックス対応）
 ///
 /// アスペクト比を保持してリサイズし、余白をImageNet平均値で埋める。
+#[cfg(feature = "imgproc")]
 fn preprocess_imagenet_nchw(frame: &Mat, width: i32, height: i32) -> Result<(Array4<f32>, LetterboxInfo)> {
     let frame_w = frame.cols() as f32;
     let frame_h = frame.rows() as f32;
@@ -124,7 +134,7 @@ fn preprocess_imagenet_nchw(frame: &Mat, width: i32, height: i32) -> Result<(Arr
 
     // BGR -> RGB
     let mut rgb = Mat::default();
-    imgproc::cvt_color(frame, &mut rgb, imgproc::COLOR_BGR2RGB, 0, AlgorithmHint::ALGO_HINT_DEFAULT)?;
+    imgproc::cvt_color_def(frame, &mut rgb, imgproc::COLOR_BGR2RGB)?;
 
     // アスペクト比保持リサイズ
     let mut resized = Mat::default();
@@ -197,6 +207,7 @@ fn preprocess_imagenet_nchw(frame: &Mat, width: i32, height: i32) -> Result<(Arr
 /// SpinePose用の入力テンソルに変換
 ///
 /// - BGR -> RGB -> アスペクト比保持リサイズ+レターボックス -> ImageNet正規化 -> NCHW [1, 3, 256, 192]
+#[cfg(feature = "imgproc")]
 pub fn preprocess_for_spinepose(frame: &Mat) -> Result<(Array4<f32>, LetterboxInfo)> {
     preprocess_imagenet_nchw(frame, SPINEPOSE_INPUT_WIDTH, SPINEPOSE_INPUT_HEIGHT)
 }
@@ -204,11 +215,12 @@ pub fn preprocess_for_spinepose(frame: &Mat) -> Result<(Array4<f32>, LetterboxIn
 /// RTMW3D用の入力テンソルに変換
 ///
 /// - BGR -> RGB -> アスペクト比保持リサイズ+レターボックス -> ImageNet正規化 -> NCHW [1, 3, 384, 288]
+#[cfg(feature = "imgproc")]
 pub fn preprocess_for_rtmw3d(frame: &Mat) -> Result<(Array4<f32>, LetterboxInfo)> {
     preprocess_imagenet_nchw(frame, RTMW3D_INPUT_WIDTH, RTMW3D_INPUT_HEIGHT)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "imgproc"))]
 mod tests {
     use super::*;
 

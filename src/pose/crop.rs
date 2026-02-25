@@ -1,4 +1,6 @@
+#[cfg(feature = "imgproc")]
 use anyhow::Result;
+#[cfg(feature = "imgproc")]
 use opencv::{
     core::{Mat, Rect},
     prelude::*,
@@ -84,6 +86,7 @@ pub fn bbox_from_keypoints(
 /// - BBoxを1.25倍に拡張（中心を保持）
 /// - 4:3アスペクト比（h:w = 256:192）に調整
 /// - フレーム境界にクリップ
+#[cfg(feature = "imgproc")]
 pub fn crop_for_pose(
     frame: &Mat,
     bbox: &BBox,

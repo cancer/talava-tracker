@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use ndarray::Array4;
 use opencv::{
-    core::{AlgorithmHint, Mat, Size, CV_32FC3},
+    core::{Mat, Size, CV_32FC3},
     imgproc,
     prelude::*,
 };
@@ -92,13 +92,7 @@ impl PersonDetector {
 
         // BGR -> RGB
         let mut rgb = Mat::default();
-        imgproc::cvt_color(
-            frame,
-            &mut rgb,
-            imgproc::COLOR_BGR2RGB,
-            0,
-            AlgorithmHint::ALGO_HINT_DEFAULT,
-        )?;
+        imgproc::cvt_color_def(frame, &mut rgb, imgproc::COLOR_BGR2RGB)?;
 
         // input_size x input_size にリサイズ
         let mut resized = Mat::default();

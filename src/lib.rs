@@ -1,7 +1,11 @@
+#[cfg(feature = "desktop")]
 pub mod calibration;
+#[cfg(feature = "desktop")]
 pub mod camera;
 pub mod config;
 pub mod pose;
+pub mod protocol;
+#[cfg(feature = "desktop")]
 pub mod render;
 pub mod tracker;
 pub mod triangulation;
