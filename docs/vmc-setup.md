@@ -15,32 +15,44 @@
 | 1     | 左足 | VMT_1           |
 | 2     | 右足 | VMT_2           |
 | 3     | 胸   | VMT_3           |
-
-※ 現在は腰（VMT_0）のみ実装済み
+| 4     | 左膝 | VMT_4           |
+| 5     | 右膝 | VMT_5           |
 
 ## 手順
 
-### 1. talava-tracker を起動
+### 1. inference_server を起動
+
+Windows 側で実行:
+
+```bash
+inference_server.exe
+```
+
+設定は `inference_server.toml` で管理。`vmt_addr` にVMTの受信アドレスを設定（デフォルト: 127.0.0.1:39570）。
+
+### 2. camera_server を起動
 
 Mac 側で実行:
 
 ```bash
-VMT_ADDR=<WindowsのIP>:39570 cargo run --release --bin tracker_sender
+cargo run --release --bin camera_server
 ```
 
-### 2. VMT で受信確認
+設定は `camera_server.toml` で管理。`server_addr` にWindows側のIPとポートを設定。
+
+### 3. VMT で受信確認
 
 VMT のウィンドウでトラッカーが認識されていることを確認。
 
-### 3. SteamVR でトラッカー確認
+### 4. SteamVR でトラッカー確認
 
-SteamVR のデバイス一覧に VMT_0 が表示されることを確認。
+SteamVR のデバイス一覧に VMT_0 〜 VMT_5 が表示されることを確認。
 
-### 4. VMC でトラッカー割当
+### 5. VMC でトラッカー割当
 
 1. VMC を起動
 2. 設定 → トラッカー割当
-3. 腰 → VMT_0 を選択
+3. 腰 → VMT_0、左足 → VMT_1、右足 → VMT_2、胸 → VMT_3 を選択
 4. 適用
 
 ## トラブルシューティング
@@ -49,9 +61,15 @@ SteamVR のデバイス一覧に VMT_0 が表示されることを確認。
 
 - VMT が起動しているか確認
 - ファイアウォールで UDP 39570 が許可されているか確認
-- talava-tracker の `Sent:` が 0 でないか確認
+- inference_server のログでVMT送信が行われているか確認
+
+### camera_server が接続できない
+
+- inference_server が先に起動しているか確認
+- ファイアウォールで TCP 9000 が許可されているか確認
+- `camera_server.toml` の `server_addr` が正しいか確認
 
 ### 位置がずれる
 
-- キャリブレーションが必要（フェーズ3で実装予定）
-- スケール調整が必要な場合あり
+- ポーズキャリブレーションが必要（コンソールで `c + Enter`、または自動発動を待つ）
+- `inference_server.toml` の `offset_y` で高さを調整

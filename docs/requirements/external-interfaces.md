@@ -149,11 +149,11 @@ macOS上でApple Neural Engine/GPUを使用した推論高速化。`coreml`フ�
 opencv = { version = "0.93", features = ["videoio", "imgproc", "imgcodecs", "aruco", "calib3d", "objdetect"] }
 ```
 
-### カメラキャプチャ (videoio)
+### カメラキャプチャ (videoio) — camera_server
 
 - バックエンド: `CAP_AVFOUNDATION`（macOS専用）
 - 設定: FPS=60, バッファサイズ=1
-- 解像度: 640x480（単眼）/ 1920x1080（複眼時の一部カメラ）
+- 解像度: カメラ依存（1760x1328 / 1920x1440 / 1920x1080）
 
 ### キャリブレーション (aruco + calib3d)
 
@@ -163,30 +163,48 @@ opencv = { version = "0.93", features = ["videoio", "imgproc", "imgcodecs", "aru
 - 外部パラメータ: `calib3d::solve_pnp(SOLVEPNP_ITERATIVE)`
 - 歪み補正: radial(k1,k2,k3) + tangential(p1,p2)
 
-## EI-05: Bevy ECS
+## EI-05: TCPプロトコル（camera_server ↔ inference_server）
 
 ### 使用クレート
 
 ```toml
-bevy = { version = "0.15", default-features = false }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bincode = "1"
+bytes = "1"
+futures = "0.3"
 ```
 
-ウィンドウ・レンダリング機能は無効。ECSフレームワークとしてのみ使用。
+### フレーミング
 
-### 利用パターン
+`tokio_util::codec::LengthDelimitedCodec` で長さプレフィクスフレーミング。最大フレーム長16MB。
 
-- `ScheduleRunnerPlugin::run_loop(frame_duration)`: 固定間隔ループ
-- Resource: 状態管理（CameraInputs, PoseState, TrackerState, VmtSender等）
-- NonSendResource: スレッド非安全リソース（DebugView/minifb）
-- System chain: `.chain()`で実行順序を保証
+### メッセージ型
 
-### システム実行順
+```rust
+/// Mac → Win
+enum ClientMessage {
+    CameraCalibration { data: CalibrationData },
+    FrameSet { timestamp_us: u64, frames: Vec<Frame> },
+    TriggerPoseCalibration,
+}
 
+/// Win → Mac
+enum ServerMessage {
+    CameraCalibrationAck { ok: bool, error: Option<String> },
+    Ready,
+    LogData { filename: String, data: Vec<u8> },
+}
 ```
-send_frames_system → receive_results_system → triangulate_system
-→ calibration_system → compute_trackers_system → send_vmt_system → fps_system
-→ debug_view_system
-```
+
+### 接続シーケンス
+
+1. Win: TCPサーバー起動（デフォルト 0.0.0.0:9000）
+2. Mac→Win: TCP接続
+3. Mac→Win: `CameraCalibration` 送信
+4. Win→Mac: `CameraCalibrationAck` 応答
+5. Win→Mac: `Ready` 送信
+6. Mac: フレームストリーミング開始
 
 ## EI-06: One Euro Filter
 
@@ -249,12 +267,15 @@ filtered = alpha * current + (1-alpha) * previous
 | anyhow | 1.0 | エラーハンドリング |
 | ort | 2.0.0-rc.9 | ONNX Runtime推論 |
 | ndarray | 0.17 | テンソル操作 |
-| opencv | 0.93 | カメラ・画像処理・キャリブレーション |
-| minifb | 0.27 | デバッグウィンドウ |
-| bevy | 0.15 | ECSフレームワーク |
+| opencv | 0.93 | カメラ・画像処理・キャリブレーション（camera_server） |
+| image | 0.25 | JPEG展開（inference_server） |
 | nalgebra | 0.33 | 線形代数（三角測量SVD） |
-| signal-hook | 0.4.3 | UNIXシグナル処理 |
-| toml | 0.9.11 | config.toml解析 |
+| tokio | 1 | 非同期ランタイム（TCP通信） |
+| tokio-util | 0.7 | LengthDelimitedCodec |
+| bincode | 1 | バイナリシリアライズ |
+| bytes | 1 | バイトバッファ |
+| futures | 0.3 | 非同期ストリーム |
+| toml | 0.9.11 | 設定ファイル解析 |
 | serde | 1.0.228 | シリアライズ |
 | serde_json | 1.0 | JSON処理 |
 | chrono | 0.4.43 | 日時操作 |

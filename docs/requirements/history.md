@@ -1,6 +1,6 @@
 # 開発経緯・要求変遷
 
-開発期間: 2026-02-06 ~ 2026-02-16（約11日間）。全42コミット。ブランチはmainのみ。GitHub Issue/PRは未使用。
+開発期間: 2026-02-06 ~。GitHub Issue/PRで管理。
 
 ## タイムライン
 
@@ -110,6 +110,22 @@
 - 足トラッカーのジャンプ抑制
 - ankleベースにkneeフォールバック
 
+### 2026-02-23 ~ 02-25: camera_server + inference_server 分離構成
+
+**コミット（PR #47）**:
+- `src/protocol.rs` TCP通信プロトコル（bincode + LengthDelimitedCodec）
+- `src/bin/camera_server.rs` Mac側バイナリ
+- `src/bin/inference_server.rs` Win側バイナリ
+
+**要求**:
+- 「Mac側の推論負荷をなくし、Win側でGPU推論を可能にしたい」
+- カメラ入力（Mac）と推論（Win）を別マシンに分離
+- camera_server: カメラキャプチャ → JPEG圧縮 → TCP送信
+- inference_server: TCP受信 → JPEG展開 → ONNX推論(DirectML) → 三角測量 → トラッカー → VMT送信
+- Bevyなし（パイプラインが線形のためECSのメリットが薄い）
+
+**影響**: アーキテクチャの大幅変更。inference_serverはBevy非依存の素の関数チェーン + スレッド構成。
+
 ## ユーザーの要求の本質的な変遷
 
 ```
@@ -125,6 +141,8 @@ Phase 6:   「速くしろ」（1fps→60fps+補間90fps）
    ↓
 三角測量:  「奥行きを正確にしろ」（単眼→複眼三角測量）
    ↓
+分離構成:  「GPUで推論しろ」（Mac+Win分離、camera_server+inference_server）
+   ↓
 現在:     「安定させろ」（z値ドリフト、キーポイント欠落、消失）
 ```
 
@@ -134,4 +152,4 @@ Phase 6:   「速くしろ」（1fps→60fps+補間90fps）
 2. **CoreMLはハングする**: macOSのCoreMLは利用可能だが一部モデルでハング。無効化が安全。
 3. **One Euro Filterの.clone() vs .take()**: 毎フレーム`.clone()`でデータ供給→75Hz, alpha≈0.11（強い平滑化、安定）。`.take()`だと25Hz, alpha≈0.28（不安定）。
 4. **キーポイント毎にカメラペアを変えるとz軸ノイズ**: Hip基準ペア固定で解決。
-5. **calibration_fileの有無でモードが変わる**: 設定不整合でトラッカーが大暴れした前例あり。
+5. **分離構成でシンプル化**: パイプラインが線形のためBevy ECS不要。素の関数チェーン+スレッドで十分。
