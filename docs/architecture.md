@@ -218,6 +218,18 @@ BodyTrackerの基準姿勢設定。Win側で実行（三角測量後の3D座標�
 - R: Rodriguesベクトルから回転行列に変換
 - t: 並進ベクトル
 
+### 歪み補正の現状
+
+**現在、全カメラの歪み補正が無効化されている**（dist_coeffs=[0;5]に上書き）。
+
+2D観測は歪んだ画像上の座標だが、射影行列Pは歪みなしの座標系で定義されている。この座標系不一致がリプロジェクションエラーの主因（cam0で145-177px、cam2で1700-3300px）。
+
+無効化の経緯: cam2のdist_coeffs（k2=11.5, k3=-49.9）が極端でundistort_point()のNewton-Raphson法が収束しないため、全カメラ巻き添えで無効化された。
+
+### 三角測量の診断（TriangulationDiag）
+
+`triangulate_poses()`は`(Pose, TriangulationDiag)`を返す。問題フレーム（ref_pair=NONE, z-jump棄却, kps=0, boundary棄却）を自動的にログファイルに出力する。
+
 ## トラッカー
 
 ### index割り当て
@@ -235,11 +247,12 @@ BodyTrackerの基準姿勢設定。Win側で実行（三角測量後の3D座標�
 
 | フィルタ | 閾値 | 対象 |
 |----------|------|------|
-| 速度外れ値除去 | MAX_DISPLACEMENT | 前フレームからの3D距離 |
-| hip-四肢距離 | MAX_LIMB_DIST | 四肢のhipからの距離 |
+| sanitize_pose | 境界2% | 画像端のキーポイントをconfidence=0に（四肢XY, 腰Xのみ） |
+| 速度外れ値除去 | MAX_DISPLACEMENT=0.15 | フィルタ前の生位置(last_raw_poses)との3D距離。連続5回拒否でリセット |
+| hip-四肢距離 | MAX_LIMB_DIST=1.5 | 四肢のhipからの2D距離 |
 | 左右同一位置 | dist<0.05 | 左右が同位置なら両方None |
 | ステールデータ | 0.3秒 | 更新なしでlast_posesクリア＋フィルタリセット |
-| One Euro Filter | config | 位置・回転の平滑化 |
+| One Euro Filter | config.filter | 位置・回転の平滑化（下半身は専用パラメータ） |
 
 ### 補間モード（pose_3dがないフレーム）
 
@@ -301,7 +314,6 @@ inference_server.toml の `interpolation_mode` で設定。
 |-------------|------|
 | VMT | OSC → SteamVRトラッカー |
 | SteamVR | VRランタイム |
-| バーチャルモーションキャプチャー | アバター表示 |
 | Beat Saber | ゲーム |
 
 ## 推論モデル
@@ -317,9 +329,10 @@ inference_server.toml の `model` で設定。
 
 ## 現在のカメラ構成
 
-- カメラ0: index=0, 1760x1328（基準カメラ）
-- カメラ2: index=2, 1920x1440
-- カメラ3: index=3, 1920x1080（上方から見下ろし角度）
+- カメラ0: index=0, 1760x1328, fx=1567（基準カメラ、rvec/tvec=0）
+- カメラ2: index=2, 1920x1440, fx=1765（歪み係数が極端: k2=11.5, k3=-49.9）
+- カメラ3: index=3, 1920x1080, fx=1521（上方見下ろし角度、最も広角）
+- キャリブレーション再投影誤差: cam0=0.20px, cam2=0.13px, cam3=0.38px
 
 ## 制約・前提
 
