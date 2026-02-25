@@ -78,7 +78,7 @@ struct FilterConfig {
 }
 
 fn default_pos_min_cutoff() -> f32 { 1.5 }
-fn default_pos_beta() -> f32 { 0.3 }
+fn default_pos_beta() -> f32 { 1.5 }
 fn default_rot_min_cutoff() -> f32 { 1.0 }
 fn default_rot_beta() -> f32 { 0.01 }
 
@@ -936,6 +936,7 @@ struct BodyCalibration {
     yaw_left_knee: f32, yaw_right_knee: f32,
     pitch_left_knee: f32, pitch_right_knee: f32,
     tilt_angle: f32,
+    camera_yaw: f32,
 }
 
 struct BodyTracker {
@@ -982,27 +983,34 @@ impl BodyTracker {
         f32::atan2(lower_z - hip_z, lower_y - hip_y)
     }
 
+    fn rotate_pose_xz(pose: &Pose, yaw: f32) -> Pose {
+        let (sin_y, cos_y) = yaw.sin_cos();
+        let mut rotated = pose.clone();
+        for kp in rotated.keypoints.iter_mut() {
+            let x = kp.x;
+            let z = kp.z;
+            kp.x = x * cos_y + z * sin_y;
+            kp.z = -x * sin_y + z * cos_y;
+        }
+        rotated
+    }
+
     fn rotate_pose_yz(pose: &Pose, tilt: f32) -> Pose {
         let (sin_t, cos_t) = tilt.sin_cos();
-        let lh = pose.get_by_index(KP_LEFT_HIP);
-        let rh = pose.get_by_index(KP_RIGHT_HIP);
-        let ref_z = if lh.is_valid(BODY_CONFIDENCE_THRESHOLD) && rh.is_valid(BODY_CONFIDENCE_THRESHOLD) {
-            (lh.z + rh.z) / 2.0
-        } else { 0.0 };
-
         let mut rotated = pose.clone();
         for kp in rotated.keypoints.iter_mut() {
             let y = kp.y;
             let z = kp.z;
-            kp.y = y * cos_t + ref_z * sin_t;
+            kp.y = y * cos_t + z * sin_t;
             kp.z = -y * sin_t + z * cos_t;
         }
         rotated
     }
 
-    fn calibrate(&mut self, pose: &Pose) -> bool {
-        let tilt_angle = Self::compute_tilt_angle(pose);
-        let rotated = Self::rotate_pose_yz(pose, tilt_angle);
+    fn calibrate(&mut self, pose: &Pose, camera_yaw: f32) -> bool {
+        let yaw_corrected = Self::rotate_pose_xz(pose, camera_yaw);
+        let tilt_angle = Self::compute_tilt_angle(&yaw_corrected);
+        let rotated = Self::rotate_pose_yz(&yaw_corrected, tilt_angle);
         let pose = &rotated;
 
         let lh = pose.get_by_index(KP_LEFT_HIP);
@@ -1034,11 +1042,19 @@ impl BodyTracker {
             yaw_left_knee, yaw_right_knee,
             pitch_left_knee, pitch_right_knee,
             tilt_angle,
+            camera_yaw,
         });
         true
     }
 
     fn compute(&self, pose: &Pose) -> BodyPoses {
+        let yaw = self.calibration.as_ref().map_or(0.0, |c| c.camera_yaw);
+        let yaw_corrected;
+        let pose = if yaw.abs() > 0.001 {
+            yaw_corrected = Self::rotate_pose_xz(pose, yaw);
+            &yaw_corrected
+        } else { pose };
+
         let tilt = self.calibration.as_ref().map_or(0.0, |c| c.tilt_angle);
         let rotated;
         let pose = if tilt.abs() > 0.001 {
@@ -1400,6 +1416,7 @@ fn run_inference_loop(
     let mut body_tracker = BodyTracker::new(config.mirror_x, config.offset_y, config.foot_y_offset);
     let mut filters: [PoseFilter; TRACKER_COUNT] = make_filters(&config.filter);
     let mut last_poses: [Option<TrackerPose>; TRACKER_COUNT] = [None; TRACKER_COUNT];
+    let mut last_raw_poses: [Option<TrackerPose>; TRACKER_COUNT] = [None; TRACKER_COUNT];
     let mut last_update_times: [Instant; TRACKER_COUNT] = [Instant::now(); TRACKER_COUNT];
     let mut stale: [bool; TRACKER_COUNT] = [false; TRACKER_COUNT];
     let mut reject_count: [u32; TRACKER_COUNT] = [0; TRACKER_COUNT];
@@ -1415,6 +1432,7 @@ fn run_inference_loop(
     let mut first_hip_time: Option<Instant> = None;
     let mut last_hip_time: Option<Instant> = None;
     let mut recent_hip_z: Vec<f32> = Vec::new();
+    let mut yaw_samples: Vec<f32> = Vec::new();
 
     // FPS
     let mut fps_frame_count: u32 = 0;
@@ -1437,6 +1455,7 @@ fn run_inference_loop(
         // Check console triggers
         if trigger_calibration.swap(false, Ordering::Relaxed) && calibrated && cal_deadline.is_none() {
             cal_deadline = Some(Instant::now() + Duration::from_secs(5));
+            yaw_samples.clear();
             log!(logfile, "Calibration in 5s... (console)");
         }
         if trigger_log_send.swap(false, Ordering::Relaxed) {
@@ -1513,6 +1532,7 @@ fn run_inference_loop(
                     body_tracker = BodyTracker::new(config.mirror_x, config.offset_y, config.foot_y_offset);
                     filters = make_filters(&config.filter);
                     last_poses = [None; TRACKER_COUNT];
+                    last_raw_poses = [None; TRACKER_COUNT];
                     last_update_times = [Instant::now(); TRACKER_COUNT];
                     stale = [false; TRACKER_COUNT];
                     reject_count = [0; TRACKER_COUNT];
@@ -1751,6 +1771,7 @@ fn run_inference_loop(
                 TcpEvent::TriggerPoseCalibration if calibrated => {
                     if cal_deadline.is_none() {
                         cal_deadline = Some(Instant::now() + Duration::from_secs(5));
+                        yaw_samples.clear();
                         log!(logfile, "Calibration in 5s...");
                     }
                 }
@@ -1762,16 +1783,23 @@ fn run_inference_loop(
 
         // --- Auto-calibration ---
         if !auto_cal_triggered && !body_tracker.is_calibrated() && cal_deadline.is_none() {
-            let hip_z = pose_3d.as_ref().and_then(|p| {
+            let hip_data = pose_3d.as_ref().and_then(|p| {
                 let lh = p.get_by_index(KP_LEFT_HIP);
                 let rh = p.get_by_index(KP_RIGHT_HIP);
-                if lh.is_valid(BODY_CONFIDENCE_THRESHOLD) && rh.is_valid(BODY_CONFIDENCE_THRESHOLD) { Some((lh.z + rh.z) / 2.0) } else { None }
+                if lh.is_valid(BODY_CONFIDENCE_THRESHOLD) && rh.is_valid(BODY_CONFIDENCE_THRESHOLD) {
+                    let hz = (lh.z + rh.z) / 2.0;
+                    let dx = lh.x - rh.x;
+                    let dz = lh.z - rh.z;
+                    let yaw = if dx.abs() > 0.05 { Some(f32::atan2(dz, dx)) } else { None };
+                    Some((hz, yaw))
+                } else { None }
             });
-            if let Some(z) = hip_z {
+            if let Some((z, yaw_opt)) = hip_data {
                 let now = Instant::now();
-                if first_hip_time.is_none() { first_hip_time = Some(now); recent_hip_z.clear(); }
+                if first_hip_time.is_none() { first_hip_time = Some(now); recent_hip_z.clear(); yaw_samples.clear(); }
                 last_hip_time = Some(now);
                 recent_hip_z.push(z);
+                if let Some(y) = yaw_opt { yaw_samples.push(y); }
                 if now.duration_since(first_hip_time.unwrap()).as_secs_f32() > 3.0 {
                     let n = recent_hip_z.len() as f32;
                     let mean = recent_hip_z.iter().sum::<f32>() / n;
@@ -1783,22 +1811,49 @@ fn run_inference_loop(
                         log!(logfile, "Auto-calibration triggered (hip z stable: mean={:.2}, std={:.2}, n={})", mean, std_dev, recent_hip_z.len());
                     } else {
                         log!(logfile, "Auto-cal rejected: hip z unstable (mean={:.2}, std={:.2}, n={})", mean, std_dev, recent_hip_z.len());
-                        first_hip_time = None; recent_hip_z.clear();
+                        first_hip_time = None; recent_hip_z.clear(); yaw_samples.clear();
                     }
                 }
             } else {
                 let gap = last_hip_time.map_or(f32::MAX, |t| Instant::now().duration_since(t).as_secs_f32());
-                if gap > 0.5 { first_hip_time = None; last_hip_time = None; recent_hip_z.clear(); }
+                if gap > 0.5 { first_hip_time = None; last_hip_time = None; recent_hip_z.clear(); yaw_samples.clear(); }
+            }
+        }
+
+        // --- Yaw sample accumulation during countdown ---
+        if let Some(deadline) = cal_deadline {
+            if !deadline.saturating_duration_since(Instant::now()).is_zero() {
+                if let Some(ref pose) = pose_3d {
+                    let lh = pose.get_by_index(KP_LEFT_HIP);
+                    let rh = pose.get_by_index(KP_RIGHT_HIP);
+                    if lh.is_valid(BODY_CONFIDENCE_THRESHOLD) && rh.is_valid(BODY_CONFIDENCE_THRESHOLD) {
+                        let dx = lh.x - rh.x;
+                        let dz = lh.z - rh.z;
+                        if dx.abs() > 0.05 {
+                            yaw_samples.push(f32::atan2(dz, dx));
+                        }
+                    }
+                }
             }
         }
 
         // --- Manual calibration deadline ---
         if let Some(deadline) = cal_deadline {
             if deadline.saturating_duration_since(Instant::now()).is_zero() {
+                // Compute median yaw from accumulated samples
+                let camera_yaw = if yaw_samples.len() >= 10 {
+                    yaw_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    yaw_samples[yaw_samples.len() / 2]
+                } else {
+                    0.0
+                };
+                yaw_samples.clear();
+
                 if let Some(ref pose) = pose_3d {
-                    if body_tracker.calibrate(pose) {
+                    if body_tracker.calibrate(pose, camera_yaw) {
                         filters = make_filters(&config.filter);
                         last_poses = [None; TRACKER_COUNT];
+                        last_raw_poses = [None; TRACKER_COUNT];
                         // Send reset signal to VMT loop (all-None result)
                         let now = Instant::now();
                         let _ = result_tx.try_send(InferenceResult {
@@ -1809,7 +1864,13 @@ fn run_inference_loop(
                             infer_done_at: now,
                             result_sent_at: now,
                         });
-                        log!(logfile, "Calibrated!");
+                        if let Some(ref cal) = body_tracker.calibration {
+                            log!(logfile, "Calibrated! yaw={:.1}deg tilt={:.1}deg (yaw_samples={})",
+                                cal.camera_yaw.to_degrees(), cal.tilt_angle.to_degrees(),
+                                if camera_yaw.abs() > 0.001 { "used" } else { "insufficient" });
+                        } else {
+                            log!(logfile, "Calibrated!");
+                        }
                     } else {
                         log!(logfile, "Calibration failed: hip not detected");
                     }
@@ -1861,7 +1922,7 @@ fn run_inference_loop(
                 for i in 0..TRACKER_COUNT {
                     let mut accepted = false;
                     if let Some(p) = poses[i] {
-                        let (velocity_ok, displacement) = match last_poses[i].as_ref() {
+                        let (velocity_ok, displacement) = match last_raw_poses[i].as_ref() {
                             Some(last) => {
                                 let dx = p.position[0] - last.position[0];
                                 let dy = p.position[1] - last.position[1];
@@ -1912,7 +1973,7 @@ fn run_inference_loop(
                         } else if !velocity_ok && limb_ok {
                             reject_count[i] += 1;
                             if reject_count[i] >= 5 {
-                                let z_ok = match last_poses[i].as_ref() {
+                                let z_ok = match last_raw_poses[i].as_ref() {
                                     Some(last) => (p.position[2] - last.position[2]).abs() <= 0.3,
                                     None => true,
                                 };
@@ -1931,6 +1992,8 @@ fn run_inference_loop(
                                 }
                             }
                         }
+                        // Always update last_raw_poses regardless of accept/reject
+                        last_raw_poses[i] = Some(p);
                     }
                     if !accepted && last_poses[i].is_some() {
                         let stale_time = now.duration_since(last_update_times[i]).as_secs_f32();
@@ -2616,7 +2679,7 @@ mod tests {
     fn test_body_calibrate_and_compute() {
         let mut bt = BodyTracker::new(false, 0.0, 0.0);
         let calibration_pose = standing_pose();
-        assert!(bt.calibrate(&calibration_pose), "calibration should succeed");
+        assert!(bt.calibrate(&calibration_pose, 0.0), "calibration should succeed");
         assert!(bt.is_calibrated());
 
         // Compute with the same pose as calibration: all positions should be ~0
@@ -2633,7 +2696,7 @@ mod tests {
     fn test_body_calibrate_shifts_position() {
         let mut bt = BodyTracker::new(false, 0.0, 0.0);
         let calibration_pose = standing_pose();
-        bt.calibrate(&calibration_pose);
+        bt.calibrate(&calibration_pose, 0.0);
 
         // Shifted pose: person moved right by 0.1
         let shifted = make_pose(&[
@@ -2661,7 +2724,7 @@ mod tests {
             (KP_LEFT_SHOULDER,  0.42, 0.30, 0.0, 0.9),
             (KP_RIGHT_SHOULDER, 0.58, 0.30, 0.0, 0.9),
         ]);
-        assert!(!bt.calibrate(&pose), "calibrate should fail without hips");
+        assert!(!bt.calibrate(&pose, 0.0), "calibrate should fail without hips");
         assert!(!bt.is_calibrated());
     }
 
@@ -2700,7 +2763,7 @@ mod tests {
             (KP_LEFT_ANKLE, 0.43, 0.80, 2.0, 0.9),
             (KP_RIGHT_ANKLE, 0.57, 0.80, 2.0, 0.9),
         ]);
-        bt.calibrate(&cal_pose);
+        bt.calibrate(&cal_pose, 0.0);
 
         // Same pose → z should be 0 (ref_z - current_z = 2.0 - 2.0 = 0)
         let result = bt.compute(&cal_pose);
