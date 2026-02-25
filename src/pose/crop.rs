@@ -1,11 +1,3 @@
-#[cfg(feature = "imgproc")]
-use anyhow::Result;
-#[cfg(feature = "imgproc")]
-use opencv::{
-    core::{Mat, Rect},
-    prelude::*,
-};
-
 use super::keypoint::{Keypoint, KeypointIndex, Pose};
 
 /// クロップ領域（正規化座標 0.0〜1.0）
@@ -79,67 +71,6 @@ pub fn bbox_from_keypoints(
         width: max_x - min_x,
         height: max_y - min_y,
     })
-}
-
-/// BBoxからクロップ領域を計算し、フレームからクロップ
-///
-/// - BBoxを1.25倍に拡張（中心を保持）
-/// - 4:3アスペクト比（h:w = 256:192）に調整
-/// - フレーム境界にクリップ
-#[cfg(feature = "imgproc")]
-pub fn crop_for_pose(
-    frame: &Mat,
-    bbox: &BBox,
-    frame_w: u32,
-    frame_h: u32,
-) -> Result<(Mat, CropRegion)> {
-    // 1.25倍に拡張（中心を保持）
-    let expand = 1.25;
-    let cx = bbox.x + bbox.width / 2.0;
-    let cy = bbox.y + bbox.height / 2.0;
-    let mut w = bbox.width * expand;
-    let mut h = bbox.height * expand;
-
-    // 4:3アスペクト比に調整（h:w = 4:3）
-    let target_ratio = 4.0 / 3.0; // height / width
-    let current_ratio = h / w;
-    if current_ratio < target_ratio {
-        // 横長 → 高さを増やす
-        h = w * target_ratio;
-    } else {
-        // 縦長 → 幅を増やす
-        w = h / target_ratio;
-    }
-
-    // 左上座標
-    let mut x = cx - w / 2.0;
-    let mut y = cy - h / 2.0;
-
-    // フレーム境界にクリップ
-    let fw = frame_w as f32;
-    let fh = frame_h as f32;
-    x = x.max(0.0);
-    y = y.max(0.0);
-    w = w.min(fw - x);
-    h = h.min(fh - y);
-
-    // 整数座標に変換（Rect用）
-    let rx = x as i32;
-    let ry = y as i32;
-    let rw = (w as i32).max(1);
-    let rh = (h as i32).max(1);
-
-    let roi = Rect::new(rx, ry, rw, rh);
-    let cropped = Mat::roi(frame, roi)?;
-
-    let crop_region = CropRegion {
-        x: x / fw,
-        y: y / fh,
-        width: w / fw,
-        height: h / fh,
-    };
-
-    Ok((cropped.try_clone()?, crop_region))
 }
 
 /// SpinePose出力座標（クロップ画像内の正規化座標）をフレーム全体の正規化座標に変換

@@ -14,8 +14,7 @@ cargo run --bin camera_server     # Mac側: カメラキャプチャ + TCP送信
 cargo run --bin inference_server  # Win側: 推論 + 三角測量 + VMT送信
 
 # ツール
-cargo run --bin calibrate    # カメラキャリブレーション
-cargo run --bin camera_view  # 画角調整（カメラ映像グリッド表示）
+cargo run --bin camera_probe  # カメラデバイス検出
 ```
 
 ## What This Project Does
@@ -34,11 +33,8 @@ Mac (camera_server) --TCP:9000--> Windows (inference_server) --OSC/UDP:39570--> 
 
 - `protocol` - camera_server ↔ inference_server 間のTCPプロトコル（bincode + LengthDelimitedCodec）
 - `vmt` - VMTへのOSC送信。`/VMT/Room/Unity`アドレスでトラッカーの位置(x,y,z)と回転(quaternion)を送信
-- `calibration` - ChArUcoボードによるカメラキャリブレーション
-- `triangulation` - DLT三角測量による3Dポーズ再構成
-- `tracker/body` - 骨格キーポイントからトラッカー位置・回転を算出
-- `camera` - ThreadedCameraによるバックグラウンドフレーム取り込み
-- `pose` - ONNX推論、前処理、人物検出
+- `triangulation` - DLT三角測量（CameraParams, triangulate_point, reprojection_error）
+- `pose` - キーポイント定義、クロップ領域、レターボックス補正
 
 ### Data Flow
 
