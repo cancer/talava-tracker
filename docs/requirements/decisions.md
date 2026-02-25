@@ -22,13 +22,15 @@
 
 **決定**: Beat Saber ModであるNaluluna Avatarsを最終表示先とする。
 
-### DEC-01-4: Bevy ECSへの移行
+### DEC-01-4: camera_server + inference_server 分離構成
 
-**決定**: 独自のメインループからBevy ECSベースに移行。
+**決定**: カメラ入力（Mac）と推論（Win）を別マシン・別バイナリに分離。
 
-**理由**: マルチカメラ三角測量導入に伴い、システム間の依存管理が複雑化。ECSで明示的に管理。
+**理由**: Mac側の推論負荷をなくし、Win側でGPU推論（DirectML）を可能にする。パイプラインが線形のためBevy ECSのメリットが薄く、素の関数チェーン + スレッドで構成。
 
-**結果**: tracker_sender等の旧コードは破棄。
+**結果**: camera_server（Mac: カメラ + TCP送信）、inference_server（Win: 推論 + 三角測量 + VMT送信）の2バイナリ。TCP（bincode + LengthDelimitedCodec）で通信。
+
+**時期**: 2026-02-23
 
 ## DEC-02: モデル選定
 

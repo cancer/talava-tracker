@@ -24,8 +24,8 @@
 
 ## システム概要
 
-Beat Saber撮影用のSteamVR仮想トラッカーシステム。Mac上で複数カメラから人体姿勢をリアルタイム推定し、6つのトラッカー（腰・左足・右足・胸・左膝・右膝）の位置・回転データをOSC/UDP経由でVMT(Virtual Motion Tracker)に送信する。最終的なアバター表示先はVMC（バーチャルモーションキャプチャー）。
+Beat Saber撮影用のSteamVR仮想トラッカーシステム。Mac上でカメラ映像をキャプチャし（camera_server）、TCP経由でWindows側（inference_server）に送信。Windows側でONNX推論（GPU）・DLT三角測量を行い、6つのトラッカー（腰・左足・右足・胸・左膝・右膝）の位置・回転データをOSC/UDP経由でVMT(Virtual Motion Tracker)に送信する。最終的なアバター表示先はVMC（バーチャルモーションキャプチャー）。
 
 ```
-Mac (カメラ) → 姿勢推定(ONNX) → [三角測量] → トラッカー算出 → 平滑化 → OSC/UDP → Windows (VMT → SteamVR → VMC)
+Mac (camera_server: カメラ + JPEG圧縮) → TCP → Windows (inference_server: 推論 + 三角測量 + トラッカー) → OSC/UDP → VMT → SteamVR → VMC
 ```

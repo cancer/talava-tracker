@@ -4,10 +4,9 @@
 
 ### NFR-01-1: フレームレート
 
-- VMTへの送信レート: 90FPS目標（config.toml `app.target_fps = 90`）
-- 推論FPS: カメラFPS（30）に律速。推論~33ms/フレーム
+- VMTへの送信レート: 90FPS目標
+- 推論FPS: カメラFPS（30）に律速
 - 補間で推論とVMT送信のレート差を埋める
-- Bevy ScheduleRunnerPluginで固定間隔ループ
 
 ### NFR-01-2: 推論遅延
 
@@ -34,7 +33,7 @@
 
 ### NFR-02-2: ポーズ検出信頼度
 
-- 信頼度閾値: 0.3（複眼）/ 0.2（単眼）
+- 信頼度閾値: 0.3
 - モデル依存で変動
 
 ### NFR-02-3: 位置精度の目標
@@ -89,23 +88,24 @@
 
 ### NFR-04-4: ビルド・起動
 
-- `cargo build` / `cargo run` のみで起動可能
+- Mac側: `cargo run --bin camera_server`
+- Win側: `cargo run --bin inference_server`（またはリリースバイナリ）
 - 外部サービス依存なし（ONNX Runtimeは同梱）
-- macOS専用（AVFoundationバックエンド）
+- Mac側: macOS（AVFoundationバックエンド）
+- Win側: Windows（DirectML GPU推論）
 
 ## NFR-05: 保守性
 
 ### NFR-05-1: モジュール分離
 
 - カメラキャプチャ、姿勢推定、三角測量、トラッカー算出、VMT送信が独立モジュール
-- Bevy ECSでシステム間の依存を明示的に管理
+- camera_server / inference_server の2バイナリに分離
 
 ### NFR-05-2: モデル切り替え
 
 - config.toml `app.model`で推論モデルを切り替え可能
 - 新モデル追加はdetector.rsとpreprocess.rsへの追加で対応
 
-### NFR-05-3: 単眼/複眼モード切り替え
+### NFR-05-3: モデル切り替え
 
-- `calibration_file`の有無でモードが自動決定
-- BodyTrackerの`world_coords`フラグで内部処理が分岐
+- inference_server.toml `model`で推論モデルを切り替え可能

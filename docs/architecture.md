@@ -3,7 +3,7 @@
 ## 概要
 
 カメラ映像から人体姿勢を推定し、SteamVRの仮想トラッカーとして出力するシステム。
-単眼モードと複眼（三角測量）モードを切り替え可能。
+Mac側でカメラキャプチャ、Windows側でGPU推論・三角測量・VMT送信を行う分離構成。
 
 ## 用途
 
@@ -12,117 +12,157 @@ Beat Saber撮影（操作用途ではない）
 ## システム構成
 
 ```
-┌───────────────────────────────────────────┐     ┌──────────────────────────────┐
-│                   Mac                      │     │          Windows             │
-│                                            │     │                              │
-│  ┌──────────┐                              │     │                              │
-│  │ カメラ 0 │──┐   ┌───────────────────┐  │     │  ┌─────┐   ┌─────────┐      │
-│  └──────────┘  │   │                   │  │ OSC │  │ VMT │──→│ SteamVR │      │
-│  ┌──────────┐  ├──→│  tracker_bevy     │────────→│     │   │         │      │
-│  │ カメラ 2 │──┤   │ ・姿勢推定(ONNX) │  │ UDP │  └─────┘   │ ┌──────────┐  │
-│  └──────────┘  │   │ ・三角測量(DLT)   │  │     │            │ │トラッカー│  │
-│  ┌──────────┐  │   │ ・座標変換       │  │     │            │ │ 0:腰     │  │
-│  │ カメラ 3 │──┘   │ ・平滑化         │  │     │            │ │ 1:左足   │  │
-│  └──────────┘      │ ・OSC送信        │  │     │            │ │ 2:右足   │  │
-│                    └───────────────────┘  │     │            │ │ 3:胸     │  │
-│                                            │     │            │ │ 4:左膝   │  │
-└───────────────────────────────────────────┘     │            │ │ 5:右膝   │  │
-                                                   │            │ └──────────┘  │
-                                                   │            └─────────┘      │
-                                                   └──────────────────────────────┘
+┌────────────────────────────────┐     ┌─────────────────────────────────────┐
+│          Mac (camera_server)   │     │       Windows (inference_server)    │
+│                                │     │                                     │
+│  ┌──────────┐                  │     │  ┌──────────────────────────────┐   │
+│  │ カメラ 0 │──┐  ┌─────────┐ │ TCP │  │ TCP受信 → JPEG展開          │   │
+│  └──────────┘  ├─→│ フレーム │ │────→│  │ → 人物検出 → 前処理        │   │
+│  ┌──────────┐  │  │ 同期    │ │ :9000│  │ → ONNX推論(GPU)           │   │
+│  │ カメラ 2 │──┤  │ + JPEG  │ │     │  │ → 三角測量(DLT)           │   │
+│  └──────────┘  │  │ 圧縮    │ │     │  │ → トラッカー算出          │   │  ┌──────────────────┐
+│  ┌──────────┐  │  │ + TCP   │ │     │  │ → フィルタ → VMT送信 ─────│───│→│ VMT → SteamVR    │
+│  │ カメラ 3 │──┘  │ 送信    │ │     │  └──────────────────────────────┘   │  │  ┌──────────┐    │
+│  └──────────┘     └─────────┘ │     │                                     │  │  │トラッカー│    │
+│                                │     │                                     │  │  │ 0:腰     │    │
+│  ┌──────────────────────────┐  │     │                                     │  │  │ 1:左足   │    │
+│  │ キャリブレーション(Mac内) │  │     │                                     │  │  │ 2:右足   │    │
+│  │ ChArUco検出・計算        │  │     │                                     │  │  │ 3:胸     │    │
+│  └──────────────────────────┘  │     │                                     │  │  │ 4:左膝   │    │
+└────────────────────────────────┘     └─────────────────────────────────────┘  │  │ 5:右膝   │    │
+                                                                  OSC/UDP:39570│  └──────────┘    │
+                                                                               └──────────────────┘
 ```
 
-- **VMT送信先**: 192.168.10.35:39570
-- **バイナリ**: `cargo run --bin tracker_bevy`（Cargo.tomlの`default-run`）
+- **設定ファイル**: Mac側 `camera_server.toml` / Win側 `inference_server.toml`
+- **バイナリ**: Mac `cargo run --bin camera_server` / Win `cargo run --bin inference_server`
 
-## 動作モード
+## データフロー
 
-### 単眼モード
-
-`config.toml`で`calibration_file`が未設定、かつ`[[cameras]]`が1台以下の場合。
-
-- `[camera]`セクションの設定を使用
-- 2Dポーズをそのままbody trackerに渡す
-- FOV補正による奥行き推定（`fov_v`設定）
-- One Euroフィルタが毎フレーム`.clone()`で供給され、高頻度（~75Hz）で安定動作
-
-### 複眼モード（三角測量）
-
-`config.toml`で`calibration_file = "calibration.json"`を設定した場合。
-
-- `calibration.json`からカメラパラメータ（内部行列、歪み係数、外部パラメータ）を読み込み
-- 各カメラで独立に2Dポーズ推定 → DLT三角測量で3Dポーズを再構成
-- FOV補正は無効（`fov_v = 0.0`）、三角測量が直接3D座標を算出
-
-## データフロー（複眼モード）
+### Mac側 (camera_server)
 
 ```
 カメラ0映像 ─┐
-             ├→ ThreadedCamera (バックグラウンド取り込み)
-カメラ2映像 ─┘
+カメラ2映像 ─┼→ ThreadedCamera (バックグラウンド取り込み)
+カメラ3映像 ─┘
                     │
                     ▼
          ┌─────────────────────┐
-         │ send_frames_system  │  新フレームがあれば推論スレッドに送信
-         └─────────────────────┘  (sync_channel, try_send)
+         │ フレーム同期        │  全カメラのフレームが揃うまで待機
+         └─────────────────────┘
                     │
                     ▼
          ┌─────────────────────┐
-         │ 推論スレッド (1本)  │  人物検出 → クロップ → 前処理 → ONNX推論
+         │ JPEG圧縮 + TCP送信  │  FrameSet（timestamp_us + Vec<Frame>）
+         └─────────────────────┘
+```
+
+### Win側 (inference_server)
+
+```
+         ┌─────────────────────┐
+         │ TCP受信スレッド      │  FrameSet受信 → JPEG展開
+         └─────────────────────┘  → channelでメインへ
+                    │
+                    ▼
+         ┌─────────────────────┐
+         │ メインスレッド       │  人物検出 → クロップ → 前処理 → ONNX推論
          │ ・keypoint/yolo検出 │  全カメラを逐次処理
-         │ ・spinepose_medium  │  (~335ms/フレーム)
+         │ ・spinepose_medium  │
          └─────────────────────┘
                     │
                     ▼
          ┌─────────────────────┐
-         │receive_results_system│  推論結果をposes_2d[cam_idx]に格納
+         │ 三角測量(DLT)       │  全カメラのposeからDLT三角測量
+         └─────────────────────┘  → 3Dポーズを算出
+                    │
+                    ▼
+         ┌─────────────────────┐
+         │ トラッカー算出      │  pose_3d → BodyTracker.compute()
+         │  ・外れ値除去       │  → 6トラッカーの位置・回転算出
+         │  ・ステールデータ検出│  → One Euroフィルタ → last_poses更新
          └─────────────────────┘
                     │
                     ▼
          ┌─────────────────────┐
-         │ triangulate_system  │  全カメラのposeが揃ったらDLT三角測量
-         │                     │  → pose_3dに3Dポーズを格納
-         │                     │  → poses_2dをクリア（次の三角測量待ち）
-         └─────────────────────┘
-                    │
-                    ▼
-         ┌─────────────────────┐
-         │calibration_system   │  [C+Enter]で5秒後にbody trackerの基準設定
-         └─────────────────────┘
-                    │
-                    ▼
-         ┌─────────────────────┐
-         │compute_trackers_system│  pose_3d → BodyTracker.compute()
-         │  ・sanitize_pose     │  → 6トラッカーの位置・回転算出
-         │  ・外れ値除去        │  → One Euroフィルタ → last_poses更新
-         │  ・ステールデータ検出│
-         └─────────────────────┘
-                    │
-                    ▼
-         ┌─────────────────────┐
-         │ send_vmt_system     │  OSC/UDPでVMTに送信
+         │ VMT送信             │  OSC/UDPでVMTに送信
          │  ・補間/外挿        │  pose_3dがないフレームは補間モードで補完
          └─────────────────────┘
 ```
 
 ## スレッド構成
 
+### Mac側 (camera_server)
+
 | スレッド | 役割 |
 |----------|------|
-| メイン (Bevy) | ScheduleRunnerPlugin (target_fps: 90Hz) でシステムチェーン実行 |
-| 推論スレッド | 全カメラのフレームを逐次推論（1本で共有） |
+| メイン (tokio) | TCP接続管理、フレーム送信、自動再接続 |
 | カメラスレッド × N | ThreadedCamera: バックグラウンドでフレーム取り込み |
-| コンソールスレッド | stdin監視、キャリブレーション指示 |
+
+### Win側 (inference_server)
+
+| スレッド | 役割 |
+|----------|------|
+| メイン | channel受信 → 推論 → 三角測量 → トラッカー → VMT送信 |
+| TCP受信スレッド | フレームセット受信 → JPEG展開 → channelでメインへ |
+
+## TCPプロトコル
+
+### 接続方向
+
+Mac（クライアント）→ Win（サーバー）。MacはWinのIPを知っている。
+
+### フレーミング
+
+素のTCPに `tokio_util::codec::LengthDelimitedCodec` で長さプレフィクスフレーミング。
+serde + bincode でシリアライズ。
+
+### メッセージタイプ
+
+**Mac → Win (ClientMessage):**
+
+| タイプ | 用途 |
+|--------|------|
+| `CameraCalibration` | キャリブレーションデータ送信（接続時 + 再キャリブ時） |
+| `FrameSet` | 同期済みフレーム群（timestamp_us + Vec\<Frame\>） |
+| `TriggerPoseCalibration` | VR原点設定の実行指示 |
+
+**Win → Mac (ServerMessage):**
+
+| タイプ | 用途 |
+|--------|------|
+| `CameraCalibrationAck` | 受信完了（OK/Error） |
+| `Ready` | フレーム受信準備完了 |
+| `LogData` | ログデータの送信（ファイル名 + データ） |
+
+### 接続シーケンス
+
+1. Win: TCPサーバー起動、接続待ち
+2. Mac→Win: TCP接続
+3. Mac→Win: `CameraCalibration` 送信
+4. Win→Mac: `CameraCalibrationAck` 応答
+5. Win→Mac: `Ready` 送信
+6. Mac: フレームストリーミング開始
+
+### 帯域見積もり（JPEG Q80、3カメラ、30fps）
+
+| リサイズ | 1フレームセット | 30fps時 |
+|----------|----------------|---------|
+| そのまま | ~800KB | ~24MB/s (~190Mbps) |
+| 半分 | ~250KB | ~7.5MB/s (~60Mbps) |
+
+有線LAN (Gigabit) なら元サイズで余裕。
 
 ## キャリブレーション
 
 ### カメラキャリブレーション（`cargo run --bin calibrate`）
 
-ChArUcoボードを使用してカメラの内部・外部パラメータを推定する。
+ChArUcoボードを使用してカメラの内部・外部パラメータを推定する。Mac内部で完結。
 
 1. **内部パラメータ推定**: 各カメラで個別にChArUcoボードを撮影（自動キャプチャ、0.5s間隔）
 2. **外部パラメータ推定**: 全カメラで同時にボードを撮影し、カメラ間の相対姿勢を算出
 3. 結果は`calibration.json`に保存
+4. camera_server起動時に読み込み、`CameraCalibration`メッセージでWin側に送信
 
 #### calibration.json の構造
 
@@ -139,18 +179,9 @@ ChArUcoボードを使用してカメラの内部・外部パラメータを推�
       "width": 1920, "height": 1080,
       "intrinsic_matrix": [/* 3x3 row-major */],
       "dist_coeffs": [/* 5要素 */],
-      "rvec": [0.0, 0.0, 0.0],   // 基準カメラ: 原点
+      "rvec": [0.0, 0.0, 0.0],
       "tvec": [0.0, 0.0, 0.0],
       "reprojection_error": 0.147
-    },
-    {
-      "camera_index": 2,
-      "width": 1920, "height": 1080,
-      "intrinsic_matrix": [/* 3x3 row-major */],
-      "dist_coeffs": [/* 5要素 */],
-      "rvec": [-0.400, 0.394, 0.050],  // カメラ0からの相対回転
-      "tvec": [-0.843, -0.957, 0.820], // カメラ0からの相対並進
-      "reprojection_error": 0.154
     }
   ]
 }
@@ -159,14 +190,14 @@ ChArUcoボードを使用してカメラの内部・外部パラメータを推�
 - 最初のカメラが基準座標系（rvec/tvec = 0）
 - 2台目以降は基準カメラからの相対姿勢
 
-### ランタイムキャリブレーション（[C + Enter]）
+### ポーズキャリブレーション
 
-BodyTrackerの基準姿勢設定。5秒のカウントダウン後に現在のポーズを基準として記録する。
+BodyTrackerの基準姿勢設定。Win側で実行（三角測量後の3D座標が必要なため）。
 
-- 腰の基準位置（hip_x, hip_y, hip_z）
-- 肩のyaw基準角度
-- 胴体高さ（奥行き・体型比率の基準値）
-- 各四肢の腰からの相対オフセット
+- Mac側から`TriggerPoseCalibration`メッセージで発動、またはWin側コンソール入力
+- 自動: hipが3秒間安定で自動発動
+- 保存項目: 腰の基準位置、肩のyaw基準角度、胴体高さ、各四肢の腰からの相対オフセット
+- キャリブレーション後、フィルタ・補間器はリセット
 
 ## 三角測量
 
@@ -189,7 +220,7 @@ BodyTrackerの基準姿勢設定。5秒のカウントダウン後に現在の�
 
 ### 歪み補正の現状
 
-**現在、全カメラの歪み補正が無効化されている**（`tracker_bevy.rs` L201: `let dc: [f64; 5] = [0.0; 5]`）。
+**現在、全カメラの歪み補正が無効化されている**（dist_coeffs=[0;5]に上書き）。
 
 2D観測は歪んだ画像上の座標だが、射影行列Pは歪みなしの座標系で定義されている。この座標系不一致がリプロジェクションエラーの主因（cam0で145-177px、cam2で1700-3300px）。
 
@@ -197,7 +228,7 @@ BodyTrackerの基準姿勢設定。5秒のカウントダウン後に現在の�
 
 ### 三角測量の診断（TriangulationDiag）
 
-`triangulate_poses()`は`(Pose, TriangulationDiag)`を返す。`triangulate_system`が問題フレーム（ref_pair=NONE, z-jump棄却, kps=0, boundary棄却）を自動的にログファイルに出力する。
+`triangulate_poses()`は`(Pose, TriangulationDiag)`を返す。問題フレーム（ref_pair=NONE, z-jump棄却, kps=0, boundary棄却）を自動的にログファイルに出力する。
 
 ## トラッカー
 
@@ -212,7 +243,7 @@ BodyTrackerの基準姿勢設定。5秒のカウントダウン後に現在の�
 | 4 | 左膝 | LeftKnee |
 | 5 | 右膝 | RightKnee |
 
-### 品質保証フィルタ（compute_trackers_system）
+### 品質保証フィルタ
 
 | フィルタ | 閾値 | 対象 |
 |----------|------|------|
@@ -225,7 +256,7 @@ BodyTrackerの基準姿勢設定。5秒のカウントダウン後に現在の�
 
 ### 補間モード（pose_3dがないフレーム）
 
-`config.toml`の`[interpolation] mode`で設定。
+inference_server.toml の `interpolation_mode` で設定。
 
 | モード | 動作 |
 |--------|------|
@@ -233,7 +264,7 @@ BodyTrackerの基準姿勢設定。5秒のカウントダウン後に現在の�
 | `lerp` | 前回値への線形補間 |
 | `none` | 最後の値をホールド |
 
-## 通信プロトコル
+## 通信プロトコル（VMT）
 
 ### OSC (Open Sound Control)
 
@@ -256,35 +287,44 @@ BodyTrackerの基準姿勢設定。5秒のカウントダウン後に現在の�
 
 ## 技術スタック
 
-### Mac側 (talava-tracker)
+### Mac側 (camera_server)
 
 | 機能 | ライブラリ |
 |------|-----------|
-| ECSフレームワーク | bevy |
 | カメラ取り込み | opencv |
-| 姿勢推定 | ort (ONNX Runtime) |
-| 座標計算・三角測量 | nalgebra |
-| OSC送信 | rosc |
+| JPEG圧縮 | opencv (imgcodecs) |
+| TCP通信 | tokio, tokio-util |
+| シリアライズ | serde, bincode |
 | キャリブレーション | opencv (ChArUco) |
 
-### Windows側
+### Win側 (inference_server)
+
+| 機能 | ライブラリ |
+|------|-----------|
+| TCP通信 | tokio, tokio-util |
+| シリアライズ | serde, bincode |
+| JPEG展開 | image crate |
+| 姿勢推定 | ort (ONNX Runtime, DirectML) |
+| 座標計算・三角測量 | nalgebra |
+| OSC送信 | rosc |
+
+### Windows側ソフトウェア
 
 | ソフトウェア | 役割 |
 |-------------|------|
 | VMT | OSC → SteamVRトラッカー |
 | SteamVR | VRランタイム |
-| バーチャルモーションキャプチャー | アバター表示 |
 | Beat Saber | ゲーム |
 
 ## 推論モデル
 
-`config.toml`の`[app] model`で設定。
+inference_server.toml の `model` で設定。
 
 | モデル名 | ファイル | キーポイント数 | 特徴 |
 |----------|---------|---------------|------|
 | movenet | movenet_lightning.onnx | 17 | 高速・低精度 |
 | spinepose_small | spinepose_small.onnx | 37 | 中速・中精度 |
-| spinepose_medium | spinepose_medium.onnx | 37 | 低速・高精度（現在使用） |
+| spinepose_medium | spinepose_medium.onnx | 37 | 低速・高精度（デフォルト） |
 | rtmw3d | rtmw3d-x.onnx | 37 | 3D対応 |
 
 ## 現在のカメラ構成
@@ -298,4 +338,5 @@ BodyTrackerの基準姿勢設定。5秒のカウントダウン後に現在の�
 
 - 脚の動きは機敏（Beat Saberのプレイ中の動きを追従する必要がある）
 - 編集前提の品質で許容
-- 推論スレッドは1本で全カメラを逐次処理（カメラ数×推論時間がレイテンシに直結）
+- 推論はWin側のGPU (DirectML) で実行
+- Mac→Win間はGigabit有線LAN前提

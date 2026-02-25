@@ -7,15 +7,15 @@
 - **被写体が不要なcargo run(ビルド確認、cargo test等)では呼ぶな。呼ぶのはポーズ検出テスト時のみ**
 - **動作確認が済むまでコミットするな**
 
-## 現在の状態（2026-02-21）
+## 現在の状態（2026-02-25）
 
 ### 最優先課題: レンズ歪み補正の有効化
 
-全カメラの歪み補正が無効化されている（`src/bin/tracker_bevy.rs` L201: `let dc: [f64; 5] = [0.0; 5]`）。
+全カメラの歪み補正が無効化されている（dist_coeffs=[0;5]に上書き）。
 
 **問題**: 2D観測は歪んだ画像上の座標だが、射影行列P=K[R|t]は歪みなしの座標系で定義されている。この座標系不一致がリプロジェクションエラーの主因。
 
-**診断結果**（2026-02-21 実機ログ `tracker_20260221_160027.log`）:
+**診断結果**:
 - c0+c1: hip reproj error = 145-177px（閾値120pxをわずかに超過）→ ref_pair=NONE
 - c0+c2: 1700-3300px（cam2の歪みが極端）
 - c1+c2: 1600-3300px
@@ -29,16 +29,44 @@
 
 `triangulate_poses()`のhip z-jumpチェック（MAX_HIP_Z_JUMP=0.3m）で棄却されると、PREV_HIP_Zが更新されない → 以降のフレームも全て棄却される永久ループに陥る。
 
-実測: prev_hip_z=1.536が固定され、z=4-14mのフレームが延々と棄却される。
+### R_kneeの非対称
 
-### 未コミットの変更（main上）
+hip→L_knee=0.59, hip→R_knee=1.33（scale後）。右膝が異常に遠い。
 
-1. 速度チェック基準: last_poses→last_raw_poses（フィルタ前位置と比較）
-2. max_displacement: 0.4→0.15
-3. 下半身フィルタ分離: lower_body_position_min_cutoff=1.0, beta=0.5
-4. キャリブレーション時のlast_raw_poses/reject_countリセット
-5. TriangulationDiag: 三角測量の棄却理由をログファイルに出力
-6. config.toml: leg_scale, offset_y, foot_y_offset変更
+## アーキテクチャ
+
+camera_server（Mac）+ inference_server（Win）の分離構成。
+
+```
+Mac (camera_server) --TCP:9000--> Win (inference_server) --OSC/UDP:39570--> VMT → SteamVR
+```
+
+- **camera_server**: カメラキャプチャ → JPEG圧縮 → TCP送信。設定は `camera_server.toml`
+- **inference_server**: TCP受信 → JPEG展開 → ONNX推論 → 三角測量 → トラッカー算出 → フィルタ → VMT送信。設定は `inference_server.toml`
+
+## ファイル構成
+
+| ファイル | 内容 |
+|---------|------|
+| `src/bin/camera_server.rs` | Mac側バイナリ: カメラキャプチャ + TCP送信 |
+| `src/bin/inference_server.rs` | Win側バイナリ: 推論 + 三角測量 + トラッカー + VMT送信 |
+| `src/protocol.rs` | TCP通信プロトコル（ClientMessage/ServerMessage） |
+| `src/triangulation.rs` | DLT三角測量、歪み補正、再投影チェック、TriangulationDiag |
+| `src/tracker/body.rs` | キーポイント→トラッカー位置変換、キャリブレーション |
+| `src/tracker/one_euro.rs` | One Euroフィルタ（上半身/下半身分離対応） |
+| `src/config.rs` | 設定ファイル読み込み（lower_body_position_min_cutoff追加済み） |
+| `calibration.json` | カメラ内部/外部パラメータ、歪み係数 |
+| `camera_server.toml` | Mac側設定（カメラ、接続先、JPEG品質） |
+| `inference_server.toml` | Win側設定（VMT、モデル、フィルタ） |
+
+### 完了した修正
+
+1. **歪み補正実装** (`src/triangulation.rs`): CameraParamsにundistort_point()実装（Newton-Raphson法）
+2. **再投影エラーチェック**: MAX_REPROJ_ERROR=120px（max方式）
+3. **Hip基準ペア固定**: 全キーポイントで同じカメラペアを使いz軸一貫性を確保
+4. **per-keypointバウンダリチェック**: ±10m/z>0
+5. **hip z-jumpチェック**: MAX_HIP_Z_JUMP=0.3mでフレーム棄却
+6. **TriangulationDiag**: 棄却理由（ref_pair, reproj error, z-jump）のログ出力
 
 ### カメラ構成（3台）
 
@@ -51,32 +79,11 @@
 - **cam2・cam3は角度が異なるからこそ三角測量に不可欠。除外は選択肢にない**
 - calibration.jsonのreprojection_error: cam0=0.20px, cam2=0.13px, cam3=0.38px（キャリブレーション自体は良好）
 
-### 完了した修正
-
-1. **歪み補正実装** (`src/triangulation.rs`): CameraParamsにundistort_point()実装（Newton-Raphson法）
-2. **再投影エラーチェック**: MAX_REPROJ_ERROR=120px（max方式）
-3. **Hip基準ペア固定**: 全キーポイントで同じカメラペアを使いz軸一貫性を確保
-4. **per-keypointバウンダリチェック**: ±10m/z>0
-5. **hip z-jumpチェック**: MAX_HIP_Z_JUMP=0.3mでフレーム棄却
-6. **TriangulationDiag**: 棄却理由（ref_pair, reproj error, z-jump）のログ出力
-
-### ファイル構成
-
-| ファイル | 内容 |
-|---------|------|
-| `src/triangulation.rs` | DLT三角測量、歪み補正、再投影チェック、TriangulationDiag |
-| `src/bin/tracker_bevy.rs` | Bevy ECSメインループ、品質チェック、VMT送信 |
-| `src/tracker/body.rs` | キーポイント→トラッカー位置変換、キャリブレーション |
-| `src/tracker/one_euro.rs` | One Euroフィルタ（上半身/下半身分離対応） |
-| `src/config.rs` | 設定ファイル読み込み（lower_body_position_min_cutoff追加済み） |
-| `calibration.json` | カメラ内部/外部パラメータ、歪み係数 |
-| `config.toml` | アプリ設定（カメラ、フィルタ、VMT） |
-
 ### デバッグの進め方
 
 #### TriangulationDiagのログ出力を確認する
 
-`triangulate_system`が問題フレーム（ref_pair=NONE, z-jump棄却, kps=0, boundary棄却）を自動的にログファイルに出力する。
+問題フレーム（ref_pair=NONE, z-jump棄却, kps=0, boundary棄却）を自動的にログファイルに出力する。
 
 出力例:
 ```

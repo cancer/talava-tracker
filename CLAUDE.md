@@ -6,27 +6,33 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 cargo build          # ビルド
-cargo run            # 実行（tracker_bevy、default-run）
 cargo test           # 全テスト実行
 cargo test test_name # 単一テスト実行
+
+# 分離構成（Mac + Win）
+cargo run --bin camera_server     # Mac側: カメラキャプチャ + TCP送信
+cargo run --bin inference_server  # Win側: 推論 + 三角測量 + VMT送信
+
+# ツール
 cargo run --bin calibrate    # カメラキャリブレーション
 cargo run --bin camera_view  # 画角調整（カメラ映像グリッド表示）
 ```
 
 ## What This Project Does
 
-Beat Saber撮影用のSteamVR仮想トラッカーシステム。カメラから人体姿勢を推定し、腰・足・胸・膝のトラッカーデータをOSC経由でVMTに送信する。単眼/複眼（三角測量）モード対応。
+Beat Saber撮影用のSteamVR仮想トラッカーシステム。Mac側でカメラ映像をキャプチャし、TCP経由でWindows側に送信。Windows側でONNX推論・DLT三角測量を行い、腰・足・胸・膝のトラッカーデータをOSC経由でVMTに送信する。
 
 ## Architecture
 
 ```
-Mac (talava-tracker)  --OSC/UDP:39570-->  Windows (VMT -> SteamVR -> Beat Saber)
+Mac (camera_server) --TCP:9000--> Windows (inference_server) --OSC/UDP:39570--> VMT -> SteamVR
 ```
 
 詳細は `docs/architecture.md` 参照。
 
 ### Modules
 
+- `protocol` - camera_server ↔ inference_server 間のTCPプロトコル（bincode + LengthDelimitedCodec）
 - `vmt` - VMTへのOSC送信。`/VMT/Room/Unity`アドレスでトラッカーの位置(x,y,z)と回転(quaternion)を送信
 - `calibration` - ChArUcoボードによるカメラキャリブレーション
 - `triangulation` - DLT三角測量による3Dポーズ再構成
@@ -36,7 +42,11 @@ Mac (talava-tracker)  --OSC/UDP:39570-->  Windows (VMT -> SteamVR -> Beat Saber)
 
 ### Data Flow
 
-カメラ映像 → ThreadedCamera → 人物検出 → 前処理 → ONNX推論 → [三角測量] → トラッカー算出 → 平滑化 → OSC送信
+```
+[Mac] カメラ映像 → JPEG圧縮 → TCP送信
+  ↓
+[Win] TCP受信 → JPEG展開 → 人物検出 → 前処理 → ONNX推論 → 三角測量 → トラッカー算出 → 平滑化 → OSC送信
+```
 
 ### Tracker Index
 
@@ -51,6 +61,6 @@ Mac (talava-tracker)  --OSC/UDP:39570-->  Windows (VMT -> SteamVR -> Beat Saber)
 
 ## Environment
 
-- macOS環境で動作
-- VMT送信先: 192.168.10.35:39570
-- `VMT_ADDR`環境変数で送信先を上書き可能
+- Mac (camera_server): カメラキャプチャ。設定は `camera_server.toml`
+- Windows (inference_server): 推論 + VMT送信。設定は `inference_server.toml`
+- VMT送信先: inference_server.toml の `vmt_addr`（デフォルト: 127.0.0.1:39570）

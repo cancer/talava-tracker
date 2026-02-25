@@ -4,15 +4,16 @@
 
 ### CON-01-1: 実行環境
 
-- **プラットフォーム**: macOS専用（AVFoundationバックエンド依存）
-- **送信先**: Windows PC (192.168.10.35:39570) でVMT→SteamVR→VMCが動作
+- **Mac側（camera_server）**: macOS（AVFoundationバックエンド依存）。カメラキャプチャ + TCP送信
+- **Win側（inference_server）**: Windows。ONNX推論（DirectML GPU）+ 三角測量 + VMT送信
+- **通信**: Mac→Win TCP接続（ポート9000）、Win→VMT OSC/UDP（ポート39570）
 - **VR接続**: Quest Link（Air Link）経由。Steam Linkは遅すぎてNG
 
 ### CON-01-2: カメラ
 
 - **内蔵カメラ**: Mac内蔵カメラ（index 0）
 - **外部カメラ**: iPhone連携（Camo Camera等経由）。iPhone 7, 8, 13を使用
-- **解像度**: 640x480（単眼時）/ 1760x1328, 1920x1440, 1920x1080（複眼時、カメラにより異なる）
+- **解像度**: 1760x1328 / 1920x1440 / 1920x1080（カメラによる）
 - **カメラFPS**: 30FPS（カメラ性能に依存。設定上は60だが実効30）
 - **物理配置**:
   - カメラのアイラインが肩の高さ（下半身になるほど距離が縮まる）
@@ -24,7 +25,9 @@
 
 ### CON-01-3: ネットワーク
 
-- **Mac→Windows**: 同一LAN内でUDP通信（ポート39570）
+- **Mac→Windows**: 同一LAN内でTCP通信（ポート9000、フレーム転送）
+- **Windows内**: localhost UDP通信（ポート39570、VMT送信）
+- **帯域**: Gigabit有線LAN前提。JPEG Q80 × 3カメラ × 30fps ≈ 190Mbps
 - **遅延**: LAN内のため無視できるレベル
 
 ## CON-02: ソフトウェア制約
@@ -41,10 +44,11 @@
 - モデルファイルはgit管理外（models/ディレクトリ）
 - SimCC出力形式（SpinePose）とヒートマップ出力形式（MoveNet）の両方に対応
 
-### CON-02-3: Bevy ECS
+### CON-02-3: TCPプロトコル
 
-- Bevy 0.15、`default-features = false`（レンダリング無効）
-- minifbのWindowはNonSendResourceとして管理（メインスレッド制約）
+- tokio + tokio-util (LengthDelimitedCodec) + bincode + serde
+- Mac→Win: フル画像JPEG送信（人物検出はWin側で実行）
+- フレーム同期はMac側で実施（全カメラのフレームが揃ってから送信）
 
 ## CON-03: 運用制約
 
@@ -73,13 +77,7 @@
 - マルチカメラ時: 各カメラ順次推論のため、カメラ数×推論時間
 - 補間（extrapolate/lerp）でVMT送信レートを確保
 
-### CON-04-2: 単眼モードの限界
-
-- 奥行き（z軸）は胴体高さ比から推定のため精度が低い
-- カメラ1台では人体フルボディを映せない場合がある
-- パースペクティブ歪み（画像端で位置がずれる）
-
-### CON-04-3: 三角測量の精度限界
+### CON-04-2: 三角測量の精度限界
 
 - 2カメラ間の基線長・角度に依存（角度が異なるほど三角測量の精度は向上）
 - **レンズ歪み補正が必須**: 歪み補正なしでは、2D観測（歪み座標）と射影行列（無歪み座標）の不一致によりリプロジェクションエラーが増大する。cam0で145-177px、cam2で1700-3300pxの歪みオフセットが実測されている
