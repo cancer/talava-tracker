@@ -1,4 +1,11 @@
+#[cfg(feature = "imgproc")]
+pub mod calibration;
+#[cfg(feature = "imgproc")]
+pub mod camera;
+pub mod config;
 pub mod pose;
 pub mod protocol;
+#[cfg(feature = "imgproc")]
+pub mod render;
 pub mod triangulation;
 pub mod vmt;
