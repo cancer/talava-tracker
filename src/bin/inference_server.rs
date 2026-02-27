@@ -1935,8 +1935,9 @@ fn run_inference_loop(
                             result_sent_at: now,
                         });
                         if let Some(ref cal) = body_tracker.calibration {
-                            log!(logfile, "Calibrated! yaw={:.1}deg tilt={:.1}deg (yaw_samples={})",
+                            log!(logfile, "Calibrated! camera_yaw={:.1}deg tilt={:.1}deg shoulder_yaw={:.1}deg shoulder_roll={:.1}deg (yaw_samples={})",
                                 cal.camera_yaw.to_degrees(), cal.tilt_angle.to_degrees(),
+                                cal.yaw_shoulder.to_degrees(), cal.roll_shoulder.to_degrees(),
                                 if camera_yaw.abs() > 0.001 { "used" } else { "insufficient" });
                         } else {
                             log!(logfile, "Calibrated!");
@@ -1985,6 +1986,13 @@ fn run_inference_loop(
                             None => format!("{}(none)", tracker_names[i]),
                         }).collect();
                     log!(logfile, "[verbose] body_tracker raw: {}", raw_strs.join(" "));
+                    if let Some(ref chest) = body_poses.chest {
+                        let [qx, qy, qz, qw] = chest.rotation;
+                        let yaw_deg = f32::atan2(2.0 * (qw * qy + qx * qz), 1.0 - 2.0 * (qx * qx + qy * qy)).to_degrees();
+                        let roll_deg = f32::atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz)).to_degrees();
+                        log!(logfile, "[verbose] chest_rot: quat=({:.3},{:.3},{:.3},{:.3}) yaw={:.1}deg roll={:.1}deg",
+                            qx, qy, qz, qw, yaw_deg, roll_deg);
+                    }
                 }
 
                 let now = Instant::now();
