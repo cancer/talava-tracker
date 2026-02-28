@@ -14,7 +14,9 @@ cargo run --bin camera_server     # Mac側: カメラキャプチャ + TCP送信
 cargo run --bin inference_server  # Win側: 推論 + 三角測量 + VMT送信
 
 # ツール
-cargo run --bin camera_probe  # カメラデバイス検出
+cargo run --bin camera_probe    # カメラデバイス検出
+cargo run --bin calibrate       # ChArUcoキャリブレーション（設定: config.toml）
+cargo run --bin generate_board  # ChArUcoボード画像生成
 ```
 
 ## What This Project Does
@@ -35,6 +37,10 @@ Mac (camera_server) --TCP:9000--> Windows (inference_server) --OSC/UDP:39570--> 
 - `vmt` - VMTへのOSC送信。`/VMT/Room/Unity`アドレスでトラッカーの位置(x,y,z)と回転(quaternion)を送信
 - `triangulation` - DLT三角測量（CameraParams, triangulate_point, reprojection_error）
 - `pose` - キーポイント定義、クロップ領域、レターボックス補正
+- `calibration` - ChArUcoボードによるカメラキャリブレーション（imgproc feature）
+- `camera` - OpenCvCamera / ThreadedCamera（imgproc feature）
+- `render` - MinifbRenderer・骨格描画（imgproc feature）
+- `config` - キャリブレーション設定（config.toml）
 
 ### Data Flow
 

@@ -13,7 +13,8 @@ rosc = "0.10"      # OSCプロトコル（VMT連携）
 anyhow = "1.0"     # エラーハンドリング
 ort = { version = "2.0.0-rc.9", default-features = false, features = ["std", "ndarray", "tracing", "download-binaries", "copy-dylibs", "tls-rustls"] } # ONNX Runtime
 ndarray = "0.17"   # テンソル操作
-opencv = { version = "0.93", default-features = false, features = ["imgproc", "imgcodecs"], optional = true }
+opencv = { version = "0.93", default-features = false, features = ["imgproc", "imgcodecs", "calib3d", "objdetect"], optional = true }
+minifb = "0.28"
 image = "0.25"
 toml = "0.9.11"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -36,6 +37,16 @@ ort = { version = "2.0.0-rc.9", features = ["directml"] }
 [[bin]]
 name = "camera_probe"
 path = "src/bin/camera_probe.rs"
+
+[[bin]]
+name = "calibrate"
+path = "src/bin/calibrate.rs"
+required-features = ["desktop"]
+
+[[bin]]
+name = "generate_board"
+path = "src/bin/generate_board.rs"
+required-features = ["imgproc"]
 
 [[bin]]
 name = "camera_server"

@@ -1,0 +1,8 @@
+[calibration]
+dictionary = "DICT_4X4_50"
+squares_x = 5
+squares_y = 4
+square_length = 0.035   # チェスボードのマス辺長（メートル）
+marker_length = 0.025   # マス内ArUcoマーカー辺長（メートル）
+output_path = "calibration.json"
+intrinsic_frames = 15
