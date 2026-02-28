@@ -931,6 +931,8 @@ struct BodyCalibration {
     hip_z: f32,
     yaw_shoulder: f32,
     yaw_left_foot: f32, yaw_right_foot: f32,
+    left_ankle_offset: Option<(f32, f32)>,
+    right_ankle_offset: Option<(f32, f32)>,
     left_knee_offset: Option<(f32, f32)>,
     right_knee_offset: Option<(f32, f32)>,
     yaw_left_knee: f32, yaw_right_knee: f32,
@@ -944,6 +946,7 @@ struct BodyTracker {
     offset_y: f32,
     foot_y_offset: f32,
     calibration: Option<BodyCalibration>,
+    hip_z_filter: ScalarFilter,
 }
 
 struct BodyPoses {
@@ -957,7 +960,10 @@ struct BodyPoses {
 
 impl BodyTracker {
     fn new(mirror_x: bool, offset_y: f32, foot_y_offset: f32) -> Self {
-        Self { mirror_x, offset_y, foot_y_offset, calibration: None }
+        // hip_z_filter: heavy smoothing to reject noise but track actual movement
+        // min_cutoff=0.5 (strong smoothing), beta=0.005 (slow response to speed)
+        let hip_z_filter = ScalarFilter::new(0.5, 0.005, 1.0);
+        Self { mirror_x, offset_y, foot_y_offset, calibration: None, hip_z_filter }
     }
 
     fn is_calibrated(&self) -> bool { self.calibration.is_some() }
@@ -995,14 +1001,24 @@ impl BodyTracker {
         rotated
     }
 
-    fn rotate_pose_yz(pose: &Pose, tilt: f32) -> Pose {
+    fn rotate_pose_yz(pose: &Pose, tilt: f32, filtered_hip_z: f32) -> Pose {
         let (sin_t, cos_t) = tilt.sin_cos();
         let mut rotated = pose.clone();
+        // Tilt correction: camera is tilted by `tilt` radians, so the
+        // triangulated y axis is not truly vertical. We rotate y and z
+        // to correct this.
+        //
+        // For y: use filtered_hip_z (OneEuro-filtered hip z) instead of
+        // per-keypoint z. This tracks actual body movement in z (walking
+        // forward/backward) so the rotation correctly compensates, while
+        // rejecting frame-to-frame triangulation noise that would leak
+        // into y via sin(tilt).
+        //
+        // For z: use per-keypoint y and z for correct depth calculation.
         for kp in rotated.keypoints.iter_mut() {
             let y = kp.y;
-            let z = kp.z;
-            kp.y = y * cos_t + z * sin_t;
-            kp.z = -y * sin_t + z * cos_t;
+            kp.y = y * cos_t + filtered_hip_z * sin_t;
+            kp.z = -y * sin_t + kp.z * cos_t;
         }
         rotated
     }
@@ -1010,7 +1026,12 @@ impl BodyTracker {
     fn calibrate(&mut self, pose: &Pose, camera_yaw: f32) -> bool {
         let yaw_corrected = Self::rotate_pose_xz(pose, camera_yaw);
         let tilt_angle = Self::compute_tilt_angle(&yaw_corrected);
-        let rotated = Self::rotate_pose_yz(&yaw_corrected, tilt_angle);
+        let cal_lh = yaw_corrected.get_by_index(KP_LEFT_HIP);
+        let cal_rh = yaw_corrected.get_by_index(KP_RIGHT_HIP);
+        let cal_hip_z = if cal_lh.is_valid(0.0) && cal_rh.is_valid(0.0) {
+            (cal_lh.z + cal_rh.z) / 2.0
+        } else { 0.0 };
+        let rotated = Self::rotate_pose_yz(&yaw_corrected, tilt_angle, cal_hip_z);
         let pose = &rotated;
 
         let lh = pose.get_by_index(KP_LEFT_HIP);
@@ -1025,6 +1046,11 @@ impl BodyTracker {
         let yaw_left_foot = self.compute_foot_yaw(pose, KP_LEFT_KNEE, KP_LEFT_ANKLE);
         let yaw_right_foot = self.compute_foot_yaw(pose, KP_RIGHT_KNEE, KP_RIGHT_ANKLE);
 
+        let la = pose.get_by_index(KP_LEFT_ANKLE);
+        let left_ankle_offset = if la.is_valid(BODY_CONFIDENCE_THRESHOLD) { Some((la.x - hip_x, la.y - hip_y)) } else { None };
+        let ra = pose.get_by_index(KP_RIGHT_ANKLE);
+        let right_ankle_offset = if ra.is_valid(BODY_CONFIDENCE_THRESHOLD) { Some((ra.x - hip_x, ra.y - hip_y)) } else { None };
+
         let lk = pose.get_by_index(KP_LEFT_KNEE);
         let left_knee_offset = if lk.is_valid(BODY_CONFIDENCE_THRESHOLD) { Some((lk.x - hip_x, lk.y - hip_y)) } else { None };
         let rk = pose.get_by_index(KP_RIGHT_KNEE);
@@ -1038,16 +1064,21 @@ impl BodyTracker {
         self.calibration = Some(BodyCalibration {
             hip_x, hip_y, hip_z,
             yaw_shoulder, yaw_left_foot, yaw_right_foot,
+            left_ankle_offset, right_ankle_offset,
             left_knee_offset, right_knee_offset,
             yaw_left_knee, yaw_right_knee,
             pitch_left_knee, pitch_right_knee,
             tilt_angle,
             camera_yaw,
         });
+        // Initialize hip_z_filter with calibration value so it starts
+        // from the correct position without warm-up drift
+        self.hip_z_filter.reset();
+        self.hip_z_filter.filter(cal_hip_z, 1.0 / 30.0);
         true
     }
 
-    fn compute(&self, pose: &Pose) -> BodyPoses {
+    fn compute(&mut self, pose: &Pose, dt: f32) -> BodyPoses {
         let yaw = self.calibration.as_ref().map_or(0.0, |c| c.camera_yaw);
         let yaw_corrected;
         let pose = if yaw.abs() > 0.001 {
@@ -1056,9 +1087,18 @@ impl BodyTracker {
         } else { pose };
 
         let tilt = self.calibration.as_ref().map_or(0.0, |c| c.tilt_angle);
+        // Get current hip z and filter it for use in tilt rotation
+        let lh = pose.get_by_index(KP_LEFT_HIP);
+        let rh = pose.get_by_index(KP_RIGHT_HIP);
+        let raw_hip_z = if lh.is_valid(BODY_CONFIDENCE_THRESHOLD) && rh.is_valid(BODY_CONFIDENCE_THRESHOLD) {
+            (lh.z + rh.z) / 2.0
+        } else {
+            self.calibration.as_ref().map_or(0.0, |c| c.hip_z)
+        };
+        let filtered_hip_z = self.hip_z_filter.filter(raw_hip_z, dt);
         let rotated;
         let pose = if tilt.abs() > 0.001 {
-            rotated = Self::rotate_pose_yz(pose, tilt);
+            rotated = Self::rotate_pose_yz(pose, tilt, filtered_hip_z);
             &rotated
         } else { pose };
 
@@ -1202,9 +1242,15 @@ impl BodyTracker {
         let ankle = pose.get_by_index(ankle_idx);
         let ankle_valid = ankle.is_valid(BODY_CONFIDENCE_THRESHOLD);
         let knee_valid = knee.is_valid(BODY_CONFIDENCE_THRESHOLD);
+        // When ankle is not detected, use calibration-time ankle offset
+        // relative to hip. This follows body movement (unlike None/hold)
+        // without jumping to knee height (unlike knee fallback).
         let (ax, ay) = if ankle_valid { (ankle.x, ankle.y) }
-            else if knee_valid { (knee.x, knee.y) }
-            else { return None; };
+            else if let Some(cal) = &self.calibration {
+                let offset = if is_left { cal.left_ankle_offset } else { cal.right_ankle_offset };
+                if let Some((ox, oy)) = offset { (hip_x + ox, hip_y + oy) }
+                else { return None; }
+            } else { return None; };
 
         let mut position = self.convert_position(ax, ay, hip_x, hip_y, pos_z);
         position[1] += self.foot_y_offset;
@@ -1414,6 +1460,7 @@ fn run_inference_loop(
     let mut cam_id_to_idx: std::collections::HashMap<u8, usize> = std::collections::HashMap::new();
 
     let mut body_tracker = BodyTracker::new(config.mirror_x, config.offset_y, config.foot_y_offset);
+    let mut last_compute_time = Instant::now();
     let mut filters: [PoseFilter; TRACKER_COUNT] = make_filters(&config.filter);
     let mut last_poses: [Option<TrackerPose>; TRACKER_COUNT] = [None; TRACKER_COUNT];
     let mut last_raw_poses: [Option<TrackerPose>; TRACKER_COUNT] = [None; TRACKER_COUNT];
@@ -1900,7 +1947,9 @@ fn run_inference_loop(
             if !hip_valid {
                 if verbose { log!(logfile, "[verbose] hip OOB, skipping tracker compute"); }
             } else {
-                let body_poses = body_tracker.compute(pose);
+                let compute_dt = last_compute_time.elapsed().as_secs_f32();
+                last_compute_time = Instant::now();
+                let body_poses = body_tracker.compute(pose, compute_dt);
                 let poses = [
                     body_poses.hip, body_poses.left_foot, body_poses.right_foot,
                     body_poses.chest, body_poses.left_knee, body_poses.right_knee,
@@ -2335,6 +2384,8 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    const DT: f32 = 1.0 / 30.0;
+
     #[test]
     fn test_z_jump_first_frame_no_reject() {
         let mut prev_z: Option<f32> = None;
@@ -2527,9 +2578,9 @@ mod tests {
 
     #[test]
     fn test_body_compute_uncalibrated_all_keypoints() {
-        let bt = BodyTracker::new(false, 0.0, 0.0);
+        let mut bt = BodyTracker::new(false, 0.0, 0.0);
         let pose = standing_pose();
-        let result = bt.compute(&pose);
+        let result = bt.compute(&pose, DT);
 
         // hip should exist (both hips valid)
         assert!(result.hip.is_some(), "hip should be present");
@@ -2545,9 +2596,9 @@ mod tests {
 
     #[test]
     fn test_body_compute_uncalibrated_positions() {
-        let bt = BodyTracker::new(false, 0.0, 0.0);
+        let mut bt = BodyTracker::new(false, 0.0, 0.0);
         let pose = standing_pose();
-        let result = bt.compute(&pose);
+        let result = bt.compute(&pose, DT);
 
         let hip = result.hip.unwrap();
         // Uncalibrated: ref=(0.5,0.5), hip_center=(0.5,0.5)
@@ -2563,7 +2614,7 @@ mod tests {
 
     #[test]
     fn test_body_compute_no_hips_returns_all_none() {
-        let bt = BodyTracker::new(false, 0.0, 0.0);
+        let mut bt = BodyTracker::new(false, 0.0, 0.0);
         // Pose with no hip keypoints
         let pose = make_pose(&[
             (KP_LEFT_SHOULDER,  0.42, 0.30, 0.0, 0.9),
@@ -2571,7 +2622,7 @@ mod tests {
             (KP_LEFT_ANKLE,     0.43, 0.80, 0.0, 0.9),
             (KP_RIGHT_ANKLE,    0.57, 0.80, 0.0, 0.9),
         ]);
-        let result = bt.compute(&pose);
+        let result = bt.compute(&pose, DT);
 
         assert!(result.hip.is_none(), "hip should be None without hip keypoints");
         assert!(result.left_foot.is_none(), "left_foot requires hip_center");
@@ -2582,30 +2633,23 @@ mod tests {
     }
 
     #[test]
-    fn test_body_compute_missing_ankle_falls_back_to_knee() {
-        let bt = BodyTracker::new(false, 0.0, 0.0);
-        // Left ankle missing, left knee present
+    fn test_body_compute_missing_ankle_uncalibrated_returns_none() {
+        let mut bt = BodyTracker::new(false, 0.0, 0.0);
+        // Left ankle missing, uncalibrated — no ankle offset available, returns None
         let pose = make_pose(&[
             (KP_LEFT_HIP,       0.45, 0.50, 1.0, 0.9),
             (KP_RIGHT_HIP,      0.55, 0.50, 1.0, 0.9),
             (KP_LEFT_KNEE,      0.44, 0.65, 1.0, 0.9),
             (KP_RIGHT_KNEE,     0.56, 0.65, 1.0, 0.9),
             (KP_RIGHT_ANKLE,    0.57, 0.80, 1.0, 0.9),
-            // KP_LEFT_ANKLE intentionally omitted
         ]);
-        let result = bt.compute(&pose);
-
-        // Left foot should fall back to knee position
-        assert!(result.left_foot.is_some(), "left_foot should use knee as fallback");
-        let lf = result.left_foot.unwrap();
-        // knee at x=0.44, hip_center at x=0.5
-        // convert_position: ref=(0.5,0.5), global=(0.5-0.5)=0, pos_x=0+(0.5-0.44)=0.06
-        assert!((lf.position[0] - 0.06).abs() < 0.01, "left_foot x={}", lf.position[0]);
+        let result = bt.compute(&pose, DT);
+        assert!(result.left_foot.is_none(), "left_foot should be None when ankle missing and uncalibrated");
     }
 
     #[test]
     fn test_body_compute_missing_ankle_and_knee_returns_none() {
-        let bt = BodyTracker::new(false, 0.0, 0.0);
+        let mut bt = BodyTracker::new(false, 0.0, 0.0);
         let pose = make_pose(&[
             (KP_LEFT_HIP,       0.45, 0.50, 1.0, 0.9),
             (KP_RIGHT_HIP,      0.55, 0.50, 1.0, 0.9),
@@ -2615,7 +2659,7 @@ mod tests {
             (KP_RIGHT_KNEE,     0.56, 0.65, 1.0, 0.9),
             (KP_RIGHT_ANKLE,    0.57, 0.80, 1.0, 0.9),
         ]);
-        let result = bt.compute(&pose);
+        let result = bt.compute(&pose, DT);
 
         assert!(result.left_foot.is_none(), "left_foot should be None without ankle and knee");
         assert!(result.right_foot.is_some(), "right_foot should be present");
@@ -2623,12 +2667,12 @@ mod tests {
 
     #[test]
     fn test_body_compute_mirror_x() {
-        let bt_normal = BodyTracker::new(false, 0.0, 0.0);
-        let bt_mirror = BodyTracker::new(true, 0.0, 0.0);
+        let mut bt_normal = BodyTracker::new(false, 0.0, 0.0);
+        let mut bt_mirror = BodyTracker::new(true, 0.0, 0.0);
         let pose = standing_pose();
 
-        let normal = bt_normal.compute(&pose);
-        let mirror = bt_mirror.compute(&pose);
+        let normal = bt_normal.compute(&pose, DT);
+        let mirror = bt_mirror.compute(&pose, DT);
 
         let nh = normal.hip.unwrap();
         let mh = mirror.hip.unwrap();
@@ -2648,9 +2692,9 @@ mod tests {
 
     #[test]
     fn test_body_compute_offset_y() {
-        let bt = BodyTracker::new(false, 0.5, 0.0);
+        let mut bt = BodyTracker::new(false, 0.5, 0.0);
         let pose = standing_pose();
-        let result = bt.compute(&pose);
+        let result = bt.compute(&pose, DT);
 
         let hip = result.hip.unwrap();
         // offset_y=0.5 is added to all y positions
@@ -2659,12 +2703,12 @@ mod tests {
 
     #[test]
     fn test_body_compute_foot_y_offset() {
-        let bt = BodyTracker::new(false, 0.0, 0.1);
+        let mut bt = BodyTracker::new(false, 0.0, 0.1);
         let pose = standing_pose();
-        let result = bt.compute(&pose);
+        let result = bt.compute(&pose, DT);
 
-        let bt_no_offset = BodyTracker::new(false, 0.0, 0.0);
-        let result_no_offset = bt_no_offset.compute(&pose);
+        let mut bt_no_offset = BodyTracker::new(false, 0.0, 0.0);
+        let result_no_offset = bt_no_offset.compute(&pose, DT);
 
         let lf = result.left_foot.unwrap();
         let lf_no = result_no_offset.left_foot.unwrap();
@@ -2683,7 +2727,7 @@ mod tests {
         assert!(bt.is_calibrated());
 
         // Compute with the same pose as calibration: all positions should be ~0
-        let result = bt.compute(&calibration_pose);
+        let result = bt.compute(&calibration_pose, DT);
         let hip = result.hip.unwrap();
         assert!((hip.position[0]).abs() < 0.01, "calibrated hip x={}", hip.position[0]);
         assert!((hip.position[1]).abs() < 0.01, "calibrated hip y={}", hip.position[1]);
@@ -2709,7 +2753,7 @@ mod tests {
             (KP_LEFT_ANKLE,     0.53, 0.80, 1.0, 0.9),
             (KP_RIGHT_ANKLE,    0.67, 0.80, 1.0, 0.9),
         ]);
-        let result = bt.compute(&shifted);
+        let result = bt.compute(&shifted, DT);
         let hip = result.hip.unwrap();
         // Person moved right by 0.1 in image → hip_center=(0.6, 0.5)
         // convert_position: ref=(0.5,0.5), global=(0.5-0.6)=(-0.1, 0.5-0.5=0)
@@ -2730,7 +2774,7 @@ mod tests {
 
     #[test]
     fn test_body_compute_depth_from_z() {
-        let bt = BodyTracker::new(false, 0.0, 0.0);
+        let mut bt = BodyTracker::new(false, 0.0, 0.0);
         let pose = make_pose(&[
             (KP_LEFT_HIP,   0.45, 0.50, 2.0, 0.9),
             (KP_RIGHT_HIP,  0.55, 0.50, 2.0, 0.9),
@@ -2739,7 +2783,7 @@ mod tests {
             (KP_LEFT_ANKLE, 0.43, 0.80, 2.5, 0.9),
             (KP_RIGHT_ANKLE, 0.57, 0.80, 1.5, 0.9),
         ]);
-        let result = bt.compute(&pose);
+        let result = bt.compute(&pose, DT);
 
         // Uncalibrated: estimate_depth = ref_z(0) - hip_z(2.0) = -2.0
         let hip = result.hip.unwrap();
@@ -2766,7 +2810,7 @@ mod tests {
         bt.calibrate(&cal_pose, 0.0);
 
         // Same pose → z should be 0 (ref_z - current_z = 2.0 - 2.0 = 0)
-        let result = bt.compute(&cal_pose);
+        let result = bt.compute(&cal_pose, DT);
         let hip = result.hip.unwrap();
         assert!((hip.position[2]).abs() < 0.01, "calibrated hip z={}", hip.position[2]);
 
@@ -2781,7 +2825,7 @@ mod tests {
             (KP_LEFT_ANKLE, 0.43, 0.80, 1.5, 0.9),
             (KP_RIGHT_ANKLE, 0.57, 0.80, 1.5, 0.9),
         ]);
-        let result = bt.compute(&closer_pose);
+        let result = bt.compute(&closer_pose, DT);
         let hip = result.hip.unwrap();
         assert!((hip.position[2] - 0.5).abs() < 0.01, "closer hip z={}", hip.position[2]);
     }
@@ -2969,5 +3013,115 @@ mod tests {
         let tilt = BodyTracker::compute_tilt_angle(&pose);
         // atan2(2.0 - 1.0, 0.8 - 0.5) = atan2(1.0, 0.3) ≈ 1.28
         assert!(tilt > 0.5, "tilted tilt={}", tilt);
+    }
+
+    // ===================================================================
+    // Axis isolation tests (specification-driven, not implementation-driven)
+    // These define WHAT the system must guarantee, not HOW it achieves it.
+    // ===================================================================
+
+    /// Helper: create a calibrated BodyTracker with a standard pose.
+    fn make_calibrated_tracker(yaw: f32) -> (BodyTracker, Pose) {
+        let mut bt = BodyTracker::new(false, 0.0, 0.0);
+        let pose = make_pose(&[
+            (KP_LEFT_HIP,       0.45, 0.50, 2.0, 0.9),
+            (KP_RIGHT_HIP,      0.55, 0.50, 2.0, 0.9),
+            (KP_LEFT_SHOULDER,   0.42, 0.30, 2.0, 0.9),
+            (KP_RIGHT_SHOULDER,  0.58, 0.30, 2.0, 0.9),
+            (KP_LEFT_ANKLE,      0.44, 0.80, 2.0, 0.9),
+            (KP_RIGHT_ANKLE,     0.56, 0.80, 2.0, 0.9),
+            (KP_LEFT_KNEE,       0.44, 0.65, 2.0, 0.9),
+            (KP_RIGHT_KNEE,      0.56, 0.65, 2.0, 0.9),
+        ]);
+        bt.calibrate(&pose, yaw);
+        (bt, pose)
+    }
+
+    #[test]
+    fn test_x_movement_with_noise_does_not_leak_to_y() {
+        // Spec: lateral (x) movement must not significantly affect height (y).
+        // Real triangulation produces correlated noise: x+0.2 may cause
+        // y±0.03 and z±0.05. The pipeline must not amplify this.
+        let (mut bt, base) = make_calibrated_tracker(0.4);
+        let r_base = bt.compute(&base, DT);
+        let hip_y_base = r_base.hip.unwrap().position[1];
+
+        // Simulate realistic movement: x+0.2 with triangulation noise
+        let noise_cases: [(f32, f32, f32); 3] = [
+            (0.2, 0.03, 0.05),   // x right, slight y/z noise
+            (-0.2, -0.02, -0.04), // x left, slight y/z noise
+            (0.15, 0.04, -0.06),  // x right, larger noise
+        ];
+        for (dx, dy_noise, dz_noise) in &noise_cases {
+            let mut shifted = base.clone();
+            for kp in shifted.keypoints.iter_mut() {
+                kp.x += dx;
+                kp.y += dy_noise;
+                kp.z += dz_noise;
+            }
+            let hip_y_shifted = bt.compute(&shifted, DT).hip.unwrap().position[1];
+            let y_delta = (hip_y_shifted - hip_y_base).abs();
+            // y output should not exceed the input y noise by more than 50%
+            // (pipeline must not amplify noise)
+            let max_y = dy_noise.abs() * 1.5 + 0.01;
+            assert!(
+                y_delta < max_y,
+                "x={} noise dy={} dz={}: y_delta={:.3} > max={:.3}",
+                dx, dy_noise, dz_noise, y_delta, max_y
+            );
+        }
+    }
+
+    #[test]
+    fn test_z_movement_does_not_leak_to_y() {
+        // Spec: depth (z) movement must not affect height (y).
+        // Uniform z shift across all keypoints.
+        let (mut bt, base) = make_calibrated_tracker(0.4);
+        let r_base = bt.compute(&base, DT);
+        let hip_y_base = r_base.hip.unwrap().position[1];
+
+        for dz in &[0.5, -0.3, 1.0] {
+            let mut shifted = base.clone();
+            for kp in shifted.keypoints.iter_mut() { kp.z += dz; }
+            let hip_y_shifted = bt.compute(&shifted, DT).hip.unwrap().position[1];
+            let leak = (hip_y_shifted - hip_y_base).abs();
+            assert!(leak < 0.02, "z({:+.1})->y leak={:.3}", dz, leak);
+        }
+    }
+
+    #[test]
+    fn test_per_keypoint_z_noise_does_not_leak_to_foot_y() {
+        // Spec: z noise on individual keypoints (not uniform) must not
+        // affect their y positions. This catches the case where ankle z
+        // differs from hip z.
+        let (mut bt, base) = make_calibrated_tracker(0.4);
+        let r_base = bt.compute(&base, DT);
+        let lf_y_base = r_base.left_foot.unwrap().position[1];
+        let rf_y_base = r_base.right_foot.unwrap().position[1];
+
+        let mut noisy = base.clone();
+        noisy.keypoints[KP_LEFT_ANKLE].z += 1.0;
+        noisy.keypoints[KP_RIGHT_ANKLE].z -= 0.5;
+        // hip z unchanged
+        let r_noisy = bt.compute(&noisy, DT);
+        let lf_leak = (r_noisy.left_foot.unwrap().position[1] - lf_y_base).abs();
+        let rf_leak = (r_noisy.right_foot.unwrap().position[1] - rf_y_base).abs();
+        assert!(lf_leak < 0.02, "L_ankle z+1.0 -> L_foot y leak={:.3}", lf_leak);
+        assert!(rf_leak < 0.02, "R_ankle z-0.5 -> R_foot y leak={:.3}", rf_leak);
+    }
+
+    #[test]
+    fn test_y_movement_preserved() {
+        // Spec: vertical (y) movement must be reflected in output y.
+        let (mut bt, base) = make_calibrated_tracker(0.4);
+        let r_base = bt.compute(&base, DT);
+        let hip_y_base = r_base.hip.unwrap().position[1];
+
+        let mut shifted = base.clone();
+        for kp in shifted.keypoints.iter_mut() { kp.y += 0.1; }
+        let hip_y_shifted = bt.compute(&shifted, DT).hip.unwrap().position[1];
+
+        let delta = (hip_y_shifted - hip_y_base).abs();
+        assert!(delta > 0.05, "y movement not preserved: base={:.3} shifted={:.3} delta={:.3}", hip_y_base, hip_y_shifted, delta);
     }
 }
