@@ -168,11 +168,11 @@ fn main() -> Result<()> {
     // [2/4] 内部パラメータキャリブレーション
     println!("[2/4] 内部パラメータキャリブレーション");
     println!("  各カメラでChArUcoボードを様々な角度から見せてください");
-    println!("  6コーナー以上検出されると自動キャプチャします（2秒間隔）");
+    println!("  6コーナー以上検出されると自動キャプチャします（1秒間隔）");
     println!("  [Q] 中止");
     println!();
 
-    let capture_interval = std::time::Duration::from_millis(500);
+    let capture_interval = std::time::Duration::from_millis(1000);
 
     let mut camera_matrices: Vec<Mat> = Vec::new();
     let mut dist_coeffs_vec: Vec<Mat> = Vec::new();
@@ -193,100 +193,146 @@ fn main() -> Result<()> {
             h as usize,
         )?;
 
-        let mut all_corners: Vec<Mat> = Vec::new();
-        let mut all_ids: Vec<Mat> = Vec::new();
-        let mut last_capture = Instant::now() - capture_interval; // 初回は即キャプチャ可能
+        // k3異常値検出時にリトライするための外側ループ
+        let (k_result, dist_result, error_result) = loop {
+            let mut all_corners: Vec<Mat> = Vec::new();
+            let mut all_ids: Vec<Mat> = Vec::new();
+            let mut last_capture = Instant::now() - capture_interval;
 
-        println!("  キャプチャ: 0/{}", cal_config.intrinsic_frames);
+            println!("  キャプチャ: 0/{}", cal_config.intrinsic_frames);
 
-        while all_corners.len() < cal_config.intrinsic_frames && renderer.is_open() {
-            let frame = match camera.get_frame() {
-                Some(f) => f,
-                None => continue,
-            };
+            while all_corners.len() < cal_config.intrinsic_frames && renderer.is_open() {
+                let frame = match camera.get_frame() {
+                    Some(f) => f,
+                    None => continue,
+                };
 
-            // ChArUcoコーナー検出（処理に時間がかかる）
-            let (corners, ids, n_corners) = detect_charuco_corners(&detector, &frame)?;
+                // ChArUcoコーナー検出（処理に時間がかかる）
+                let (corners, ids, n_corners) = detect_charuco_corners(&detector, &frame)?;
 
-            // 自動キャプチャ
-            let captured_now = if n_corners >= 6 && last_capture.elapsed() >= capture_interval {
-                all_corners.push(corners.clone());
-                all_ids.push(ids);
-                last_capture = Instant::now();
-                println!("  キャプチャ: {}/{}", all_corners.len(), cal_config.intrinsic_frames);
-                true
-            } else {
-                false
-            };
+                // 自動キャプチャ
+                let captured_now = if n_corners >= 6 && last_capture.elapsed() >= capture_interval {
+                    all_corners.push(corners.clone());
+                    all_ids.push(ids);
+                    last_capture = Instant::now();
+                    println!("  キャプチャ: {}/{}", all_corners.len(), cal_config.intrinsic_frames);
+                    true
+                } else {
+                    false
+                };
 
-            // 検出後に最新フレームを取得して表示（遅延解消）
-            let mut display = camera.get_frame().unwrap_or(frame);
+                // 検出後に最新フレームを取得して表示（遅延解消）
+                let mut display = camera.get_frame().unwrap_or(frame);
 
-            if n_corners > 0 {
-                for i in 0..n_corners {
-                    let pt = corners.at_2d::<opencv::core::Point2f>(i, 0)?;
-                    let color = if n_corners >= 6 {
-                        Scalar::new(0.0, 255.0, 0.0, 0.0)
-                    } else {
-                        Scalar::new(0.0, 255.0, 255.0, 0.0)
-                    };
-                    opencv::imgproc::circle(
-                        &mut display,
-                        opencv::core::Point::new(pt.x as i32, pt.y as i32),
-                        5, color, -1, opencv::imgproc::LINE_8, 0,
-                    )?;
+                if n_corners > 0 {
+                    for i in 0..n_corners {
+                        let pt = corners.at_2d::<opencv::core::Point2f>(i, 0)?;
+                        let color = if n_corners >= 6 {
+                            Scalar::new(0.0, 255.0, 0.0, 0.0)
+                        } else {
+                            Scalar::new(0.0, 255.0, 255.0, 0.0)
+                        };
+                        opencv::imgproc::circle(
+                            &mut display,
+                            opencv::core::Point::new(pt.x as i32, pt.y as i32),
+                            5, color, -1, opencv::imgproc::LINE_8, 0,
+                        )?;
+                    }
+                }
+
+                // ステータス表示
+                let (status, color) = if captured_now {
+                    (format!("CAPTURED! | {}/{}", all_corners.len(), cal_config.intrinsic_frames),
+                     Scalar::new(255.0, 255.0, 255.0, 0.0))
+                } else if n_corners >= 6 {
+                    (format!("Corners: {} OK | {}/{}", n_corners, all_corners.len(), cal_config.intrinsic_frames),
+                     Scalar::new(0.0, 255.0, 0.0, 0.0))
+                } else if n_corners > 0 {
+                    (format!("Corners: {} (need 6+) | {}/{}", n_corners, all_corners.len(), cal_config.intrinsic_frames),
+                     Scalar::new(0.0, 255.0, 255.0, 0.0))
+                } else {
+                    (format!("No corners | {}/{}", all_corners.len(), cal_config.intrinsic_frames),
+                     Scalar::new(0.0, 0.0, 255.0, 0.0))
+                };
+                opencv::imgproc::put_text(
+                    &mut display, &status,
+                    opencv::core::Point::new(10, 30),
+                    opencv::imgproc::FONT_HERSHEY_SIMPLEX, 0.7,
+                    color, 2, opencv::imgproc::LINE_8, false,
+                )?;
+
+                renderer.draw_frame(&display)?;
+                renderer.update()?;
+
+                if renderer.is_key_pressed(Key::Q) {
+                    bail!("ユーザーにより中止されました");
                 }
             }
 
-            // ステータス表示
-            let (status, color) = if captured_now {
-                (format!("CAPTURED! | {}/{}", all_corners.len(), cal_config.intrinsic_frames),
-                 Scalar::new(255.0, 255.0, 255.0, 0.0))
-            } else if n_corners >= 6 {
-                (format!("Corners: {} OK | {}/{}", n_corners, all_corners.len(), cal_config.intrinsic_frames),
-                 Scalar::new(0.0, 255.0, 0.0, 0.0))
-            } else if n_corners > 0 {
-                (format!("Corners: {} (need 6+) | {}/{}", n_corners, all_corners.len(), cal_config.intrinsic_frames),
-                 Scalar::new(0.0, 255.0, 255.0, 0.0))
-            } else {
-                (format!("No corners | {}/{}", all_corners.len(), cal_config.intrinsic_frames),
-                 Scalar::new(0.0, 0.0, 255.0, 0.0))
-            };
-            opencv::imgproc::put_text(
-                &mut display, &status,
-                opencv::core::Point::new(10, 30),
-                opencv::imgproc::FONT_HERSHEY_SIMPLEX, 0.7,
-                color, 2, opencv::imgproc::LINE_8, false,
-            )?;
-
-            renderer.draw_frame(&display)?;
-            renderer.update()?;
-
-            if renderer.is_key_pressed(Key::Q) {
-                bail!("ユーザーにより中止されました");
+            if all_corners.len() < 3 {
+                println!("  フレーム不足（{}枚、最低3枚必要）。デフォルト値を使用します", all_corners.len());
+                let fy = h as f64 / (2.0 * (55.0f64.to_radians() / 2.0).tan());
+                let mut k = Mat::eye(3, 3, opencv::core::CV_64F)?.to_mat()?;
+                *k.at_2d_mut::<f64>(0, 0)? = fy;
+                *k.at_2d_mut::<f64>(1, 1)? = fy;
+                *k.at_2d_mut::<f64>(0, 2)? = w as f64 / 2.0;
+                *k.at_2d_mut::<f64>(1, 2)? = h as f64 / 2.0;
+                break (k, Mat::zeros(5, 1, opencv::core::CV_64F)?.to_mat()?, -1.0);
             }
-        }
 
-        if all_corners.len() < 3 {
-            println!("  フレーム不足（{}枚、最低3枚必要）。デフォルト値を使用します", all_corners.len());
-            // デフォルトの内部パラメータ（FOV 55度相当）
-            let fy = h as f64 / (2.0 * (55.0f64.to_radians() / 2.0).tan());
-            let mut k = Mat::eye(3, 3, opencv::core::CV_64F)?.to_mat()?;
-            *k.at_2d_mut::<f64>(0, 0)? = fy;
-            *k.at_2d_mut::<f64>(1, 1)? = fy;
-            *k.at_2d_mut::<f64>(0, 2)? = w as f64 / 2.0;
-            *k.at_2d_mut::<f64>(1, 2)? = h as f64 / 2.0;
-            camera_matrices.push(k);
-            dist_coeffs_vec.push(Mat::zeros(5, 1, opencv::core::CV_64F)?.to_mat()?);
-            reprojection_errors.push(-1.0);
-        } else {
             println!("  キャリブレーション中...");
             let (k, dist, error) = calibrate_intrinsics(&all_corners, &all_ids, &board, image_size)?;
             println!("  再投影誤差: {:.4} px", error);
-            camera_matrices.push(k);
-            dist_coeffs_vec.push(dist);
-            reprojection_errors.push(error);
-        }
+
+            // k3異常値検出: 画像境界8点でradial factor R を検証
+            let fx = *k.at_2d::<f64>(0, 0)?;
+            let fy_val = *k.at_2d::<f64>(1, 1)?;
+            let cx = *k.at_2d::<f64>(0, 2)?;
+            let cy = *k.at_2d::<f64>(1, 2)?;
+            let k1 = *dist.at::<f64>(0)?;
+            let k2 = *dist.at::<f64>(1)?;
+            let k3 = if dist.rows() >= 5 { *dist.at::<f64>(4)? } else { 0.0 };
+
+            let w_f = w as f64;
+            let h_f = h as f64;
+            let boundary_points: [(f64, f64, &str); 8] = [
+                (0.0,       0.0,       "top-left"),
+                (w_f,       0.0,       "top-right"),
+                (0.0,       h_f,       "bottom-left"),
+                (w_f,       h_f,       "bottom-right"),
+                (w_f / 2.0, 0.0,       "top-center"),
+                (w_f / 2.0, h_f,       "bottom-center"),
+                (0.0,       h_f / 2.0, "left-center"),
+                (w_f,       h_f / 2.0, "right-center"),
+            ];
+
+            let mut has_negative = false;
+            for &(u, v, label) in &boundary_points {
+                let x = (u - cx) / fx;
+                let y = (v - cy) / fy_val;
+                let r2 = x * x + y * y;
+                let r4 = r2 * r2;
+                let r6 = r4 * r2;
+                let radial = 1.0 + k1 * r2 + k2 * r4 + k3 * r6;
+                if radial <= 0.0 {
+                    println!("  警告: {} (u={:.0}, v={:.0}) で R={:.4} ≤ 0 (r2={:.4}, k1={:.4}, k2={:.4}, k3={:.4})",
+                        label, u, v, radial, r2, k1, k2, k3);
+                    has_negative = true;
+                }
+            }
+
+            if has_negative {
+                println!("  歪みモデル破綻を検出。キャプチャをやり直します...");
+                println!();
+                continue; // 外側loopの先頭に戻り、キャプチャからやり直し
+            }
+
+            break (k, dist, error);
+        };
+
+        camera_matrices.push(k_result);
+        dist_coeffs_vec.push(dist_result);
+        reprojection_errors.push(error_result);
     }
 
     // [3/4] 外部パラメータキャリブレーション
