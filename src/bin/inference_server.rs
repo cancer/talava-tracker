@@ -930,6 +930,7 @@ struct BodyCalibration {
     hip_x: f32, hip_y: f32,
     hip_z: f32,
     yaw_shoulder: f32,
+    roll_shoulder: f32,
     yaw_left_foot: f32, yaw_right_foot: f32,
     left_ankle_offset: Option<(f32, f32)>,
     right_ankle_offset: Option<(f32, f32)>,
@@ -1043,6 +1044,7 @@ impl BodyTracker {
         let hip_z = (lh.z + rh.z) / 2.0;
 
         let yaw_shoulder = self.compute_shoulder_yaw(pose);
+        let roll_shoulder = self.compute_shoulder_roll(pose);
         let yaw_left_foot = self.compute_foot_yaw(pose, KP_LEFT_KNEE, KP_LEFT_ANKLE);
         let yaw_right_foot = self.compute_foot_yaw(pose, KP_RIGHT_KNEE, KP_RIGHT_ANKLE);
 
@@ -1063,7 +1065,8 @@ impl BodyTracker {
 
         self.calibration = Some(BodyCalibration {
             hip_x, hip_y, hip_z,
-            yaw_shoulder, yaw_left_foot, yaw_right_foot,
+            yaw_shoulder, roll_shoulder,
+            yaw_left_foot, yaw_right_foot,
             left_ankle_offset, right_ankle_offset,
             left_knee_offset, right_knee_offset,
             yaw_left_knee, yaw_right_knee,
@@ -1170,6 +1173,16 @@ impl BodyTracker {
         let rs = pose.get_by_index(KP_RIGHT_SHOULDER);
         if ls.is_valid(BODY_CONFIDENCE_THRESHOLD) && rs.is_valid(BODY_CONFIDENCE_THRESHOLD) {
             let dx = if self.mirror_x { rs.x - ls.x } else { ls.x - rs.x };
+            let dz = rs.z - ls.z;
+            f32::atan2(dz, dx)
+        } else { 0.0 }
+    }
+
+    fn compute_shoulder_roll(&self, pose: &Pose) -> f32 {
+        let ls = pose.get_by_index(KP_LEFT_SHOULDER);
+        let rs = pose.get_by_index(KP_RIGHT_SHOULDER);
+        if ls.is_valid(BODY_CONFIDENCE_THRESHOLD) && rs.is_valid(BODY_CONFIDENCE_THRESHOLD) {
+            let dx = if self.mirror_x { rs.x - ls.x } else { ls.x - rs.x };
             let dy = rs.y - ls.y;
             f32::atan2(dy, dx)
         } else { 0.0 }
@@ -1218,6 +1231,12 @@ impl BodyTracker {
         [cy * sp, sy * cp, -sy * sp, cy * cp]
     }
 
+    fn yaw_roll_to_quaternion(yaw: f32, roll: f32) -> [f32; 4] {
+        let (sy, cy) = (yaw / 2.0).sin_cos();
+        let (sr, cr) = (roll / 2.0).sin_cos();
+        [-sy * sr, sy * cr, cy * sr, cy * cr]
+    }
+
     fn reject_duplicate_pair(left: &mut Option<TrackerPose>, right: &mut Option<TrackerPose>) {
         if let (Some(l), Some(r)) = (left.as_ref(), right.as_ref()) {
             let dx = l.position[0] - r.position[0];
@@ -1230,8 +1249,10 @@ impl BodyTracker {
         let (hip_x, hip_y) = hip_center?;
         let position = self.convert_position(hip_x, hip_y, hip_x, hip_y, pos_z);
         let ref_yaw = self.calibration.as_ref().map_or(0.0, |c| c.yaw_shoulder);
+        let ref_roll = self.calibration.as_ref().map_or(0.0, |c| c.roll_shoulder);
         let yaw = self.compute_shoulder_yaw(pose) - ref_yaw;
-        Some(TrackerPose::new(position, Self::yaw_to_quaternion(yaw)))
+        let roll = self.compute_shoulder_roll(pose) - ref_roll;
+        Some(TrackerPose::new(position, Self::yaw_roll_to_quaternion(yaw, roll)))
     }
 
     fn compute_foot(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32,
@@ -1283,8 +1304,10 @@ impl BodyTracker {
 
         let position = self.convert_position(x, y, hip_x, hip_y, pos_z);
         let ref_yaw = self.calibration.as_ref().map_or(0.0, |c| c.yaw_shoulder);
+        let ref_roll = self.calibration.as_ref().map_or(0.0, |c| c.roll_shoulder);
         let yaw = self.compute_shoulder_yaw(pose) - ref_yaw;
-        Some(TrackerPose::new(position, Self::yaw_to_quaternion(yaw)))
+        let roll = self.compute_shoulder_roll(pose) - ref_roll;
+        Some(TrackerPose::new(position, Self::yaw_roll_to_quaternion(yaw, roll)))
     }
 
     fn compute_knee(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32,
@@ -1912,8 +1935,9 @@ fn run_inference_loop(
                             result_sent_at: now,
                         });
                         if let Some(ref cal) = body_tracker.calibration {
-                            log!(logfile, "Calibrated! yaw={:.1}deg tilt={:.1}deg (yaw_samples={})",
+                            log!(logfile, "Calibrated! camera_yaw={:.1}deg tilt={:.1}deg shoulder_yaw={:.1}deg shoulder_roll={:.1}deg (yaw_samples={})",
                                 cal.camera_yaw.to_degrees(), cal.tilt_angle.to_degrees(),
+                                cal.yaw_shoulder.to_degrees(), cal.roll_shoulder.to_degrees(),
                                 if camera_yaw.abs() > 0.001 { "used" } else { "insufficient" });
                         } else {
                             log!(logfile, "Calibrated!");
@@ -1962,6 +1986,13 @@ fn run_inference_loop(
                             None => format!("{}(none)", tracker_names[i]),
                         }).collect();
                     log!(logfile, "[verbose] body_tracker raw: {}", raw_strs.join(" "));
+                    if let Some(ref chest) = body_poses.chest {
+                        let [qx, qy, qz, qw] = chest.rotation;
+                        let yaw_deg = f32::atan2(2.0 * (qw * qy + qx * qz), 1.0 - 2.0 * (qx * qx + qy * qy)).to_degrees();
+                        let roll_deg = f32::atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz)).to_degrees();
+                        log!(logfile, "[verbose] chest_rot: quat=({:.3},{:.3},{:.3},{:.3}) yaw={:.1}deg roll={:.1}deg",
+                            qx, qy, qz, qw, yaw_deg, roll_deg);
+                    }
                 }
 
                 let now = Instant::now();
