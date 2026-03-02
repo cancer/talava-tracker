@@ -138,6 +138,8 @@ const KP_NAMES: &[&str] = &[
 const MAX_REPROJ_ERROR: f32 = 120.0;
 const MAX_HIP_Z_JUMP: f32 = 0.3;
 const MAX_HIP_Z_REJECT_STREAK: u32 = 5;
+const MAX_FOOT_YAW: f32 = std::f32::consts::FRAC_PI_4;   // ±45°
+const MAX_FOOT_PITCH: f32 = std::f32::consts::FRAC_PI_6;  // ±30°
 
 fn find_hip_reference_pair(
     cameras: &[&CameraParams],
@@ -932,6 +934,7 @@ struct BodyCalibration {
     yaw_shoulder: f32,
     roll_shoulder: f32,
     yaw_left_foot: f32, yaw_right_foot: f32,
+    pitch_left_foot: f32, pitch_right_foot: f32,
     left_ankle_offset: Option<(f32, f32)>,
     right_ankle_offset: Option<(f32, f32)>,
     left_knee_offset: Option<(f32, f32)>,
@@ -1047,6 +1050,8 @@ impl BodyTracker {
         let roll_shoulder = self.compute_shoulder_roll(pose);
         let yaw_left_foot = self.compute_foot_yaw(pose, KP_LEFT_KNEE, KP_LEFT_ANKLE);
         let yaw_right_foot = self.compute_foot_yaw(pose, KP_RIGHT_KNEE, KP_RIGHT_ANKLE);
+        let pitch_left_foot = self.compute_foot_pitch(pose, KP_LEFT_KNEE, KP_LEFT_ANKLE, KP_LEFT_BIG_TOE);
+        let pitch_right_foot = self.compute_foot_pitch(pose, KP_RIGHT_KNEE, KP_RIGHT_ANKLE, KP_RIGHT_BIG_TOE);
 
         let la = pose.get_by_index(KP_LEFT_ANKLE);
         let left_ankle_offset = if la.is_valid(BODY_CONFIDENCE_THRESHOLD) { Some((la.x - hip_x, la.y - hip_y)) } else { None };
@@ -1067,6 +1072,7 @@ impl BodyTracker {
             hip_x, hip_y, hip_z,
             yaw_shoulder, roll_shoulder,
             yaw_left_foot, yaw_right_foot,
+            pitch_left_foot, pitch_right_foot,
             left_ankle_offset, right_ankle_offset,
             left_knee_offset, right_knee_offset,
             yaw_left_knee, yaw_right_knee,
@@ -1199,6 +1205,24 @@ impl BodyTracker {
         } else { 0.0 }
     }
 
+    fn compute_foot_pitch(&self, pose: &Pose, knee_idx: usize, ankle_idx: usize, toe_idx: usize) -> f32 {
+        let ankle = pose.get_by_index(ankle_idx);
+        let toe = pose.get_by_index(toe_idx);
+        // Primary: toe → ankle (direct foot orientation)
+        if ankle.is_valid(BODY_CONFIDENCE_THRESHOLD) && toe.is_valid(BODY_CONFIDENCE_THRESHOLD) {
+            let dz = toe.z - ankle.z;
+            let dy = toe.y - ankle.y;
+            return f32::atan2(dz, dy);
+        }
+        // Fallback: knee → ankle (shin angle)
+        let knee = pose.get_by_index(knee_idx);
+        if knee.is_valid(BODY_CONFIDENCE_THRESHOLD) && ankle.is_valid(BODY_CONFIDENCE_THRESHOLD) {
+            let dz = ankle.z - knee.z;
+            let dy = ankle.y - knee.y;
+            f32::atan2(dz, dy)
+        } else { 0.0 }
+    }
+
     fn compute_knee_yaw(&self, pose: &Pose, hip_idx: usize, knee_idx: usize) -> f32 {
         let hip = pose.get_by_index(hip_idx);
         let knee = pose.get_by_index(knee_idx);
@@ -1220,6 +1244,7 @@ impl BodyTracker {
         } else { 0.0 }
     }
 
+    #[cfg(test)]
     fn yaw_to_quaternion(yaw: f32) -> [f32; 4] {
         let half = yaw / 2.0;
         [0.0, half.sin(), 0.0, half.cos()]
@@ -1276,13 +1301,22 @@ impl BodyTracker {
         let mut position = self.convert_position(ax, ay, hip_x, hip_y, pos_z);
         position[1] += self.foot_y_offset;
 
+        let toe_idx = if is_left { KP_LEFT_BIG_TOE } else { KP_RIGHT_BIG_TOE };
         let yaw = if knee_valid && ankle_valid {
             let ref_yaw = self.calibration.as_ref().map_or(0.0, |c| {
                 if is_left { c.yaw_left_foot } else { c.yaw_right_foot }
             });
-            self.compute_foot_yaw(pose, knee_idx, ankle_idx) - ref_yaw
+            (self.compute_foot_yaw(pose, knee_idx, ankle_idx) - ref_yaw)
+                .clamp(-MAX_FOOT_YAW, MAX_FOOT_YAW)
         } else { 0.0 };
-        Some(TrackerPose::new(position, Self::yaw_to_quaternion(yaw)))
+        let pitch = if ankle_valid {
+            let ref_pitch = self.calibration.as_ref().map_or(0.0, |c| {
+                if is_left { c.pitch_left_foot } else { c.pitch_right_foot }
+            });
+            (self.compute_foot_pitch(pose, knee_idx, ankle_idx, toe_idx) - ref_pitch)
+                .clamp(-MAX_FOOT_PITCH, MAX_FOOT_PITCH)
+        } else { 0.0 };
+        Some(TrackerPose::new(position, Self::yaw_pitch_to_quaternion(yaw, pitch)))
     }
 
     fn compute_chest(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32) -> Option<TrackerPose> {
@@ -1475,6 +1509,8 @@ fn run_inference_loop(
     let mut camera_params: Vec<CameraParams> = Vec::new();
     let mut calibrated = false;
     let mut prev_poses: Vec<Option<Pose>> = Vec::new();
+    // (pre_sanitize: (LA, RA, LBigToe, RBigToe), post_sanitize: (LA, RA))
+    let mut pre_sanitize_confs: Vec<Option<((f32, f32, f32, f32), (f32, f32))>> = Vec::new();
     let mut poses_2d: Vec<Option<Pose>> = Vec::new();
     let mut pose_timestamps: Vec<Option<Instant>> = Vec::new();
     let mut cam_widths: Vec<u32> = Vec::new();
@@ -1594,6 +1630,7 @@ fn run_inference_loop(
 
                     num_cameras = cal.cameras.len();
                     prev_poses = vec![None; num_cameras];
+                    pre_sanitize_confs = vec![None; num_cameras];
                     poses_2d = vec![None; num_cameras];
                     pose_timestamps = vec![None; num_cameras];
                     calibrated = true;
@@ -1725,8 +1762,18 @@ fn run_inference_loop(
                                 cam_idx, infer_ms, kp_strs.join(" "));
                         }
 
+                        // Record pre-sanitize ankle/toe confidence for FPS diagnostics
+                        let pre_la = pose.get_by_index(KP_LEFT_ANKLE).confidence;
+                        let pre_ra = pose.get_by_index(KP_RIGHT_ANKLE).confidence;
+                        let pre_lt = pose.get_by_index(KP_LEFT_BIG_TOE).confidence;
+                        let pre_rt = pose.get_by_index(KP_RIGHT_BIG_TOE).confidence;
+
                         let pre_sanitize = if verbose { Some(pose.clone()) } else { None };
                         pose = sanitize_pose(&pose);
+
+                        let post_la = pose.get_by_index(KP_LEFT_ANKLE).confidence;
+                        let post_ra = pose.get_by_index(KP_RIGHT_ANKLE).confidence;
+                        pre_sanitize_confs[cam_idx] = Some(((pre_la, pre_ra, pre_lt, pre_rt), (post_la, post_ra)));
 
                         if verbose {
                             if let Some(ref pre) = pre_sanitize {
@@ -1935,9 +1982,10 @@ fn run_inference_loop(
                             result_sent_at: now,
                         });
                         if let Some(ref cal) = body_tracker.calibration {
-                            log!(logfile, "Calibrated! camera_yaw={:.1}deg tilt={:.1}deg shoulder_yaw={:.1}deg shoulder_roll={:.1}deg (yaw_samples={})",
+                            log!(logfile, "Calibrated! camera_yaw={:.1}deg tilt={:.1}deg shoulder_yaw={:.1}deg shoulder_roll={:.1}deg foot_pitch_L={:.1}deg foot_pitch_R={:.1}deg (yaw_samples={})",
                                 cal.camera_yaw.to_degrees(), cal.tilt_angle.to_degrees(),
                                 cal.yaw_shoulder.to_degrees(), cal.roll_shoulder.to_degrees(),
+                                cal.pitch_left_foot.to_degrees(), cal.pitch_right_foot.to_degrees(),
                                 if camera_yaw.abs() > 0.001 { "used" } else { "insufficient" });
                         } else {
                             log!(logfile, "Calibrated!");
@@ -2113,7 +2161,10 @@ fn run_inference_loop(
             for i in 0..TRACKER_COUNT {
                 if !stale[i] {
                     if let Some(ref p) = last_poses[i] {
-                        parts.push(format!("{}({:.2},{:.2},{:.2})", names[i], p.position[0], p.position[1], p.position[2]));
+                        let q_str = if i == 1 || i == 2 || i == 4 || i == 5 {
+                            format!(" q=[{:.2},{:.2},{:.2},{:.2}]", p.rotation[0], p.rotation[1], p.rotation[2], p.rotation[3])
+                        } else { String::new() };
+                        parts.push(format!("{}({:.2},{:.2},{:.2}){}", names[i], p.position[0], p.position[1], p.position[2], q_str));
                     }
                 }
             }
@@ -2124,7 +2175,14 @@ fn run_inference_loop(
                     let confs: Vec<String> = diag_kps.iter()
                         .map(|(name, idx)| format!("{}={:.2}", name, p.get_by_index(*idx).confidence))
                         .collect();
-                    cam_diag.push_str(&format!(" cam{}[{}]", cam_idx, confs.join(",")));
+                    let san_info = if let Some(((pre_la, pre_ra, pre_lt, pre_rt), (post_la, post_ra))) = pre_sanitize_confs[cam_idx] {
+                        let mut parts = Vec::new();
+                        if (pre_la - post_la).abs() > 0.01 { parts.push(format!("LA:{:.2}→{:.2}", pre_la, post_la)); }
+                        if (pre_ra - post_ra).abs() > 0.01 { parts.push(format!("RA:{:.2}→{:.2}", pre_ra, post_ra)); }
+                        if pre_lt > 0.01 || pre_rt > 0.01 { parts.push(format!("LT={:.2},RT={:.2}", pre_lt, pre_rt)); }
+                        if parts.is_empty() { String::new() } else { format!(" san({})", parts.join(",")) }
+                    } else { String::new() };
+                    cam_diag.push_str(&format!(" cam{}[{}]{}", cam_idx, confs.join(","), san_info));
                 }
             }
             let drops = frame_drop_count.swap(0, Ordering::Relaxed);
