@@ -51,6 +51,8 @@ struct Config {
     #[serde(default)]
     verbose: bool,
     #[serde(default)]
+    latency_offset_ms: f32,
+    #[serde(default)]
     filter: FilterConfig,
 }
 
@@ -75,12 +77,18 @@ struct FilterConfig {
     lower_body_position_min_cutoff: Option<f32>,
     #[serde(default)]
     lower_body_position_beta: Option<f32>,
+    #[serde(default = "default_hip_z_min_cutoff")]
+    hip_z_min_cutoff: f32,
+    #[serde(default = "default_hip_z_beta")]
+    hip_z_beta: f32,
 }
 
 fn default_pos_min_cutoff() -> f32 { 1.5 }
 fn default_pos_beta() -> f32 { 1.5 }
 fn default_rot_min_cutoff() -> f32 { 1.0 }
 fn default_rot_beta() -> f32 { 0.01 }
+fn default_hip_z_min_cutoff() -> f32 { 0.5 }
+fn default_hip_z_beta() -> f32 { 0.005 }
 
 impl Default for FilterConfig {
     fn default() -> Self {
@@ -91,6 +99,8 @@ impl Default for FilterConfig {
             rotation_beta: default_rot_beta(),
             lower_body_position_min_cutoff: None,
             lower_body_position_beta: None,
+            hip_z_min_cutoff: default_hip_z_min_cutoff(),
+            hip_z_beta: default_hip_z_beta(),
         }
     }
 }
@@ -872,12 +882,13 @@ impl Extrapolator {
         self.last_update = Some(now);
     }
 
-    fn predict(&self, dt_secs: f32) -> Option<TrackerPose> {
+    fn predict(&self, dt_secs: f32, latency_offset: f32) -> Option<TrackerPose> {
+        let total_dt = dt_secs + latency_offset;
         self.current.map(|cur| TrackerPose::new(
             [
-                cur.position[0] + self.velocity[0] * dt_secs,
-                cur.position[1] + self.velocity[1] * dt_secs,
-                cur.position[2] + self.velocity[2] * dt_secs,
+                cur.position[0] + self.velocity[0] * total_dt,
+                cur.position[1] + self.velocity[1] * total_dt,
+                cur.position[2] + self.velocity[2] * total_dt,
             ],
             cur.rotation,
         ))
@@ -963,10 +974,8 @@ struct BodyPoses {
 }
 
 impl BodyTracker {
-    fn new(mirror_x: bool, offset_y: f32, foot_y_offset: f32) -> Self {
-        // hip_z_filter: heavy smoothing to reject noise but track actual movement
-        // min_cutoff=0.5 (strong smoothing), beta=0.005 (slow response to speed)
-        let hip_z_filter = ScalarFilter::new(0.5, 0.005, 1.0);
+    fn new(mirror_x: bool, offset_y: f32, foot_y_offset: f32, filter_config: &FilterConfig) -> Self {
+        let hip_z_filter = ScalarFilter::new(filter_config.hip_z_min_cutoff, filter_config.hip_z_beta, 1.0);
         Self { mirror_x, offset_y, foot_y_offset, calibration: None, hip_z_filter }
     }
 
@@ -1412,6 +1421,7 @@ const VMT_SEND_HZ: f32 = 90.0;
 struct InferenceResult {
     poses: [Option<TrackerPose>; TRACKER_COUNT],
     stale: [bool; TRACKER_COUNT],
+    freshly_accepted: [bool; TRACKER_COUNT],
     camera_timestamp_us: u64,
     frame_received_at: Instant,
     infer_done_at: Instant,
@@ -1518,7 +1528,7 @@ fn run_inference_loop(
     let mut num_cameras: usize = 0;
     let mut cam_id_to_idx: std::collections::HashMap<u8, usize> = std::collections::HashMap::new();
 
-    let mut body_tracker = BodyTracker::new(config.mirror_x, config.offset_y, config.foot_y_offset);
+    let mut body_tracker = BodyTracker::new(config.mirror_x, config.offset_y, config.foot_y_offset, &config.filter);
     let mut last_compute_time = Instant::now();
     let mut filters: [PoseFilter; TRACKER_COUNT] = make_filters(&config.filter);
     let mut last_poses: [Option<TrackerPose>; TRACKER_COUNT] = [None; TRACKER_COUNT];
@@ -1636,7 +1646,7 @@ fn run_inference_loop(
                     calibrated = true;
 
                     // Reset tracker state
-                    body_tracker = BodyTracker::new(config.mirror_x, config.offset_y, config.foot_y_offset);
+                    body_tracker = BodyTracker::new(config.mirror_x, config.offset_y, config.foot_y_offset, &config.filter);
                     filters = make_filters(&config.filter);
                     last_poses = [None; TRACKER_COUNT];
                     last_raw_poses = [None; TRACKER_COUNT];
@@ -1976,6 +1986,7 @@ fn run_inference_loop(
                         let _ = result_tx.try_send(InferenceResult {
                             poses: [None; TRACKER_COUNT],
                             stale: [false; TRACKER_COUNT],
+                            freshly_accepted: [false; TRACKER_COUNT],
                             camera_timestamp_us: 0,
                             frame_received_at: now,
                             infer_done_at: now,
@@ -2000,6 +2011,7 @@ fn run_inference_loop(
 
         // --- Compute trackers ---
         let tracker_names = ["hip", "L_foot", "R_foot", "chest", "L_knee", "R_knee"];
+        let mut freshly_accepted = [false; TRACKER_COUNT];
         if let Some(ref pose) = pose_3d {
             let lh = pose.get_by_index(KP_LEFT_HIP);
             let rh = pose.get_by_index(KP_RIGHT_HIP);
@@ -2098,9 +2110,10 @@ fn run_inference_loop(
                             stale[i] = false;
                             reject_count[i] = 0;
                             accepted = true;
+                            freshly_accepted[i] = true;
                         } else if !velocity_ok && limb_ok {
                             reject_count[i] += 1;
-                            if reject_count[i] >= 5 {
+                            if reject_count[i] >= 3 {
                                 let z_ok = match last_raw_poses[i].as_ref() {
                                     Some(last) => (p.position[2] - last.position[2]).abs() <= 0.3,
                                     None => true,
@@ -2114,6 +2127,7 @@ fn run_inference_loop(
                                     stale[i] = false;
                                     reject_count[i] = 0;
                                     accepted = true;
+                                    freshly_accepted[i] = true;
                                 } else {
                                     if verbose { log!(logfile, "[verbose] {}: reset blocked (z_jump too large)", tracker_names[i]); }
                                     reject_count[i] = 0;
@@ -2144,6 +2158,7 @@ fn run_inference_loop(
             let result = InferenceResult {
                 poses: last_poses,
                 stale,
+                freshly_accepted,
                 camera_timestamp_us: current_camera_ts,
                 frame_received_at,
                 infer_done_at,
@@ -2161,9 +2176,7 @@ fn run_inference_loop(
             for i in 0..TRACKER_COUNT {
                 if !stale[i] {
                     if let Some(ref p) = last_poses[i] {
-                        let q_str = if i == 1 || i == 2 || i == 4 || i == 5 {
-                            format!(" q=[{:.2},{:.2},{:.2},{:.2}]", p.rotation[0], p.rotation[1], p.rotation[2], p.rotation[3])
-                        } else { String::new() };
+                        let q_str = format!(" q=[{:.2},{:.2},{:.2},{:.2}]", p.rotation[0], p.rotation[1], p.rotation[2], p.rotation[3]);
                         parts.push(format!("{}({:.2},{:.2},{:.2}){}", names[i], p.position[0], p.position[1], p.position[2], q_str));
                     }
                 }
@@ -2215,6 +2228,7 @@ fn vmt_send_loop(
     vmt: &VmtClient,
     logfile: &LogFile,
     interp_mode: &str,
+    latency_offset: f32,
 ) {
     let mut extrapolators: [Extrapolator; TRACKER_COUNT] = std::array::from_fn(|_| Extrapolator::new());
     let mut lerpers: [Lerper; TRACKER_COUNT] = std::array::from_fn(|_| Lerper::new());
@@ -2273,7 +2287,12 @@ fn vmt_send_loop(
                     for i in 0..TRACKER_COUNT {
                         if let Some(p) = result.poses[i] {
                             if !result.stale[i] {
-                                extrapolators[i].update(p);
+                                // Only update extrapolator velocity when the pose was freshly accepted.
+                                // During rejection streaks, the same stale pose is sent but we don't
+                                // want to zero out the extrapolator's velocity.
+                                if result.freshly_accepted[i] {
+                                    extrapolators[i].update(p);
+                                }
                                 lerpers[i].update(p, lerp_t);
                                 last_sent_poses[i] = Some(p);
                             }
@@ -2294,7 +2313,7 @@ fn vmt_send_loop(
             match interp_mode {
                 "extrapolate" => {
                     for i in 0..TRACKER_COUNT {
-                        if let Some(predicted) = extrapolators[i].predict(dt) {
+                        if let Some(predicted) = extrapolators[i].predict(dt, latency_offset) {
                             let _ = vmt.send(TRACKER_INDICES[i], 1, &predicted);
                         }
                     }
@@ -2441,6 +2460,7 @@ async fn main() -> Result<()> {
         let infer_trigger_log = Arc::clone(&trigger_log_send);
         let infer_trigger_cal = Arc::clone(&trigger_calibration);
         let infer_frame_drop = Arc::clone(&frame_drop_count);
+        let latency_offset = config.latency_offset_ms / 1000.0;
         let inference_handle = std::thread::spawn(move || {
             run_inference_loop(
                 &rx, &config, &mut detector, &mut person_detector, model_type, &result_tx,
@@ -2455,7 +2475,7 @@ async fn main() -> Result<()> {
         let vmt_logfile = Arc::clone(&logfile);
         let vmt_interp = interp_mode.clone();
         tokio::task::block_in_place(|| {
-            vmt_send_loop(&result_rx, &vmt, &vmt_logfile, &vmt_interp);
+            vmt_send_loop(&result_rx, &vmt, &vmt_logfile, &vmt_interp, latency_offset);
         });
 
         // Wait for inference thread to finish and reclaim ownership
@@ -2667,7 +2687,7 @@ mod tests {
 
     #[test]
     fn test_body_compute_uncalibrated_all_keypoints() {
-        let mut bt = BodyTracker::new(false, 0.0, 0.0);
+        let mut bt = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
         let pose = standing_pose();
         let result = bt.compute(&pose, DT);
 
@@ -2685,7 +2705,7 @@ mod tests {
 
     #[test]
     fn test_body_compute_uncalibrated_positions() {
-        let mut bt = BodyTracker::new(false, 0.0, 0.0);
+        let mut bt = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
         let pose = standing_pose();
         let result = bt.compute(&pose, DT);
 
@@ -2703,7 +2723,7 @@ mod tests {
 
     #[test]
     fn test_body_compute_no_hips_returns_all_none() {
-        let mut bt = BodyTracker::new(false, 0.0, 0.0);
+        let mut bt = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
         // Pose with no hip keypoints
         let pose = make_pose(&[
             (KP_LEFT_SHOULDER,  0.42, 0.30, 0.0, 0.9),
@@ -2723,7 +2743,7 @@ mod tests {
 
     #[test]
     fn test_body_compute_missing_ankle_uncalibrated_returns_none() {
-        let mut bt = BodyTracker::new(false, 0.0, 0.0);
+        let mut bt = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
         // Left ankle missing, uncalibrated — no ankle offset available, returns None
         let pose = make_pose(&[
             (KP_LEFT_HIP,       0.45, 0.50, 1.0, 0.9),
@@ -2738,7 +2758,7 @@ mod tests {
 
     #[test]
     fn test_body_compute_missing_ankle_and_knee_returns_none() {
-        let mut bt = BodyTracker::new(false, 0.0, 0.0);
+        let mut bt = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
         let pose = make_pose(&[
             (KP_LEFT_HIP,       0.45, 0.50, 1.0, 0.9),
             (KP_RIGHT_HIP,      0.55, 0.50, 1.0, 0.9),
@@ -2756,8 +2776,8 @@ mod tests {
 
     #[test]
     fn test_body_compute_mirror_x() {
-        let mut bt_normal = BodyTracker::new(false, 0.0, 0.0);
-        let mut bt_mirror = BodyTracker::new(true, 0.0, 0.0);
+        let mut bt_normal = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
+        let mut bt_mirror = BodyTracker::new(true, 0.0, 0.0, &FilterConfig::default());
         let pose = standing_pose();
 
         let normal = bt_normal.compute(&pose, DT);
@@ -2781,7 +2801,7 @@ mod tests {
 
     #[test]
     fn test_body_compute_offset_y() {
-        let mut bt = BodyTracker::new(false, 0.5, 0.0);
+        let mut bt = BodyTracker::new(false, 0.5, 0.0, &FilterConfig::default());
         let pose = standing_pose();
         let result = bt.compute(&pose, DT);
 
@@ -2792,11 +2812,11 @@ mod tests {
 
     #[test]
     fn test_body_compute_foot_y_offset() {
-        let mut bt = BodyTracker::new(false, 0.0, 0.1);
+        let mut bt = BodyTracker::new(false, 0.0, 0.1, &FilterConfig::default());
         let pose = standing_pose();
         let result = bt.compute(&pose, DT);
 
-        let mut bt_no_offset = BodyTracker::new(false, 0.0, 0.0);
+        let mut bt_no_offset = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
         let result_no_offset = bt_no_offset.compute(&pose, DT);
 
         let lf = result.left_foot.unwrap();
@@ -2810,7 +2830,7 @@ mod tests {
 
     #[test]
     fn test_body_calibrate_and_compute() {
-        let mut bt = BodyTracker::new(false, 0.0, 0.0);
+        let mut bt = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
         let calibration_pose = standing_pose();
         assert!(bt.calibrate(&calibration_pose, 0.0), "calibration should succeed");
         assert!(bt.is_calibrated());
@@ -2827,7 +2847,7 @@ mod tests {
 
     #[test]
     fn test_body_calibrate_shifts_position() {
-        let mut bt = BodyTracker::new(false, 0.0, 0.0);
+        let mut bt = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
         let calibration_pose = standing_pose();
         bt.calibrate(&calibration_pose, 0.0);
 
@@ -2852,7 +2872,7 @@ mod tests {
 
     #[test]
     fn test_body_calibrate_fails_without_hips() {
-        let mut bt = BodyTracker::new(false, 0.0, 0.0);
+        let mut bt = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
         let pose = make_pose(&[
             (KP_LEFT_SHOULDER,  0.42, 0.30, 0.0, 0.9),
             (KP_RIGHT_SHOULDER, 0.58, 0.30, 0.0, 0.9),
@@ -2863,7 +2883,7 @@ mod tests {
 
     #[test]
     fn test_body_compute_depth_from_z() {
-        let mut bt = BodyTracker::new(false, 0.0, 0.0);
+        let mut bt = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
         let pose = make_pose(&[
             (KP_LEFT_HIP,   0.45, 0.50, 2.0, 0.9),
             (KP_RIGHT_HIP,  0.55, 0.50, 2.0, 0.9),
@@ -2885,7 +2905,7 @@ mod tests {
 
     #[test]
     fn test_body_compute_depth_calibrated() {
-        let mut bt = BodyTracker::new(false, 0.0, 0.0);
+        let mut bt = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
         let cal_pose = make_pose(&[
             (KP_LEFT_HIP,   0.45, 0.50, 2.0, 0.9),
             (KP_RIGHT_HIP,  0.55, 0.50, 2.0, 0.9),
@@ -2957,7 +2977,7 @@ mod tests {
 
     #[test]
     fn test_convert_position_uncalibrated() {
-        let bt = BodyTracker::new(false, 0.0, 0.0);
+        let bt = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
         // hip at (0.5, 0.5), point at (0.3, 0.7)
         let pos = bt.convert_position(0.3, 0.7, 0.5, 0.5, 0.0);
         // ref=(0.5,0.5), global=(0.5-0.5,0.5-0.5)=(0,0)
@@ -2970,7 +2990,7 @@ mod tests {
 
     #[test]
     fn test_convert_position_mirror_x() {
-        let bt = BodyTracker::new(true, 0.0, 0.0);
+        let bt = BodyTracker::new(true, 0.0, 0.0, &FilterConfig::default());
         let pos = bt.convert_position(0.3, 0.7, 0.5, 0.5, 0.0);
         // pos_x before mirror = 0.2, after mirror = -0.2
         assert!((pos[0] - (-0.2)).abs() < 0.001, "mirror x={}", pos[0]);
@@ -3111,7 +3131,7 @@ mod tests {
 
     /// Helper: create a calibrated BodyTracker with a standard pose.
     fn make_calibrated_tracker(yaw: f32) -> (BodyTracker, Pose) {
-        let mut bt = BodyTracker::new(false, 0.0, 0.0);
+        let mut bt = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
         let pose = make_pose(&[
             (KP_LEFT_HIP,       0.45, 0.50, 2.0, 0.9),
             (KP_RIGHT_HIP,      0.55, 0.50, 2.0, 0.9),
