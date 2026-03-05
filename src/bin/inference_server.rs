@@ -77,18 +77,12 @@ struct FilterConfig {
     lower_body_position_min_cutoff: Option<f32>,
     #[serde(default)]
     lower_body_position_beta: Option<f32>,
-    #[serde(default = "default_hip_z_min_cutoff")]
-    hip_z_min_cutoff: f32,
-    #[serde(default = "default_hip_z_beta")]
-    hip_z_beta: f32,
 }
 
 fn default_pos_min_cutoff() -> f32 { 1.5 }
 fn default_pos_beta() -> f32 { 1.5 }
 fn default_rot_min_cutoff() -> f32 { 1.0 }
 fn default_rot_beta() -> f32 { 0.01 }
-fn default_hip_z_min_cutoff() -> f32 { 0.5 }
-fn default_hip_z_beta() -> f32 { 0.005 }
 
 impl Default for FilterConfig {
     fn default() -> Self {
@@ -99,8 +93,6 @@ impl Default for FilterConfig {
             rotation_beta: default_rot_beta(),
             lower_body_position_min_cutoff: None,
             lower_body_position_beta: None,
-            hip_z_min_cutoff: default_hip_z_min_cutoff(),
-            hip_z_beta: default_hip_z_beta(),
         }
     }
 }
@@ -964,20 +956,22 @@ const CONFIDENCE_THRESHOLD: f32 = 0.3;
 const BODY_CONFIDENCE_THRESHOLD: f32 = 0.2;
 
 struct BodyCalibration {
-    hip_x: f32, hip_y: f32,
-    hip_z: f32,
+    hip_x: f32, hip_y: f32, hip_z: f32,
     yaw_shoulder: f32,
     roll_shoulder: f32,
     yaw_left_foot: f32, yaw_right_foot: f32,
     pitch_left_foot: f32, pitch_right_foot: f32,
-    left_ankle_offset: Option<(f32, f32)>,
-    right_ankle_offset: Option<(f32, f32)>,
-    left_knee_offset: Option<(f32, f32)>,
-    right_knee_offset: Option<(f32, f32)>,
+    left_ankle_offset: Option<(f32, f32, f32)>,
+    right_ankle_offset: Option<(f32, f32, f32)>,
+    left_knee_offset: Option<(f32, f32, f32)>,
+    right_knee_offset: Option<(f32, f32, f32)>,
     yaw_left_knee: f32, yaw_right_knee: f32,
     pitch_left_knee: f32, pitch_right_knee: f32,
-    tilt_angle: f32,
+    /// Rotation matrix transpose (3x3, row-major) for camera→world transform
+    world_rotation: [f32; 9],
+    /// Stored for logging only
     camera_yaw: f32,
+    tilt_angle: f32,
 }
 
 struct BodyTracker {
@@ -985,7 +979,6 @@ struct BodyTracker {
     offset_y: f32,
     foot_y_offset: f32,
     calibration: Option<BodyCalibration>,
-    hip_z_filter: ScalarFilter,
 }
 
 struct BodyPoses {
@@ -998,9 +991,8 @@ struct BodyPoses {
 }
 
 impl BodyTracker {
-    fn new(mirror_x: bool, offset_y: f32, foot_y_offset: f32, filter_config: &FilterConfig) -> Self {
-        let hip_z_filter = ScalarFilter::new(filter_config.hip_z_min_cutoff, filter_config.hip_z_beta, 1.0);
-        Self { mirror_x, offset_y, foot_y_offset, calibration: None, hip_z_filter }
+    fn new(mirror_x: bool, offset_y: f32, foot_y_offset: f32) -> Self {
+        Self { mirror_x, offset_y, foot_y_offset, calibration: None }
     }
 
     fn is_calibrated(&self) -> bool { self.calibration.is_some() }
@@ -1026,50 +1018,45 @@ impl BodyTracker {
         f32::atan2(lower_z - hip_z, lower_y - hip_y)
     }
 
-    fn rotate_pose_xz(pose: &Pose, yaw: f32) -> Pose {
-        let (sin_y, cos_y) = yaw.sin_cos();
-        let mut rotated = pose.clone();
-        for kp in rotated.keypoints.iter_mut() {
-            let x = kp.x;
-            let z = kp.z;
-            kp.x = x * cos_y + z * sin_y;
-            kp.z = -x * sin_y + z * cos_y;
-        }
-        rotated
+    /// Build the world rotation matrix M that converts camera coordinates to
+    /// world coordinates: M = R_x(-tilt) * R_y(yaw).
+    /// This undoes the camera's tilt (X-axis rotation) and applies the yaw
+    /// (Y-axis rotation) to align with the gravity-based coordinate system.
+    fn build_world_rotation(yaw: f32, tilt: f32) -> [f32; 9] {
+        let (sy, cy) = yaw.sin_cos();
+        let (st, ct) = tilt.sin_cos();
+        // R_y(yaw):     [[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]]
+        // R_x(-tilt):   [[1, 0, 0], [0, ct, st], [0, -st, ct]]
+        // M = R_x(-tilt) * R_y(yaw):
+        [
+            cy,        0.0,  sy,
+            -sy * st,  ct,   cy * st,
+            -sy * ct,  -st,  cy * ct,
+        ]
     }
 
-    fn rotate_pose_yz(pose: &Pose, tilt: f32, filtered_hip_z: f32) -> Pose {
-        let (sin_t, cos_t) = tilt.sin_cos();
-        let mut rotated = pose.clone();
-        // Tilt correction: camera is tilted by `tilt` radians, so the
-        // triangulated y axis is not truly vertical. We rotate y and z
-        // to correct this.
-        //
-        // For y: use filtered_hip_z (OneEuro-filtered hip z) instead of
-        // per-keypoint z. This tracks actual body movement in z (walking
-        // forward/backward) so the rotation correctly compensates, while
-        // rejecting frame-to-frame triangulation noise that would leak
-        // into y via sin(tilt).
-        //
-        // For z: use per-keypoint y and z for correct depth calculation.
-        for kp in rotated.keypoints.iter_mut() {
-            let y = kp.y;
-            kp.y = y * cos_t + filtered_hip_z * sin_t;
-            kp.z = -y * sin_t + kp.z * cos_t;
+    /// Transform a pose from camera coordinates to world coordinates using R^T.
+    fn to_world_coords(pose: &Pose, r_t: &[f32; 9]) -> Pose {
+        let mut world = pose.clone();
+        for kp in world.keypoints.iter_mut() {
+            let (x, y, z) = (kp.x, kp.y, kp.z);
+            kp.x = r_t[0] * x + r_t[1] * y + r_t[2] * z;
+            kp.y = r_t[3] * x + r_t[4] * y + r_t[5] * z;
+            kp.z = r_t[6] * x + r_t[7] * y + r_t[8] * z;
         }
-        rotated
+        world
     }
 
     fn calibrate(&mut self, pose: &Pose, camera_yaw: f32) -> bool {
-        let yaw_corrected = Self::rotate_pose_xz(pose, camera_yaw);
+        // Build rotation matrix from yaw-corrected pose to compute tilt
+        let r_yaw_only = Self::build_world_rotation(camera_yaw, 0.0);
+        let yaw_corrected = Self::to_world_coords(pose, &r_yaw_only);
         let tilt_angle = Self::compute_tilt_angle(&yaw_corrected);
-        let cal_lh = yaw_corrected.get_by_index(KP_LEFT_HIP);
-        let cal_rh = yaw_corrected.get_by_index(KP_RIGHT_HIP);
-        let cal_hip_z = if cal_lh.is_valid(0.0) && cal_rh.is_valid(0.0) {
-            (cal_lh.z + cal_rh.z) / 2.0
-        } else { 0.0 };
-        let rotated = Self::rotate_pose_yz(&yaw_corrected, tilt_angle, cal_hip_z);
-        let pose = &rotated;
+
+        // Build full R^T and transform to world coordinates
+        let world_rotation = Self::build_world_rotation(camera_yaw, tilt_angle);
+        let world_pose = Self::to_world_coords(pose, &world_rotation);
+        let pose = &world_pose;
 
         let lh = pose.get_by_index(KP_LEFT_HIP);
         let rh = pose.get_by_index(KP_RIGHT_HIP);
@@ -1087,14 +1074,14 @@ impl BodyTracker {
         let pitch_right_foot = self.compute_foot_pitch(pose, KP_RIGHT_KNEE, KP_RIGHT_ANKLE, KP_RIGHT_BIG_TOE);
 
         let la = pose.get_by_index(KP_LEFT_ANKLE);
-        let left_ankle_offset = if la.is_valid(BODY_CONFIDENCE_THRESHOLD) { Some((la.x - hip_x, la.y - hip_y)) } else { None };
+        let left_ankle_offset = if la.is_valid(BODY_CONFIDENCE_THRESHOLD) { Some((la.x - hip_x, la.y - hip_y, la.z - hip_z)) } else { None };
         let ra = pose.get_by_index(KP_RIGHT_ANKLE);
-        let right_ankle_offset = if ra.is_valid(BODY_CONFIDENCE_THRESHOLD) { Some((ra.x - hip_x, ra.y - hip_y)) } else { None };
+        let right_ankle_offset = if ra.is_valid(BODY_CONFIDENCE_THRESHOLD) { Some((ra.x - hip_x, ra.y - hip_y, ra.z - hip_z)) } else { None };
 
         let lk = pose.get_by_index(KP_LEFT_KNEE);
-        let left_knee_offset = if lk.is_valid(BODY_CONFIDENCE_THRESHOLD) { Some((lk.x - hip_x, lk.y - hip_y)) } else { None };
+        let left_knee_offset = if lk.is_valid(BODY_CONFIDENCE_THRESHOLD) { Some((lk.x - hip_x, lk.y - hip_y, lk.z - hip_z)) } else { None };
         let rk = pose.get_by_index(KP_RIGHT_KNEE);
-        let right_knee_offset = if rk.is_valid(BODY_CONFIDENCE_THRESHOLD) { Some((rk.x - hip_x, rk.y - hip_y)) } else { None };
+        let right_knee_offset = if rk.is_valid(BODY_CONFIDENCE_THRESHOLD) { Some((rk.x - hip_x, rk.y - hip_y, rk.z - hip_z)) } else { None };
 
         let yaw_left_knee = self.compute_knee_yaw(pose, KP_LEFT_HIP, KP_LEFT_KNEE);
         let yaw_right_knee = self.compute_knee_yaw(pose, KP_RIGHT_HIP, KP_RIGHT_KNEE);
@@ -1110,101 +1097,58 @@ impl BodyTracker {
             left_knee_offset, right_knee_offset,
             yaw_left_knee, yaw_right_knee,
             pitch_left_knee, pitch_right_knee,
-            tilt_angle,
-            camera_yaw,
+            world_rotation,
+            camera_yaw, tilt_angle,
         });
-        // Initialize hip_z_filter with calibration value so it starts
-        // from the correct position without warm-up drift
-        self.hip_z_filter.reset();
-        self.hip_z_filter.filter(cal_hip_z, 1.0 / 30.0);
         true
     }
 
-    fn compute(&mut self, pose: &Pose, dt: f32) -> BodyPoses {
-        let yaw = self.calibration.as_ref().map_or(0.0, |c| c.camera_yaw);
-        let yaw_corrected;
-        let pose = if yaw.abs() > 0.001 {
-            yaw_corrected = Self::rotate_pose_xz(pose, yaw);
-            &yaw_corrected
-        } else { pose };
+    fn compute(&mut self, pose: &Pose, _dt: f32) -> BodyPoses {
+        // Identity R^T (no rotation) used when uncalibrated
+        const IDENTITY: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let r_t = self.calibration.as_ref().map_or(&IDENTITY, |c| &c.world_rotation);
 
-        let tilt = self.calibration.as_ref().map_or(0.0, |c| c.tilt_angle);
-        // Get current hip z and filter it for use in tilt rotation
-        let lh = pose.get_by_index(KP_LEFT_HIP);
-        let rh = pose.get_by_index(KP_RIGHT_HIP);
-        let raw_hip_z = if lh.is_valid(BODY_CONFIDENCE_THRESHOLD) && rh.is_valid(BODY_CONFIDENCE_THRESHOLD) {
-            (lh.z + rh.z) / 2.0
-        } else {
-            self.calibration.as_ref().map_or(0.0, |c| c.hip_z)
-        };
-        let filtered_hip_z = self.hip_z_filter.filter(raw_hip_z, dt);
-        let rotated;
-        let pose = if tilt.abs() > 0.001 {
-            rotated = Self::rotate_pose_yz(pose, tilt, filtered_hip_z);
-            &rotated
+        let world;
+        let pose = if r_t != &IDENTITY {
+            world = Self::to_world_coords(pose, r_t);
+            &world
         } else { pose };
 
         let lh = pose.get_by_index(KP_LEFT_HIP);
         let rh = pose.get_by_index(KP_RIGHT_HIP);
         let hip_center = if lh.is_valid(BODY_CONFIDENCE_THRESHOLD) && rh.is_valid(BODY_CONFIDENCE_THRESHOLD) {
-            Some(((lh.x + rh.x) / 2.0, (lh.y + rh.y) / 2.0))
+            Some(((lh.x + rh.x) / 2.0, (lh.y + rh.y) / 2.0, (lh.z + rh.z) / 2.0))
         } else { None };
 
-        let hip_z = self.estimate_depth(pose);
-        let (lf_z, rf_z, ch_z, lk_z, rk_z) = (
-            self.keypoint_depth(pose, KP_LEFT_ANKLE, hip_z),
-            self.keypoint_depth(pose, KP_RIGHT_ANKLE, hip_z),
-            hip_z,
-            self.keypoint_depth(pose, KP_LEFT_KNEE, hip_z),
-            self.keypoint_depth(pose, KP_RIGHT_KNEE, hip_z),
-        );
-
-        let mut left_foot = self.compute_foot(pose, hip_center, lf_z, KP_LEFT_KNEE, KP_LEFT_ANKLE, true);
-        let mut right_foot = self.compute_foot(pose, hip_center, rf_z, KP_RIGHT_KNEE, KP_RIGHT_ANKLE, false);
-        let mut left_knee = self.compute_knee(pose, hip_center, lk_z, KP_LEFT_HIP, KP_LEFT_KNEE, true);
-        let mut right_knee = self.compute_knee(pose, hip_center, rk_z, KP_RIGHT_HIP, KP_RIGHT_KNEE, false);
+        let mut left_foot = self.compute_foot(pose, hip_center, KP_LEFT_KNEE, KP_LEFT_ANKLE, true);
+        let mut right_foot = self.compute_foot(pose, hip_center, KP_RIGHT_KNEE, KP_RIGHT_ANKLE, false);
+        let mut left_knee = self.compute_knee(pose, hip_center, KP_LEFT_HIP, KP_LEFT_KNEE, true);
+        let mut right_knee = self.compute_knee(pose, hip_center, KP_RIGHT_HIP, KP_RIGHT_KNEE, false);
 
         Self::reject_duplicate_pair(&mut left_foot, &mut right_foot);
         Self::reject_duplicate_pair(&mut left_knee, &mut right_knee);
 
         BodyPoses {
-            hip: self.compute_hip(pose, hip_center, hip_z),
+            hip: self.compute_hip(pose, hip_center),
             left_foot, right_foot,
-            chest: self.compute_chest(pose, hip_center, ch_z),
+            chest: self.compute_chest(pose, hip_center),
             left_knee, right_knee,
         }
     }
 
-    fn convert_position(&self, x: f32, y: f32, hip_x: f32, hip_y: f32, pos_z: f32) -> [f32; 3] {
-        let (ref_x, ref_y) = match &self.calibration {
-            Some(cal) => (cal.hip_x, cal.hip_y),
-            None => (0.5, 0.5),
+    /// Convert world-coordinate position to tracker position relative to calibration origin.
+    /// In camera/world coords: x=right, y=down, z=forward.
+    /// Output: x=right (or left if mirror), y=up, z=toward-camera.
+    fn convert_position(&self, x: f32, y: f32, z: f32) -> [f32; 3] {
+        let (ref_x, ref_y, ref_z) = match &self.calibration {
+            Some(cal) => (cal.hip_x, cal.hip_y, cal.hip_z),
+            None => (0.0, 0.0, 0.0),
         };
-        let global_x = ref_x - hip_x;
-        let global_y = ref_y - hip_y;
-        let mut pos_x = global_x + (hip_x - x);
+        let mut pos_x = ref_x - x;
         if self.mirror_x { pos_x = -pos_x; }
-        let pos_y = self.offset_y + (global_y + (hip_y - y));
+        let pos_y = self.offset_y + (ref_y - y);
+        let pos_z = ref_z - z;
         [pos_x, pos_y, pos_z]
-    }
-
-    fn estimate_depth(&self, pose: &Pose) -> f32 {
-        let lh = pose.get_by_index(KP_LEFT_HIP);
-        let rh = pose.get_by_index(KP_RIGHT_HIP);
-        if lh.is_valid(BODY_CONFIDENCE_THRESHOLD) && rh.is_valid(BODY_CONFIDENCE_THRESHOLD) && (lh.z.abs() > 0.001 || rh.z.abs() > 0.001) {
-            let hip_z = (lh.z + rh.z) / 2.0;
-            let ref_z = self.calibration.as_ref().map_or(0.0, |c| c.hip_z);
-            return ref_z - hip_z;
-        }
-        0.0
-    }
-
-    fn keypoint_depth(&self, pose: &Pose, kp_idx: usize, fallback: f32) -> f32 {
-        let kp = pose.get_by_index(kp_idx);
-        if kp.is_valid(BODY_CONFIDENCE_THRESHOLD) && kp.z.abs() > 0.001 {
-            let ref_z = self.calibration.as_ref().map_or(0.0, |c| c.hip_z);
-            ref_z - kp.z
-        } else { fallback }
     }
 
     fn compute_shoulder_yaw(&self, pose: &Pose) -> f32 {
@@ -1303,9 +1247,9 @@ impl BodyTracker {
         }
     }
 
-    fn compute_hip(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32) -> Option<TrackerPose> {
-        let (hip_x, hip_y) = hip_center?;
-        let position = self.convert_position(hip_x, hip_y, hip_x, hip_y, pos_z);
+    fn compute_hip(&self, pose: &Pose, hip_center: Option<(f32, f32, f32)>) -> Option<TrackerPose> {
+        let (hip_x, hip_y, hip_z) = hip_center?;
+        let position = self.convert_position(hip_x, hip_y, hip_z);
         let ref_yaw = self.calibration.as_ref().map_or(0.0, |c| c.yaw_shoulder);
         let ref_roll = self.calibration.as_ref().map_or(0.0, |c| c.roll_shoulder);
         let yaw = self.compute_shoulder_yaw(pose) - ref_yaw;
@@ -1313,25 +1257,22 @@ impl BodyTracker {
         Some(TrackerPose::new(position, Self::yaw_roll_to_quaternion(yaw, roll)))
     }
 
-    fn compute_foot(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32,
+    fn compute_foot(&self, pose: &Pose, hip_center: Option<(f32, f32, f32)>,
         knee_idx: usize, ankle_idx: usize, is_left: bool,
     ) -> Option<TrackerPose> {
-        let (hip_x, hip_y) = hip_center?;
+        let (hip_x, hip_y, hip_z) = hip_center?;
         let knee = pose.get_by_index(knee_idx);
         let ankle = pose.get_by_index(ankle_idx);
         let ankle_valid = ankle.is_valid(BODY_CONFIDENCE_THRESHOLD);
         let knee_valid = knee.is_valid(BODY_CONFIDENCE_THRESHOLD);
-        // When ankle is not detected, use calibration-time ankle offset
-        // relative to hip. This follows body movement (unlike None/hold)
-        // without jumping to knee height (unlike knee fallback).
-        let (ax, ay) = if ankle_valid { (ankle.x, ankle.y) }
+        let (ax, ay, az) = if ankle_valid { (ankle.x, ankle.y, ankle.z) }
             else if let Some(cal) = &self.calibration {
                 let offset = if is_left { cal.left_ankle_offset } else { cal.right_ankle_offset };
-                if let Some((ox, oy)) = offset { (hip_x + ox, hip_y + oy) }
+                if let Some((ox, oy, oz)) = offset { (hip_x + ox, hip_y + oy, hip_z + oz) }
                 else { return None; }
             } else { return None; };
 
-        let mut position = self.convert_position(ax, ay, hip_x, hip_y, pos_z);
+        let mut position = self.convert_position(ax, ay, az);
         position[1] += self.foot_y_offset;
         position[1] = position[1].max(0.0); // floor clamp
 
@@ -1353,24 +1294,25 @@ impl BodyTracker {
         Some(TrackerPose::new(position, Self::yaw_pitch_to_quaternion(yaw, pitch)))
     }
 
-    fn compute_chest(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32) -> Option<TrackerPose> {
-        let (hip_x, hip_y) = hip_center?;
+    fn compute_chest(&self, pose: &Pose, hip_center: Option<(f32, f32, f32)>) -> Option<TrackerPose> {
+        let (hip_x, hip_y, hip_z) = hip_center?;
         let ls = pose.get_by_index(KP_LEFT_SHOULDER);
         let rs = pose.get_by_index(KP_RIGHT_SHOULDER);
         let ls_valid = ls.is_valid(BODY_CONFIDENCE_THRESHOLD);
         let rs_valid = rs.is_valid(BODY_CONFIDENCE_THRESHOLD);
         if !ls_valid && !rs_valid { return None; }
 
-        let shoulder_y = match (ls_valid, rs_valid) {
-            (true, true) => (ls.y + rs.y) / 2.0,
-            (true, false) => ls.y,
-            (false, true) => rs.y,
+        let (shoulder_y, shoulder_z) = match (ls_valid, rs_valid) {
+            (true, true) => ((ls.y + rs.y) / 2.0, (ls.z + rs.z) / 2.0),
+            (true, false) => (ls.y, ls.z),
+            (false, true) => (rs.y, rs.z),
             _ => unreachable!(),
         };
         let x = if ls_valid && rs_valid { (ls.x + rs.x) / 2.0 } else { hip_x };
         let y = shoulder_y + (hip_y - shoulder_y) * 0.35;
+        let z = shoulder_z + (hip_z - shoulder_z) * 0.35;
 
-        let position = self.convert_position(x, y, hip_x, hip_y, pos_z);
+        let position = self.convert_position(x, y, z);
         let ref_yaw = self.calibration.as_ref().map_or(0.0, |c| c.yaw_shoulder);
         let ref_roll = self.calibration.as_ref().map_or(0.0, |c| c.roll_shoulder);
         let yaw = self.compute_shoulder_yaw(pose) - ref_yaw;
@@ -1378,21 +1320,21 @@ impl BodyTracker {
         Some(TrackerPose::new(position, Self::yaw_roll_to_quaternion(yaw, roll)))
     }
 
-    fn compute_knee(&self, pose: &Pose, hip_center: Option<(f32, f32)>, pos_z: f32,
+    fn compute_knee(&self, pose: &Pose, hip_center: Option<(f32, f32, f32)>,
         hip_idx: usize, knee_idx: usize, is_left: bool,
     ) -> Option<TrackerPose> {
-        let (hip_x, hip_y) = hip_center?;
+        let (hip_x, hip_y, hip_z) = hip_center?;
         let knee = pose.get_by_index(knee_idx);
 
-        let (kx, ky, has_keypoint) = if knee.is_valid(BODY_CONFIDENCE_THRESHOLD) {
-            (knee.x, knee.y, true)
+        let (kx, ky, kz, has_keypoint) = if knee.is_valid(BODY_CONFIDENCE_THRESHOLD) {
+            (knee.x, knee.y, knee.z, true)
         } else if let Some(cal) = &self.calibration {
             let offset = if is_left { cal.left_knee_offset } else { cal.right_knee_offset };
-            if let Some((ox, oy)) = offset { (hip_x + ox, hip_y + oy, false) }
+            if let Some((ox, oy, oz)) = offset { (hip_x + ox, hip_y + oy, hip_z + oz, false) }
             else { return None; }
         } else { return None; };
 
-        let position = self.convert_position(kx, ky, hip_x, hip_y, pos_z);
+        let position = self.convert_position(kx, ky, kz);
         let (yaw, pitch) = if has_keypoint {
             let ref_yaw = self.calibration.as_ref().map_or(0.0, |c| {
                 if is_left { c.yaw_left_knee } else { c.yaw_right_knee }
@@ -1553,7 +1495,7 @@ fn run_inference_loop(
     let mut num_cameras: usize = 0;
     let mut cam_id_to_idx: std::collections::HashMap<u8, usize> = std::collections::HashMap::new();
 
-    let mut body_tracker = BodyTracker::new(config.mirror_x, config.offset_y, config.foot_y_offset, &config.filter);
+    let mut body_tracker = BodyTracker::new(config.mirror_x, config.offset_y, config.foot_y_offset);
     let mut last_compute_time = Instant::now();
     let mut filters: [PoseFilter; TRACKER_COUNT] = make_filters(&config.filter);
     let mut last_poses: [Option<TrackerPose>; TRACKER_COUNT] = [None; TRACKER_COUNT];
@@ -1671,7 +1613,7 @@ fn run_inference_loop(
                     calibrated = true;
 
                     // Reset tracker state
-                    body_tracker = BodyTracker::new(config.mirror_x, config.offset_y, config.foot_y_offset, &config.filter);
+                    body_tracker = BodyTracker::new(config.mirror_x, config.offset_y, config.foot_y_offset);
                     filters = make_filters(&config.filter);
                     last_poses = [None; TRACKER_COUNT];
                     last_raw_poses = [None; TRACKER_COUNT];
@@ -2712,7 +2654,7 @@ mod tests {
 
     #[test]
     fn test_body_compute_uncalibrated_all_keypoints() {
-        let mut bt = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
+        let mut bt = BodyTracker::new(false, 0.0, 0.0);
         let pose = standing_pose();
         let result = bt.compute(&pose, DT);
 
@@ -2730,25 +2672,25 @@ mod tests {
 
     #[test]
     fn test_body_compute_uncalibrated_positions() {
-        let mut bt = BodyTracker::new(false, 0.0, 1.0, &FilterConfig::default());
+        let mut bt = BodyTracker::new(false, 0.0, 1.0);
         let pose = standing_pose();
         let result = bt.compute(&pose, DT);
 
         let hip = result.hip.unwrap();
-        // Uncalibrated: ref=(0.5,0.5), hip_center=(0.5,0.5)
-        // convert_position: global=(0.5-0.5, 0.5-0.5)=(0,0), pos_x=0+(0.5-0.5)=0, pos_y=0+0=0
-        assert!((hip.position[0]).abs() < 0.01, "hip x={}", hip.position[0]);
-        assert!((hip.position[1]).abs() < 0.01, "hip y={}", hip.position[1]);
+        // Uncalibrated: ref=(0,0,0), hip_center=(0.5,0.5,1.0)
+        // pos_x = 0 - 0.5 = -0.5, pos_y = 0 + (0 - 0.5) = -0.5
+        assert!((hip.position[0] - (-0.5)).abs() < 0.01, "hip x={}", hip.position[0]);
+        assert!((hip.position[1] - (-0.5)).abs() < 0.01, "hip y={}", hip.position[1]);
 
-        // Feet: ankles at y=0.8, hip at y=0.5
-        // pos_y = 0 + (0 + (0.5 - 0.8)) = -0.3, foot_y_offset=1.0 → -0.3+1.0=0.7
+        // Feet: ankles at y=0.8, z=1.0
+        // pos_y = 0 + (0 - 0.8) = -0.8, foot_y_offset=1.0 → -0.8+1.0=0.2
         let lf = result.left_foot.unwrap();
-        assert!((lf.position[1] - 0.7).abs() < 0.01, "left_foot y={}", lf.position[1]);
+        assert!((lf.position[1] - 0.2).abs() < 0.01, "left_foot y={}", lf.position[1]);
     }
 
     #[test]
     fn test_body_compute_no_hips_returns_all_none() {
-        let mut bt = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
+        let mut bt = BodyTracker::new(false, 0.0, 0.0);
         // Pose with no hip keypoints
         let pose = make_pose(&[
             (KP_LEFT_SHOULDER,  0.42, 0.30, 0.0, 0.9),
@@ -2768,7 +2710,7 @@ mod tests {
 
     #[test]
     fn test_body_compute_missing_ankle_uncalibrated_returns_none() {
-        let mut bt = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
+        let mut bt = BodyTracker::new(false, 0.0, 0.0);
         // Left ankle missing, uncalibrated — no ankle offset available, returns None
         let pose = make_pose(&[
             (KP_LEFT_HIP,       0.45, 0.50, 1.0, 0.9),
@@ -2783,7 +2725,7 @@ mod tests {
 
     #[test]
     fn test_body_compute_missing_ankle_and_knee_returns_none() {
-        let mut bt = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
+        let mut bt = BodyTracker::new(false, 0.0, 0.0);
         let pose = make_pose(&[
             (KP_LEFT_HIP,       0.45, 0.50, 1.0, 0.9),
             (KP_RIGHT_HIP,      0.55, 0.50, 1.0, 0.9),
@@ -2801,8 +2743,8 @@ mod tests {
 
     #[test]
     fn test_body_compute_mirror_x() {
-        let mut bt_normal = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
-        let mut bt_mirror = BodyTracker::new(true, 0.0, 0.0, &FilterConfig::default());
+        let mut bt_normal = BodyTracker::new(false, 0.0, 0.0);
+        let mut bt_mirror = BodyTracker::new(true, 0.0, 0.0);
         let pose = standing_pose();
 
         let normal = bt_normal.compute(&pose, DT);
@@ -2826,27 +2768,28 @@ mod tests {
 
     #[test]
     fn test_body_compute_offset_y() {
-        let mut bt = BodyTracker::new(false, 0.5, 0.0, &FilterConfig::default());
+        let mut bt = BodyTracker::new(false, 0.5, 0.0);
         let pose = standing_pose();
         let result = bt.compute(&pose, DT);
 
         let hip = result.hip.unwrap();
-        // offset_y=0.5 is added to all y positions
-        assert!((hip.position[1] - 0.5).abs() < 0.01, "hip y with offset={}", hip.position[1]);
+        // Uncalibrated: ref=(0,0,0), hip at y=0.5
+        // pos_y = offset_y + (0 - 0.5) = 0.5 + (-0.5) = 0
+        assert!((hip.position[1]).abs() < 0.01, "hip y with offset={}", hip.position[1]);
     }
 
     #[test]
     fn test_body_compute_foot_y_offset() {
-        // Use foot_y_offset=1.0 to keep foot y positive (avoid floor clamp)
-        let mut bt = BodyTracker::new(false, 0.0, 1.0, &FilterConfig::default());
+        let mut bt = BodyTracker::new(false, 0.0, 1.0);
         let pose = standing_pose();
         let result = bt.compute(&pose, DT);
 
-        // base foot y = -0.3 (ankle at 0.8, hip at 0.5), + offset 1.0 = 0.7
+        // Uncalibrated: ref=(0,0,0), ankle at y=0.8
+        // base foot y = 0 + (0 - 0.8) = -0.8, + foot_y_offset 1.0 = 0.2
         let lf = result.left_foot.unwrap();
         assert!(
-            (lf.position[1] - 0.7).abs() < 0.01,
-            "foot_y_offset=1.0: expected 0.7, got {}",
+            (lf.position[1] - 0.2).abs() < 0.01,
+            "foot_y_offset=1.0: expected 0.2, got {}",
             lf.position[1]
         );
     }
@@ -2854,7 +2797,7 @@ mod tests {
     #[test]
     fn test_body_compute_foot_floor_clamp() {
         // foot_y_offset=-1.0 forces foot y well below zero; floor clamp should keep y >= 0
-        let mut bt = BodyTracker::new(false, 0.0, -1.0, &FilterConfig::default());
+        let mut bt = BodyTracker::new(false, 0.0, -1.0);
         let pose = standing_pose();
         let result = bt.compute(&pose, DT);
 
@@ -2869,7 +2812,7 @@ mod tests {
 
     #[test]
     fn test_body_calibrate_and_compute() {
-        let mut bt = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
+        let mut bt = BodyTracker::new(false, 0.0, 0.0);
         let calibration_pose = standing_pose();
         assert!(bt.calibrate(&calibration_pose, 0.0), "calibration should succeed");
         assert!(bt.is_calibrated());
@@ -2886,7 +2829,7 @@ mod tests {
 
     #[test]
     fn test_body_calibrate_shifts_position() {
-        let mut bt = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
+        let mut bt = BodyTracker::new(false, 0.0, 0.0);
         let calibration_pose = standing_pose();
         bt.calibrate(&calibration_pose, 0.0);
 
@@ -2911,7 +2854,7 @@ mod tests {
 
     #[test]
     fn test_body_calibrate_fails_without_hips() {
-        let mut bt = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
+        let mut bt = BodyTracker::new(false, 0.0, 0.0);
         let pose = make_pose(&[
             (KP_LEFT_SHOULDER,  0.42, 0.30, 0.0, 0.9),
             (KP_RIGHT_SHOULDER, 0.58, 0.30, 0.0, 0.9),
@@ -2922,7 +2865,7 @@ mod tests {
 
     #[test]
     fn test_body_compute_depth_from_z() {
-        let mut bt = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
+        let mut bt = BodyTracker::new(false, 0.0, 0.0);
         let pose = make_pose(&[
             (KP_LEFT_HIP,   0.45, 0.50, 2.0, 0.9),
             (KP_RIGHT_HIP,  0.55, 0.50, 2.0, 0.9),
@@ -2944,7 +2887,7 @@ mod tests {
 
     #[test]
     fn test_body_compute_depth_calibrated() {
-        let mut bt = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
+        let mut bt = BodyTracker::new(false, 0.0, 0.0);
         let cal_pose = make_pose(&[
             (KP_LEFT_HIP,   0.45, 0.50, 2.0, 0.9),
             (KP_RIGHT_HIP,  0.55, 0.50, 2.0, 0.9),
@@ -3016,23 +2959,21 @@ mod tests {
 
     #[test]
     fn test_convert_position_uncalibrated() {
-        let bt = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
-        // hip at (0.5, 0.5), point at (0.3, 0.7)
-        let pos = bt.convert_position(0.3, 0.7, 0.5, 0.5, 0.0);
-        // ref=(0.5,0.5), global=(0.5-0.5,0.5-0.5)=(0,0)
-        // pos_x = 0 + (0.5-0.3) = 0.2
-        // pos_y = 0 + (0 + (0.5-0.7)) = -0.2
-        assert!((pos[0] - 0.2).abs() < 0.001, "x={}", pos[0]);
-        assert!((pos[1] - (-0.2)).abs() < 0.001, "y={}", pos[1]);
-        assert!((pos[2]).abs() < 0.001, "z={}", pos[2]);
+        let bt = BodyTracker::new(false, 0.0, 0.0);
+        // Uncalibrated: ref=(0,0,0), point at (0.3, 0.7, 1.0)
+        // pos_x = 0 - 0.3 = -0.3, pos_y = 0 + (0 - 0.7) = -0.7, pos_z = 0 - 1.0 = -1.0
+        let pos = bt.convert_position(0.3, 0.7, 1.0);
+        assert!((pos[0] - (-0.3)).abs() < 0.001, "x={}", pos[0]);
+        assert!((pos[1] - (-0.7)).abs() < 0.001, "y={}", pos[1]);
+        assert!((pos[2] - (-1.0)).abs() < 0.001, "z={}", pos[2]);
     }
 
     #[test]
     fn test_convert_position_mirror_x() {
-        let bt = BodyTracker::new(true, 0.0, 0.0, &FilterConfig::default());
-        let pos = bt.convert_position(0.3, 0.7, 0.5, 0.5, 0.0);
-        // pos_x before mirror = 0.2, after mirror = -0.2
-        assert!((pos[0] - (-0.2)).abs() < 0.001, "mirror x={}", pos[0]);
+        let bt = BodyTracker::new(true, 0.0, 0.0);
+        // pos_x = 0 - 0.3 = -0.3, mirror → 0.3
+        let pos = bt.convert_position(0.3, 0.7, 1.0);
+        assert!((pos[0] - 0.3).abs() < 0.001, "mirror x={}", pos[0]);
     }
 
     // ===================================================================
@@ -3215,13 +3156,61 @@ mod tests {
     }
 
     // ===================================================================
+    // World coordinate transformation unit tests
+    // ===================================================================
+
+    #[test]
+    fn test_build_world_rotation_identity() {
+        let r_t = BodyTracker::build_world_rotation(0.0, 0.0);
+        // Should be identity matrix
+        let expected = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        for i in 0..9 {
+            assert!((r_t[i] - expected[i]).abs() < 1e-6, "r_t[{}]={} expected {}", i, r_t[i], expected[i]);
+        }
+    }
+
+    #[test]
+    fn test_build_world_rotation_yaw_only() {
+        let yaw = std::f32::consts::FRAC_PI_2; // 90 degrees
+        let m = BodyTracker::build_world_rotation(yaw, 0.0);
+        // M = R_x(0) * R_y(90°) = R_y(90°)
+        // R_y(90°) * (1,0,0) = (cos90, 0, -sin90) = (0, 0, -1)
+        let pose = make_pose(&[(0, 1.0, 0.0, 0.0, 0.9)]);
+        let world = BodyTracker::to_world_coords(&pose, &m);
+        let kp = world.get_by_index(0);
+        assert!(kp.x.abs() < 0.01, "wx={}", kp.x);
+        assert!((kp.z - (-1.0)).abs() < 0.01, "wz={}", kp.z);
+    }
+
+    #[test]
+    fn test_build_world_rotation_tilt_only() {
+        let tilt = std::f32::consts::FRAC_PI_4; // 45 degrees
+        let m = BodyTracker::build_world_rotation(0.0, tilt);
+        // M = R_x(-45°) * R_y(0) = R_x(-45°)
+        // R_x(-45°) * (0,0,1) = (0, sin(45)*1, cos(45)*1) = (0, 0.707, 0.707)
+        let pose = make_pose(&[(0, 0.0, 0.0, 1.0, 0.9)]);
+        let world = BodyTracker::to_world_coords(&pose, &m);
+        let kp = world.get_by_index(0);
+        assert!((kp.y - 0.707).abs() < 0.01, "wy={}", kp.y);
+        assert!((kp.z - 0.707).abs() < 0.01, "wz={}", kp.z);
+    }
+
+    #[test]
+    fn test_to_world_coords_preserves_confidence() {
+        let r_t = BodyTracker::build_world_rotation(0.3, 0.2);
+        let pose = make_pose(&[(0, 1.0, 2.0, 3.0, 0.75)]);
+        let world = BodyTracker::to_world_coords(&pose, &r_t);
+        assert_eq!(world.get_by_index(0).confidence, 0.75);
+    }
+
+    // ===================================================================
     // Axis isolation tests (specification-driven, not implementation-driven)
     // These define WHAT the system must guarantee, not HOW it achieves it.
     // ===================================================================
 
     /// Helper: create a calibrated BodyTracker with a standard pose.
     fn make_calibrated_tracker(yaw: f32) -> (BodyTracker, Pose) {
-        let mut bt = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
+        let mut bt = BodyTracker::new(false, 0.0, 0.0);
         let pose = make_pose(&[
             (KP_LEFT_HIP,       0.45, 0.50, 2.0, 0.9),
             (KP_RIGHT_HIP,      0.55, 0.50, 2.0, 0.9),
