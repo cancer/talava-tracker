@@ -646,23 +646,47 @@ impl PoseDetector {
 
 /// Invalidate keypoints near image boundaries where model receptive field is clipped.
 fn sanitize_pose(pose: &Pose) -> Pose {
-    // Full boundary check (X and Y): limbs and shoulders
-    const FULL_BOUNDARY: &[usize] = &[
-        KP_LEFT_SHOULDER, KP_RIGHT_SHOULDER,
+    // Y-direction soft attenuation thresholds for lower-limb keypoints
+    const Y_DEAD: f32 = 0.01;
+    const Y_SAFE: f32 = 0.05;
+    const Y_RAMP: f32 = Y_SAFE - Y_DEAD;
+
+    // Shoulder boundary check (X and Y hard cutoff)
+    const SHOULDER_BOUNDARY: &[usize] = &[KP_LEFT_SHOULDER, KP_RIGHT_SHOULDER];
+    // Lower-limb boundary: X hard cutoff, Y soft attenuation
+    const LOWER_LIMB_BOUNDARY: &[usize] = &[
         KP_LEFT_KNEE, KP_RIGHT_KNEE, KP_LEFT_ANKLE, KP_RIGHT_ANKLE,
         KP_LEFT_BIG_TOE, KP_RIGHT_BIG_TOE, KP_LEFT_SMALL_TOE, KP_RIGHT_SMALL_TOE,
         KP_LEFT_HEEL, KP_RIGHT_HEEL,
     ];
-    // X-only boundary check: hips (Y direction allowed to be at edge for lower body)
+    // X-only boundary check: hips (Y direction allowed to be at edge)
     const X_ONLY_BOUNDARY: &[usize] = &[KP_LEFT_HIP, KP_RIGHT_HIP];
 
     let mut sanitized = pose.clone();
-    for &idx in FULL_BOUNDARY {
+
+    // Shoulders: hard cutoff on both X and Y
+    for &idx in SHOULDER_BOUNDARY {
         let kp = &mut sanitized.keypoints[idx];
         if kp.x <= 0.02 || kp.x >= 0.98 || kp.y <= 0.02 || kp.y >= 0.98 {
             kp.confidence = 0.0;
         }
     }
+
+    // Lower limbs: X hard cutoff, Y soft attenuation
+    for &idx in LOWER_LIMB_BOUNDARY {
+        let kp = &mut sanitized.keypoints[idx];
+        if kp.x <= 0.02 || kp.x >= 0.98 {
+            kp.confidence = 0.0;
+        } else if kp.y <= Y_DEAD || kp.y >= 1.0 - Y_DEAD {
+            kp.confidence = 0.0;
+        } else if kp.y < Y_SAFE {
+            kp.confidence *= (kp.y - Y_DEAD) / Y_RAMP;
+        } else if kp.y > 1.0 - Y_SAFE {
+            kp.confidence *= (1.0 - Y_DEAD - kp.y) / Y_RAMP;
+        }
+    }
+
+    // Hips: X-only boundary
     for &idx in X_ONLY_BOUNDARY {
         let kp = &mut sanitized.keypoints[idx];
         if kp.x <= 0.02 || kp.x >= 0.98 {
@@ -1309,6 +1333,7 @@ impl BodyTracker {
 
         let mut position = self.convert_position(ax, ay, hip_x, hip_y, pos_z);
         position[1] += self.foot_y_offset;
+        position[1] = position[1].max(0.0); // floor clamp
 
         let toe_idx = if is_left { KP_LEFT_BIG_TOE } else { KP_RIGHT_BIG_TOE };
         let yaw = if knee_valid && ankle_valid {
@@ -2705,7 +2730,7 @@ mod tests {
 
     #[test]
     fn test_body_compute_uncalibrated_positions() {
-        let mut bt = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
+        let mut bt = BodyTracker::new(false, 0.0, 1.0, &FilterConfig::default());
         let pose = standing_pose();
         let result = bt.compute(&pose, DT);
 
@@ -2716,9 +2741,9 @@ mod tests {
         assert!((hip.position[1]).abs() < 0.01, "hip y={}", hip.position[1]);
 
         // Feet: ankles at y=0.8, hip at y=0.5
-        // pos_y = 0 + (0 + (0.5 - 0.8)) = -0.3
+        // pos_y = 0 + (0 + (0.5 - 0.8)) = -0.3, foot_y_offset=1.0 → -0.3+1.0=0.7
         let lf = result.left_foot.unwrap();
-        assert!((lf.position[1] - (-0.3)).abs() < 0.01, "left_foot y={}", lf.position[1]);
+        assert!((lf.position[1] - 0.7).abs() < 0.01, "left_foot y={}", lf.position[1]);
     }
 
     #[test]
@@ -2812,20 +2837,34 @@ mod tests {
 
     #[test]
     fn test_body_compute_foot_y_offset() {
-        let mut bt = BodyTracker::new(false, 0.0, 0.1, &FilterConfig::default());
+        // Use foot_y_offset=1.0 to keep foot y positive (avoid floor clamp)
+        let mut bt = BodyTracker::new(false, 0.0, 1.0, &FilterConfig::default());
         let pose = standing_pose();
         let result = bt.compute(&pose, DT);
 
-        let mut bt_no_offset = BodyTracker::new(false, 0.0, 0.0, &FilterConfig::default());
-        let result_no_offset = bt_no_offset.compute(&pose, DT);
+        // base foot y = -0.3 (ankle at 0.8, hip at 0.5), + offset 1.0 = 0.7
+        let lf = result.left_foot.unwrap();
+        assert!(
+            (lf.position[1] - 0.7).abs() < 0.01,
+            "foot_y_offset=1.0: expected 0.7, got {}",
+            lf.position[1]
+        );
+    }
+
+    #[test]
+    fn test_body_compute_foot_floor_clamp() {
+        // foot_y_offset=-1.0 forces foot y well below zero; floor clamp should keep y >= 0
+        let mut bt = BodyTracker::new(false, 0.0, -1.0, &FilterConfig::default());
+        let pose = standing_pose();
+        let result = bt.compute(&pose, DT);
 
         let lf = result.left_foot.unwrap();
-        let lf_no = result_no_offset.left_foot.unwrap();
-        assert!(
-            (lf.position[1] - lf_no.position[1] - 0.1).abs() < 0.01,
-            "foot_y_offset should add 0.1: with={}, without={}",
-            lf.position[1], lf_no.position[1]
-        );
+        assert!(lf.position[1] >= 0.0, "left foot y should be >= 0 (floor clamp), got {}", lf.position[1]);
+        assert!((lf.position[1]).abs() < f32::EPSILON, "left foot y should be clamped to 0.0, got {}", lf.position[1]);
+
+        let rf = result.right_foot.unwrap();
+        assert!(rf.position[1] >= 0.0, "right foot y should be >= 0 (floor clamp), got {}", rf.position[1]);
+        assert!((rf.position[1]).abs() < f32::EPSILON, "right foot y should be clamped to 0.0, got {}", rf.position[1]);
     }
 
     #[test]
@@ -3021,21 +3060,72 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_pose_boundary_y_low() {
+    fn test_sanitize_pose_lower_limb_y_dead_zone() {
+        // y=0.005 and y=0.995 are within dead zone → confidence = 0
         let pose = make_pose(&[
-            (KP_LEFT_KNEE, 0.50, 0.01, 0.0, 0.9),  // y < 0.02 → zeroed (full boundary)
+            (KP_LEFT_KNEE, 0.50, 0.005, 0.0, 0.9),
+            (KP_RIGHT_KNEE, 0.50, 0.995, 0.0, 0.9),
         ]);
         let s = sanitize_pose(&pose);
-        assert_eq!(s.keypoints[KP_LEFT_KNEE].confidence, 0.0);
+        assert_eq!(s.keypoints[KP_LEFT_KNEE].confidence, 0.0, "y=0.005 should be in dead zone");
+        assert_eq!(s.keypoints[KP_RIGHT_KNEE].confidence, 0.0, "y=0.995 should be in dead zone");
     }
 
     #[test]
-    fn test_sanitize_pose_boundary_y_high() {
+    fn test_sanitize_pose_lower_limb_y_attenuation() {
+        // y=0.03 is in ramp zone: attenuation = (0.03 - 0.01) / (0.05 - 0.01) = 0.5
+        // confidence = 0.9 * 0.5 = 0.45
         let pose = make_pose(&[
-            (KP_RIGHT_KNEE, 0.50, 0.99, 0.0, 0.9),  // y > 0.98 → zeroed (full boundary)
+            (KP_LEFT_ANKLE, 0.50, 0.03, 0.0, 0.9),
+            (KP_RIGHT_ANKLE, 0.50, 0.97, 0.0, 0.9),
         ]);
         let s = sanitize_pose(&pose);
-        assert_eq!(s.keypoints[KP_RIGHT_KNEE].confidence, 0.0);
+        assert!((s.keypoints[KP_LEFT_ANKLE].confidence - 0.45).abs() < 1e-5,
+            "y=0.03 should attenuate to 0.45, got {}", s.keypoints[KP_LEFT_ANKLE].confidence);
+        assert!((s.keypoints[KP_RIGHT_ANKLE].confidence - 0.45).abs() < 1e-5,
+            "y=0.97 should attenuate to 0.45, got {}", s.keypoints[KP_RIGHT_ANKLE].confidence);
+    }
+
+    #[test]
+    fn test_sanitize_pose_lower_limb_y_safe_zone() {
+        // y=0.10 and y=0.90 are in safe zone → no change
+        let pose = make_pose(&[
+            (KP_LEFT_KNEE, 0.50, 0.10, 0.0, 0.9),
+            (KP_RIGHT_KNEE, 0.50, 0.90, 0.0, 0.9),
+        ]);
+        let s = sanitize_pose(&pose);
+        assert_eq!(s.keypoints[KP_LEFT_KNEE].confidence, 0.9, "y=0.10 should be unchanged");
+        assert_eq!(s.keypoints[KP_RIGHT_KNEE].confidence, 0.9, "y=0.90 should be unchanged");
+    }
+
+    #[test]
+    fn test_sanitize_pose_lower_limb_y_boundary_exact() {
+        // Exact boundary values: Y_DEAD=0.01, Y_SAFE=0.05
+        let pose = make_pose(&[
+            (KP_LEFT_ANKLE, 0.50, 0.01, 0.0, 0.9),   // exactly Y_DEAD → dead zone
+            (KP_RIGHT_ANKLE, 0.50, 0.99, 0.0, 0.9),   // exactly 1-Y_DEAD → dead zone
+            (KP_LEFT_KNEE, 0.50, 0.05, 0.0, 0.9),     // exactly Y_SAFE → safe (ramp=1.0)
+            (KP_RIGHT_KNEE, 0.50, 0.95, 0.0, 0.9),    // exactly 1-Y_SAFE → safe (ramp=1.0)
+        ]);
+        let s = sanitize_pose(&pose);
+        assert_eq!(s.keypoints[KP_LEFT_ANKLE].confidence, 0.0, "y=0.01 (Y_DEAD) should be dead");
+        assert_eq!(s.keypoints[KP_RIGHT_ANKLE].confidence, 0.0, "y=0.99 (1-Y_DEAD) should be dead");
+        assert!((s.keypoints[KP_LEFT_KNEE].confidence - 0.9).abs() < 1e-5,
+            "y=0.05 (Y_SAFE) should be full confidence, got {}", s.keypoints[KP_LEFT_KNEE].confidence);
+        assert!((s.keypoints[KP_RIGHT_KNEE].confidence - 0.9).abs() < 1e-5,
+            "y=0.95 (1-Y_SAFE) should be full confidence, got {}", s.keypoints[KP_RIGHT_KNEE].confidence);
+    }
+
+    #[test]
+    fn test_sanitize_pose_shoulder_y_hard_cutoff() {
+        // Shoulders still use hard cutoff for Y direction
+        let pose = make_pose(&[
+            (KP_LEFT_SHOULDER, 0.50, 0.015, 0.0, 0.9),  // y < 0.02 → zeroed
+            (KP_RIGHT_SHOULDER, 0.50, 0.985, 0.0, 0.9),  // y > 0.98 → zeroed
+        ]);
+        let s = sanitize_pose(&pose);
+        assert_eq!(s.keypoints[KP_LEFT_SHOULDER].confidence, 0.0, "shoulder y=0.015 should be hard cutoff");
+        assert_eq!(s.keypoints[KP_RIGHT_SHOULDER].confidence, 0.0, "shoulder y=0.985 should be hard cutoff");
     }
 
     #[test]
