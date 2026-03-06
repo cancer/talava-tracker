@@ -5,3 +5,8 @@ calibration.json
 *.png
 test_vmt.py
 logs/
+*.zip
+.playwright-mcp/
+camera_server.toml
+inference_server.toml
+camera_calibration.json
