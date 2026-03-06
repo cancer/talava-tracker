@@ -2057,7 +2057,25 @@ fn run_inference_loop(
                         } else { (true, 0.0) };
 
                         if !velocity_ok { fps_reject_velocity += 1; }
-                        if !limb_ok { fps_reject_limb += 1; }
+                        if !limb_ok {
+                            fps_reject_limb += 1;
+                            if i > 0 {
+                                if let Some(hip) = last_poses[0].as_ref() {
+                                    let anatomy_ok = match i {
+                                        1 | 2 | 4 | 5 => p.position[1] < hip.position[1],
+                                        _ => true,
+                                    };
+                                    log!(logfile, "limb_reject {}: pos=({:.2},{:.2},{:.2}) hip=({:.2},{:.2},{:.2}) dist={:.2} anatomy={}",
+                                        tracker_names[i],
+                                        p.position[0], p.position[1], p.position[2],
+                                        hip.position[0], hip.position[1], hip.position[2],
+                                        limb_dist, anatomy_ok);
+                                } else {
+                                    log!(logfile, "limb_reject {}: pos=({:.2},{:.2},{:.2}) hip=None",
+                                        tracker_names[i], p.position[0], p.position[1], p.position[2]);
+                                }
+                            }
+                        }
 
                         if verbose && (!velocity_ok || !limb_ok) {
                             log!(logfile, "[verbose] {}: reject vel_ok={} (d={:.3}) limb_ok={} (d={:.3}) reject_count={}",
