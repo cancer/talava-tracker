@@ -142,6 +142,7 @@ const MAX_HIP_Z_JUMP: f32 = 0.3;
 const MAX_HIP_Z_REJECT_STREAK: u32 = 5;
 const MAX_FOOT_YAW: f32 = std::f32::consts::FRAC_PI_4;   // ±45°
 const MAX_FOOT_PITCH: f32 = std::f32::consts::FRAC_PI_6;  // ±30°
+const MAX_FOOT_ROLL: f32 = std::f32::consts::FRAC_PI_6;   // ±30°
 
 fn find_hip_reference_pair(
     cameras: &[&CameraParams],
@@ -961,6 +962,7 @@ struct BodyCalibration {
     roll_shoulder: f32,
     yaw_left_foot: f32, yaw_right_foot: f32,
     pitch_left_foot: f32, pitch_right_foot: f32,
+    roll_left_foot: f32, roll_right_foot: f32,
     left_ankle_offset: Option<(f32, f32, f32)>,
     right_ankle_offset: Option<(f32, f32, f32)>,
     left_knee_offset: Option<(f32, f32, f32)>,
@@ -1072,6 +1074,8 @@ impl BodyTracker {
         let yaw_right_foot = self.compute_foot_yaw(pose, KP_RIGHT_KNEE, KP_RIGHT_ANKLE);
         let pitch_left_foot = self.compute_foot_pitch(pose, KP_LEFT_KNEE, KP_LEFT_ANKLE, KP_LEFT_BIG_TOE);
         let pitch_right_foot = self.compute_foot_pitch(pose, KP_RIGHT_KNEE, KP_RIGHT_ANKLE, KP_RIGHT_BIG_TOE);
+        let roll_left_foot = self.compute_foot_roll(pose, KP_LEFT_BIG_TOE, KP_LEFT_SMALL_TOE);
+        let roll_right_foot = self.compute_foot_roll(pose, KP_RIGHT_BIG_TOE, KP_RIGHT_SMALL_TOE);
 
         let la = pose.get_by_index(KP_LEFT_ANKLE);
         let left_ankle_offset = if la.is_valid(BODY_CONFIDENCE_THRESHOLD) { Some((la.x - hip_x, la.y - hip_y, la.z - hip_z)) } else { None };
@@ -1093,6 +1097,7 @@ impl BodyTracker {
             yaw_shoulder, roll_shoulder,
             yaw_left_foot, yaw_right_foot,
             pitch_left_foot, pitch_right_foot,
+            roll_left_foot, roll_right_foot,
             left_ankle_offset, right_ankle_offset,
             left_knee_offset, right_knee_offset,
             yaw_left_knee, yaw_right_knee,
@@ -1200,6 +1205,16 @@ impl BodyTracker {
         } else { 0.0 }
     }
 
+    fn compute_foot_roll(&self, pose: &Pose, big_toe_idx: usize, small_toe_idx: usize) -> f32 {
+        let big = pose.get_by_index(big_toe_idx);
+        let small = pose.get_by_index(small_toe_idx);
+        if big.is_valid(BODY_CONFIDENCE_THRESHOLD) && small.is_valid(BODY_CONFIDENCE_THRESHOLD) {
+            let dx = big.x - small.x;
+            let dy = big.y - small.y;
+            f32::atan2(dy, dx.abs())
+        } else { 0.0 }
+    }
+
     fn compute_knee_yaw(&self, pose: &Pose, hip_idx: usize, knee_idx: usize) -> f32 {
         let hip = pose.get_by_index(hip_idx);
         let knee = pose.get_by_index(knee_idx);
@@ -1231,6 +1246,18 @@ impl BodyTracker {
         let (sy, cy) = (yaw / 2.0).sin_cos();
         let (sp, cp) = (pitch / 2.0).sin_cos();
         [cy * sp, sy * cp, -sy * sp, cy * cp]
+    }
+
+    fn yaw_pitch_roll_to_quaternion(yaw: f32, pitch: f32, roll: f32) -> [f32; 4] {
+        let (sy, cy) = (yaw / 2.0).sin_cos();
+        let (sp, cp) = (pitch / 2.0).sin_cos();
+        let (sr, cr) = (roll / 2.0).sin_cos();
+        [
+            cy * sp * cr + sy * cp * sr,
+            sy * cp * cr - cy * sp * sr,
+            cy * cp * sr - sy * sp * cr,
+            cy * cp * cr + sy * sp * sr,
+        ]
     }
 
     fn yaw_roll_to_quaternion(yaw: f32, roll: f32) -> [f32; 4] {
@@ -1277,6 +1304,7 @@ impl BodyTracker {
         position[1] = position[1].max(0.0); // floor clamp
 
         let toe_idx = if is_left { KP_LEFT_BIG_TOE } else { KP_RIGHT_BIG_TOE };
+        let small_toe_idx = if is_left { KP_LEFT_SMALL_TOE } else { KP_RIGHT_SMALL_TOE };
         let yaw = if knee_valid && ankle_valid {
             let ref_yaw = self.calibration.as_ref().map_or(0.0, |c| {
                 if is_left { c.yaw_left_foot } else { c.yaw_right_foot }
@@ -1291,7 +1319,14 @@ impl BodyTracker {
             (self.compute_foot_pitch(pose, knee_idx, ankle_idx, toe_idx) - ref_pitch)
                 .clamp(-MAX_FOOT_PITCH, MAX_FOOT_PITCH)
         } else { 0.0 };
-        Some(TrackerPose::new(position, Self::yaw_pitch_to_quaternion(yaw, pitch)))
+        let roll = {
+            let ref_roll = self.calibration.as_ref().map_or(0.0, |c| {
+                if is_left { c.roll_left_foot } else { c.roll_right_foot }
+            });
+            (self.compute_foot_roll(pose, toe_idx, small_toe_idx) - ref_roll)
+                .clamp(-MAX_FOOT_ROLL, MAX_FOOT_ROLL)
+        };
+        Some(TrackerPose::new(position, Self::yaw_pitch_roll_to_quaternion(yaw, pitch, roll)))
     }
 
     fn compute_chest(&self, pose: &Pose, hip_center: Option<(f32, f32, f32)>) -> Option<TrackerPose> {
@@ -1960,10 +1995,11 @@ fn run_inference_loop(
                             result_sent_at: now,
                         });
                         if let Some(ref cal) = body_tracker.calibration {
-                            log!(logfile, "Calibrated! camera_yaw={:.1}deg tilt={:.1}deg shoulder_yaw={:.1}deg shoulder_roll={:.1}deg foot_pitch_L={:.1}deg foot_pitch_R={:.1}deg (yaw_samples={})",
+                            log!(logfile, "Calibrated! camera_yaw={:.1}deg tilt={:.1}deg shoulder_yaw={:.1}deg shoulder_roll={:.1}deg foot_pitch_L={:.1}deg foot_pitch_R={:.1}deg foot_roll_L={:.1}deg foot_roll_R={:.1}deg (yaw_samples={})",
                                 cal.camera_yaw.to_degrees(), cal.tilt_angle.to_degrees(),
                                 cal.yaw_shoulder.to_degrees(), cal.roll_shoulder.to_degrees(),
                                 cal.pitch_left_foot.to_degrees(), cal.pitch_right_foot.to_degrees(),
+                                cal.roll_left_foot.to_degrees(), cal.roll_right_foot.to_degrees(),
                                 if camera_yaw.abs() > 0.001 { "used" } else { "insufficient" });
                         } else {
                             log!(logfile, "Calibrated!");
