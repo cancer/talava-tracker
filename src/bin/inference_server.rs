@@ -637,58 +637,6 @@ impl PoseDetector {
     }
 }
 
-/// Invalidate keypoints near image boundaries where model receptive field is clipped.
-fn sanitize_pose(pose: &Pose) -> Pose {
-    // Y-direction soft attenuation thresholds for lower-limb keypoints
-    const Y_DEAD: f32 = 0.01;
-    const Y_SAFE: f32 = 0.05;
-    const Y_RAMP: f32 = Y_SAFE - Y_DEAD;
-
-    // Shoulder boundary check (X and Y hard cutoff)
-    const SHOULDER_BOUNDARY: &[usize] = &[KP_LEFT_SHOULDER, KP_RIGHT_SHOULDER];
-    // Lower-limb boundary: X hard cutoff, Y soft attenuation
-    const LOWER_LIMB_BOUNDARY: &[usize] = &[
-        KP_LEFT_KNEE, KP_RIGHT_KNEE, KP_LEFT_ANKLE, KP_RIGHT_ANKLE,
-        KP_LEFT_BIG_TOE, KP_RIGHT_BIG_TOE, KP_LEFT_SMALL_TOE, KP_RIGHT_SMALL_TOE,
-        KP_LEFT_HEEL, KP_RIGHT_HEEL,
-    ];
-    // X-only boundary check: hips (Y direction allowed to be at edge)
-    const X_ONLY_BOUNDARY: &[usize] = &[KP_LEFT_HIP, KP_RIGHT_HIP];
-
-    let mut sanitized = pose.clone();
-
-    // Shoulders: hard cutoff on both X and Y
-    for &idx in SHOULDER_BOUNDARY {
-        let kp = &mut sanitized.keypoints[idx];
-        if kp.x <= 0.02 || kp.x >= 0.98 || kp.y <= 0.02 || kp.y >= 0.98 {
-            kp.confidence = 0.0;
-        }
-    }
-
-    // Lower limbs: X hard cutoff, Y soft attenuation
-    for &idx in LOWER_LIMB_BOUNDARY {
-        let kp = &mut sanitized.keypoints[idx];
-        if kp.x <= 0.02 || kp.x >= 0.98 {
-            kp.confidence = 0.0;
-        } else if kp.y <= Y_DEAD || kp.y >= 1.0 - Y_DEAD {
-            kp.confidence = 0.0;
-        } else if kp.y < Y_SAFE {
-            kp.confidence *= (kp.y - Y_DEAD) / Y_RAMP;
-        } else if kp.y > 1.0 - Y_SAFE {
-            kp.confidence *= (1.0 - Y_DEAD - kp.y) / Y_RAMP;
-        }
-    }
-
-    // Hips: X-only boundary
-    for &idx in X_ONLY_BOUNDARY {
-        let kp = &mut sanitized.keypoints[idx];
-        if kp.x <= 0.02 || kp.x >= 0.98 {
-            kp.confidence = 0.0;
-        }
-    }
-    sanitized
-}
-
 struct PersonDetector {
     session: Session,
     input_size: i32,
@@ -1522,7 +1470,6 @@ fn run_inference_loop(
     let mut calibrated = false;
     let mut prev_poses: Vec<Option<Pose>> = Vec::new();
     // (pre_sanitize: (LA, RA, LBigToe, RBigToe), post_sanitize: (LA, RA))
-    let mut pre_sanitize_confs: Vec<Option<((f32, f32, f32, f32), (f32, f32))>> = Vec::new();
     let mut poses_2d: Vec<Option<Pose>> = Vec::new();
     let mut pose_timestamps: Vec<Option<Instant>> = Vec::new();
     let mut cam_widths: Vec<u32> = Vec::new();
@@ -1642,7 +1589,6 @@ fn run_inference_loop(
 
                     num_cameras = cal.cameras.len();
                     prev_poses = vec![None; num_cameras];
-                    pre_sanitize_confs = vec![None; num_cameras];
                     poses_2d = vec![None; num_cameras];
                     pose_timestamps = vec![None; num_cameras];
                     calibrated = true;
@@ -1772,33 +1718,6 @@ fn run_inference_loop(
                                 }).collect();
                             log!(logfile, "[verbose] cam{}: infer={:.1}ms 2d=[{}]",
                                 cam_idx, infer_ms, kp_strs.join(" "));
-                        }
-
-                        // Record pre-sanitize ankle/toe confidence for FPS diagnostics
-                        let pre_la = pose.get_by_index(KP_LEFT_ANKLE).confidence;
-                        let pre_ra = pose.get_by_index(KP_RIGHT_ANKLE).confidence;
-                        let pre_lt = pose.get_by_index(KP_LEFT_BIG_TOE).confidence;
-                        let pre_rt = pose.get_by_index(KP_RIGHT_BIG_TOE).confidence;
-
-                        let pre_sanitize = if verbose { Some(pose.clone()) } else { None };
-                        pose = sanitize_pose(&pose);
-
-                        let post_la = pose.get_by_index(KP_LEFT_ANKLE).confidence;
-                        let post_ra = pose.get_by_index(KP_RIGHT_ANKLE).confidence;
-                        pre_sanitize_confs[cam_idx] = Some(((pre_la, pre_ra, pre_lt, pre_rt), (post_la, post_ra)));
-
-                        if verbose {
-                            if let Some(ref pre) = pre_sanitize {
-                                let sanitized_kps: Vec<String> = (0..KP_COUNT)
-                                    .filter(|&i| pre.keypoints[i].confidence > 0.0 && pose.keypoints[i].confidence == 0.0)
-                                    .map(|i| {
-                                        let kp = &pre.keypoints[i];
-                                        format!("{}({:.3},{:.3})", KP_NAMES[i], kp.x, kp.y)
-                                    }).collect();
-                                if !sanitized_kps.is_empty() {
-                                    log!(logfile, "[verbose] cam{}: sanitized out: {}", cam_idx, sanitized_kps.join(" "));
-                                }
-                            }
                         }
 
                         prev_poses[cam_idx] = Some(pose.clone());
@@ -2120,12 +2039,10 @@ fn run_inference_loop(
 
                         if velocity_ok && limb_ok {
                             let smoothed = filters[i].apply(p);
-                            if verbose {
-                                log!(logfile, "[verbose] {}: raw({:.3},{:.3},{:.3}) -> filtered({:.3},{:.3},{:.3})",
-                                    tracker_names[i],
-                                    p.position[0], p.position[1], p.position[2],
-                                    smoothed.position[0], smoothed.position[1], smoothed.position[2]);
-                            }
+                            log!(logfile, "TRK {}: raw({:.4},{:.4},{:.4}) flt({:.4},{:.4},{:.4})",
+                                tracker_names[i],
+                                p.position[0], p.position[1], p.position[2],
+                                smoothed.position[0], smoothed.position[1], smoothed.position[2]);
                             last_poses[i] = Some(smoothed);
                             last_update_times[i] = now;
                             stale[i] = false;
@@ -2209,14 +2126,7 @@ fn run_inference_loop(
                     let confs: Vec<String> = diag_kps.iter()
                         .map(|(name, idx)| format!("{}={:.2}", name, p.get_by_index(*idx).confidence))
                         .collect();
-                    let san_info = if let Some(((pre_la, pre_ra, pre_lt, pre_rt), (post_la, post_ra))) = pre_sanitize_confs[cam_idx] {
-                        let mut parts = Vec::new();
-                        if (pre_la - post_la).abs() > 0.01 { parts.push(format!("LA:{:.2}→{:.2}", pre_la, post_la)); }
-                        if (pre_ra - post_ra).abs() > 0.01 { parts.push(format!("RA:{:.2}→{:.2}", pre_ra, post_ra)); }
-                        if pre_lt > 0.01 || pre_rt > 0.01 { parts.push(format!("LT={:.2},RT={:.2}", pre_lt, pre_rt)); }
-                        if parts.is_empty() { String::new() } else { format!(" san({})", parts.join(",")) }
-                    } else { String::new() };
-                    cam_diag.push_str(&format!(" cam{}[{}]{}", cam_idx, confs.join(","), san_info));
+                    cam_diag.push_str(&format!(" cam{}[{}]", cam_idx, confs.join(",")));
                 }
             }
             let drops = frame_drop_count.swap(0, Ordering::Relaxed);
@@ -3028,126 +2938,6 @@ mod tests {
         // pos_x = 0 - 0.3 = -0.3, mirror → 0.3
         let pos = bt.convert_position(0.3, 0.7, 1.0);
         assert!((pos[0] - 0.3).abs() < 0.001, "mirror x={}", pos[0]);
-    }
-
-    // ===================================================================
-    // sanitize_pose tests
-    // ===================================================================
-
-    #[test]
-    fn test_sanitize_pose_boundary_x_low() {
-        let pose = make_pose(&[
-            (KP_LEFT_ANKLE, 0.01, 0.50, 0.0, 0.9),  // x < 0.02 → zeroed
-            (KP_RIGHT_ANKLE, 0.50, 0.50, 0.0, 0.9),  // normal
-        ]);
-        let s = sanitize_pose(&pose);
-        assert_eq!(s.keypoints[KP_LEFT_ANKLE].confidence, 0.0, "left ankle should be zeroed");
-        assert_eq!(s.keypoints[KP_RIGHT_ANKLE].confidence, 0.9, "right ankle should be kept");
-    }
-
-    #[test]
-    fn test_sanitize_pose_boundary_x_high() {
-        let pose = make_pose(&[
-            (KP_LEFT_SHOULDER, 0.99, 0.50, 0.0, 0.9),  // x > 0.98 → zeroed
-        ]);
-        let s = sanitize_pose(&pose);
-        assert_eq!(s.keypoints[KP_LEFT_SHOULDER].confidence, 0.0);
-    }
-
-    #[test]
-    fn test_sanitize_pose_lower_limb_y_dead_zone() {
-        // y=0.005 and y=0.995 are within dead zone → confidence = 0
-        let pose = make_pose(&[
-            (KP_LEFT_KNEE, 0.50, 0.005, 0.0, 0.9),
-            (KP_RIGHT_KNEE, 0.50, 0.995, 0.0, 0.9),
-        ]);
-        let s = sanitize_pose(&pose);
-        assert_eq!(s.keypoints[KP_LEFT_KNEE].confidence, 0.0, "y=0.005 should be in dead zone");
-        assert_eq!(s.keypoints[KP_RIGHT_KNEE].confidence, 0.0, "y=0.995 should be in dead zone");
-    }
-
-    #[test]
-    fn test_sanitize_pose_lower_limb_y_attenuation() {
-        // y=0.03 is in ramp zone: attenuation = (0.03 - 0.01) / (0.05 - 0.01) = 0.5
-        // confidence = 0.9 * 0.5 = 0.45
-        let pose = make_pose(&[
-            (KP_LEFT_ANKLE, 0.50, 0.03, 0.0, 0.9),
-            (KP_RIGHT_ANKLE, 0.50, 0.97, 0.0, 0.9),
-        ]);
-        let s = sanitize_pose(&pose);
-        assert!((s.keypoints[KP_LEFT_ANKLE].confidence - 0.45).abs() < 1e-5,
-            "y=0.03 should attenuate to 0.45, got {}", s.keypoints[KP_LEFT_ANKLE].confidence);
-        assert!((s.keypoints[KP_RIGHT_ANKLE].confidence - 0.45).abs() < 1e-5,
-            "y=0.97 should attenuate to 0.45, got {}", s.keypoints[KP_RIGHT_ANKLE].confidence);
-    }
-
-    #[test]
-    fn test_sanitize_pose_lower_limb_y_safe_zone() {
-        // y=0.10 and y=0.90 are in safe zone → no change
-        let pose = make_pose(&[
-            (KP_LEFT_KNEE, 0.50, 0.10, 0.0, 0.9),
-            (KP_RIGHT_KNEE, 0.50, 0.90, 0.0, 0.9),
-        ]);
-        let s = sanitize_pose(&pose);
-        assert_eq!(s.keypoints[KP_LEFT_KNEE].confidence, 0.9, "y=0.10 should be unchanged");
-        assert_eq!(s.keypoints[KP_RIGHT_KNEE].confidence, 0.9, "y=0.90 should be unchanged");
-    }
-
-    #[test]
-    fn test_sanitize_pose_lower_limb_y_boundary_exact() {
-        // Exact boundary values: Y_DEAD=0.01, Y_SAFE=0.05
-        let pose = make_pose(&[
-            (KP_LEFT_ANKLE, 0.50, 0.01, 0.0, 0.9),   // exactly Y_DEAD → dead zone
-            (KP_RIGHT_ANKLE, 0.50, 0.99, 0.0, 0.9),   // exactly 1-Y_DEAD → dead zone
-            (KP_LEFT_KNEE, 0.50, 0.05, 0.0, 0.9),     // exactly Y_SAFE → safe (ramp=1.0)
-            (KP_RIGHT_KNEE, 0.50, 0.95, 0.0, 0.9),    // exactly 1-Y_SAFE → safe (ramp=1.0)
-        ]);
-        let s = sanitize_pose(&pose);
-        assert_eq!(s.keypoints[KP_LEFT_ANKLE].confidence, 0.0, "y=0.01 (Y_DEAD) should be dead");
-        assert_eq!(s.keypoints[KP_RIGHT_ANKLE].confidence, 0.0, "y=0.99 (1-Y_DEAD) should be dead");
-        assert!((s.keypoints[KP_LEFT_KNEE].confidence - 0.9).abs() < 1e-5,
-            "y=0.05 (Y_SAFE) should be full confidence, got {}", s.keypoints[KP_LEFT_KNEE].confidence);
-        assert!((s.keypoints[KP_RIGHT_KNEE].confidence - 0.9).abs() < 1e-5,
-            "y=0.95 (1-Y_SAFE) should be full confidence, got {}", s.keypoints[KP_RIGHT_KNEE].confidence);
-    }
-
-    #[test]
-    fn test_sanitize_pose_shoulder_y_hard_cutoff() {
-        // Shoulders still use hard cutoff for Y direction
-        let pose = make_pose(&[
-            (KP_LEFT_SHOULDER, 0.50, 0.015, 0.0, 0.9),  // y < 0.02 → zeroed
-            (KP_RIGHT_SHOULDER, 0.50, 0.985, 0.0, 0.9),  // y > 0.98 → zeroed
-        ]);
-        let s = sanitize_pose(&pose);
-        assert_eq!(s.keypoints[KP_LEFT_SHOULDER].confidence, 0.0, "shoulder y=0.015 should be hard cutoff");
-        assert_eq!(s.keypoints[KP_RIGHT_SHOULDER].confidence, 0.0, "shoulder y=0.985 should be hard cutoff");
-    }
-
-    #[test]
-    fn test_sanitize_pose_hip_x_only_boundary() {
-        // Hips use X-only boundary: Y edges should NOT zero confidence
-        let pose = make_pose(&[
-            (KP_LEFT_HIP, 0.50, 0.01, 0.0, 0.9),   // y=0.01 but hip is X-only → kept
-            (KP_RIGHT_HIP, 0.01, 0.50, 0.0, 0.9),   // x=0.01 → zeroed
-        ]);
-        let s = sanitize_pose(&pose);
-        assert_eq!(s.keypoints[KP_LEFT_HIP].confidence, 0.9, "hip y-edge should be kept");
-        assert_eq!(s.keypoints[KP_RIGHT_HIP].confidence, 0.0, "hip x-edge should be zeroed");
-    }
-
-    #[test]
-    fn test_sanitize_pose_inside_boundary_kept() {
-        let pose = make_pose(&[
-            (KP_LEFT_ANKLE,  0.10, 0.50, 0.0, 0.9),
-            (KP_RIGHT_ANKLE, 0.90, 0.50, 0.0, 0.9),
-            (KP_LEFT_HIP,   0.30, 0.50, 0.0, 0.9),
-            (KP_RIGHT_HIP,  0.70, 0.50, 0.0, 0.9),
-        ]);
-        let s = sanitize_pose(&pose);
-        assert_eq!(s.keypoints[KP_LEFT_ANKLE].confidence, 0.9);
-        assert_eq!(s.keypoints[KP_RIGHT_ANKLE].confidence, 0.9);
-        assert_eq!(s.keypoints[KP_LEFT_HIP].confidence, 0.9);
-        assert_eq!(s.keypoints[KP_RIGHT_HIP].confidence, 0.9);
     }
 
     // ===================================================================
