@@ -1,6 +1,7 @@
 /target
 models/*.onnx
 calibration.json
+calibration_*.log
 *.bak
 *.png
 test_vmt.py

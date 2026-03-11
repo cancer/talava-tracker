@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use minifb::Key;
 use opencv::core::{Mat, Size, Scalar};
 use opencv::{calib3d, prelude::*};
+use std::io::Write;
 use std::time::Instant;
 
 use talava_tracker::calibration::{
@@ -179,6 +180,16 @@ fn main() -> Result<()> {
     let mut image_sizes: Vec<Size> = Vec::new();
     let mut reprojection_errors: Vec<f64> = Vec::new();
 
+    // ログ用データ蓄積
+    let mut log_lines: Vec<String> = Vec::new();
+    log_lines.push(format!("=== キャリブレーションログ ==="));
+    log_lines.push(format!("日時: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S")));
+    log_lines.push(format!("ボード: {} {}x{} square={:.3}m marker={:.3}m",
+        cal_config.dictionary, cal_config.squares_x, cal_config.squares_y,
+        cal_config.square_length, cal_config.marker_length));
+    log_lines.push(format!("カメラ: {:?}", camera_indices));
+    log_lines.push(String::new());
+
     for (cam_idx, &cam_id) in camera_indices.iter().enumerate() {
         println!("--- カメラ {} ({}/{}) ---", cam_id, cam_idx + 1, num_cameras);
 
@@ -194,9 +205,10 @@ fn main() -> Result<()> {
         )?;
 
         // k3異常値検出時にリトライするための外側ループ
-        let (k_result, dist_result, error_result) = loop {
+        let (k_result, dist_result, error_result, capture_stats) = loop {
             let mut all_corners: Vec<Mat> = Vec::new();
             let mut all_ids: Vec<Mat> = Vec::new();
+            let mut capture_stats: Vec<(i32, f64, f64, f64, f64, f64)> = Vec::new(); // (n_corners, area_ratio, min_x, min_y, max_x, max_y)
             let mut last_capture = Instant::now() - capture_interval;
 
             println!("  キャプチャ: 0/{}", cal_config.intrinsic_frames);
@@ -212,10 +224,28 @@ fn main() -> Result<()> {
 
                 // 自動キャプチャ
                 let captured_now = if n_corners >= 6 && last_capture.elapsed() >= capture_interval {
+                    // コーナーのバウンディングボックスと面積比を計算
+                    let mut min_x = f64::MAX;
+                    let mut min_y = f64::MAX;
+                    let mut max_x = f64::MIN;
+                    let mut max_y = f64::MIN;
+                    for i in 0..n_corners {
+                        let pt = corners.at_2d::<opencv::core::Point2f>(i, 0)?;
+                        min_x = min_x.min(pt.x as f64);
+                        min_y = min_y.min(pt.y as f64);
+                        max_x = max_x.max(pt.x as f64);
+                        max_y = max_y.max(pt.y as f64);
+                    }
+                    let bbox_area = (max_x - min_x) * (max_y - min_y);
+                    let image_area = w as f64 * h as f64;
+                    let area_ratio = bbox_area / image_area;
+                    capture_stats.push((n_corners, area_ratio, min_x, min_y, max_x, max_y));
+
                     all_corners.push(corners.clone());
                     all_ids.push(ids);
                     last_capture = Instant::now();
-                    println!("  キャプチャ: {}/{}", all_corners.len(), cal_config.intrinsic_frames);
+                    println!("  キャプチャ: {}/{} (corners={}, area={:.1}%)",
+                        all_corners.len(), cal_config.intrinsic_frames, n_corners, area_ratio * 100.0);
                     true
                 } else {
                     false
@@ -277,7 +307,7 @@ fn main() -> Result<()> {
                 *k.at_2d_mut::<f64>(1, 1)? = fy;
                 *k.at_2d_mut::<f64>(0, 2)? = w as f64 / 2.0;
                 *k.at_2d_mut::<f64>(1, 2)? = h as f64 / 2.0;
-                break (k, Mat::zeros(5, 1, opencv::core::CV_64F)?.to_mat()?, -1.0);
+                break (k, Mat::zeros(5, 1, opencv::core::CV_64F)?.to_mat()?, -1.0, capture_stats);
             }
 
             println!("  キャリブレーション中...");
@@ -327,8 +357,48 @@ fn main() -> Result<()> {
                 continue; // 外側loopの先頭に戻り、キャプチャからやり直し
             }
 
-            break (k, dist, error);
+            break (k, dist, error, capture_stats);
         };
+
+        // 内部パラメータのログ記録
+        {
+            let fx = *k_result.at_2d::<f64>(0, 0)?;
+            let fy = *k_result.at_2d::<f64>(1, 1)?;
+            let cx = *k_result.at_2d::<f64>(0, 2)?;
+            let cy = *k_result.at_2d::<f64>(1, 2)?;
+            let dist_vals: Vec<f64> = (0..dist_result.rows().max(dist_result.cols()))
+                .map(|i| {
+                    if dist_result.rows() == 1 {
+                        *dist_result.at_2d::<f64>(0, i).unwrap()
+                    } else {
+                        *dist_result.at_2d::<f64>(i, 0).unwrap()
+                    }
+                })
+                .collect();
+            log_lines.push(format!("[内部パラメータ] カメラ{} ({}x{})", cam_id, image_sizes[cam_idx].width, image_sizes[cam_idx].height));
+            log_lines.push(format!("  fx={:.4} fy={:.4} cx={:.4} cy={:.4}", fx, fy, cx, cy));
+            log_lines.push(format!("  fx/fy={:.4}", if fy.abs() > 1e-10 { fx / fy } else { f64::NAN }));
+            log_lines.push(format!("  dist_coeffs={:?}", dist_vals));
+            log_lines.push(format!("  reproj_error={:.4} px", error_result));
+            log_lines.push(format!("  キャプチャフレーム: {}枚", capture_stats.len()));
+            for (fi, (nc, area, x0, y0, x1, y1)) in capture_stats.iter().enumerate() {
+                log_lines.push(format!("    frame {}: corners={} area={:.1}% bbox=({:.0},{:.0})-({:.0},{:.0})",
+                    fi, nc, area * 100.0, x0, y0, x1, y1));
+            }
+            // カバー範囲の集計: 全フレームの全コーナーが画像のどの領域をカバーしているか
+            if !capture_stats.is_empty() {
+                let global_min_x = capture_stats.iter().map(|s| s.2).fold(f64::MAX, f64::min);
+                let global_min_y = capture_stats.iter().map(|s| s.3).fold(f64::MAX, f64::min);
+                let global_max_x = capture_stats.iter().map(|s| s.4).fold(f64::MIN, f64::max);
+                let global_max_y = capture_stats.iter().map(|s| s.5).fold(f64::MIN, f64::max);
+                let avg_area: f64 = capture_stats.iter().map(|s| s.1).sum::<f64>() / capture_stats.len() as f64;
+                log_lines.push(format!("  全体カバー範囲: ({:.0},{:.0})-({:.0},{:.0}) = {:.0}x{:.0}px",
+                    global_min_x, global_min_y, global_max_x, global_max_y,
+                    global_max_x - global_min_x, global_max_y - global_min_y));
+                log_lines.push(format!("  平均ボード面積比: {:.1}%", avg_area * 100.0));
+            }
+            log_lines.push(String::new());
+        }
 
         camera_matrices.push(k_result);
         dist_coeffs_vec.push(dist_result);
@@ -378,10 +448,14 @@ fn main() -> Result<()> {
         // 歪み補正済み画像で検出するため、solvePnPには歪み=0を渡す
         let zero_dist = Mat::zeros(5, 1, opencv::core::CV_64F)?.to_mat()?;
 
-        let mut extrinsic_done = false;
-        let mut all_poses: Vec<(Mat, Mat)> = Vec::new();
+        let extrinsic_frames = cal_config.extrinsic_frames;
+        // 各フレームごとの全カメラポーズを蓄積: [frame][camera] = (rvec, tvec)
+        let mut pose_samples: Vec<Vec<([f64; 3], [f64; 3])>> = Vec::new();
+        let mut last_extrinsic_capture = Instant::now() - capture_interval;
 
-        while !extrinsic_done && renderer.is_open() {
+        println!("  キャプチャ: 0/{}", extrinsic_frames);
+
+        while pose_samples.len() < extrinsic_frames && renderer.is_open() {
             // 全カメラからフレーム取得・検出・表示
             let mut frames: Vec<Mat> = Vec::new();
             let mut corner_data: Vec<(Mat, Mat, i32)> = Vec::new();
@@ -426,13 +500,16 @@ fn main() -> Result<()> {
                 }
 
                 let (status, color) = if n >= 6 {
-                    (format!("Cam {} | Corners: {}", camera_indices[i], n),
+                    (format!("Cam {} | Corners: {} | {}/{}",
+                        camera_indices[i], n, pose_samples.len(), extrinsic_frames),
                      Scalar::new(0.0, 255.0, 0.0, 0.0))
                 } else if n > 0 {
-                    (format!("Cam {} | Corners: {} (need 6+)", camera_indices[i], n),
+                    (format!("Cam {} | Corners: {} (need 6+) | {}/{}",
+                        camera_indices[i], n, pose_samples.len(), extrinsic_frames),
                      Scalar::new(0.0, 255.0, 255.0, 0.0))
                 } else {
-                    (format!("Cam {} | No corners", camera_indices[i]),
+                    (format!("Cam {} | No corners | {}/{}",
+                        camera_indices[i], pose_samples.len(), extrinsic_frames),
                      Scalar::new(0.0, 0.0, 255.0, 0.0))
                 };
                 opencv::imgproc::put_text(
@@ -465,11 +542,11 @@ fn main() -> Result<()> {
 
             renderer.update()?;
 
-            // 全カメラでコーナーが十分なら自動キャプチャ
+            // 全カメラでコーナーが十分かつキャプチャ間隔を満たしたら自動キャプチャ
             let all_have_enough = corner_data.iter().all(|(_, _, n)| *n >= 6);
 
-            if all_have_enough {
-                all_poses.clear();
+            if all_have_enough && last_extrinsic_capture.elapsed() >= capture_interval {
+                let mut frame_poses = Vec::new();
                 let mut all_valid = true;
 
                 for (i, (corners, ids, _)) in corner_data.iter().enumerate() {
@@ -478,19 +555,30 @@ fn main() -> Result<()> {
                         &camera_matrices[i], &zero_dist,
                     )? {
                         Some((rvec, tvec)) => {
-                            all_poses.push((rvec, tvec));
+                            let rv = [
+                                *rvec.at_2d::<f64>(0, 0)?,
+                                *rvec.at_2d::<f64>(1, 0)?,
+                                *rvec.at_2d::<f64>(2, 0)?,
+                            ];
+                            let tv = [
+                                *tvec.at_2d::<f64>(0, 0)?,
+                                *tvec.at_2d::<f64>(1, 0)?,
+                                *tvec.at_2d::<f64>(2, 0)?,
+                            ];
+                            frame_poses.push((rv, tv));
                         }
                         None => {
-                            println!("  カメラ{}: ポーズ推定失敗", camera_indices[i]);
+                            println!("  カメラ{}: ポーズ推定失敗（スキップ）", camera_indices[i]);
                             all_valid = false;
                             break;
                         }
                     }
                 }
 
-                if all_valid && all_poses.len() == num_cameras {
-                    println!("  全カメラでポーズ推定成功！");
-                    extrinsic_done = true;
+                if all_valid && frame_poses.len() == num_cameras {
+                    pose_samples.push(frame_poses);
+                    last_extrinsic_capture = Instant::now();
+                    println!("  キャプチャ: {}/{}", pose_samples.len(), extrinsic_frames);
                 }
             }
 
@@ -499,8 +587,103 @@ fn main() -> Result<()> {
             }
         }
 
-        if !extrinsic_done {
+        if pose_samples.is_empty() {
             bail!("外部パラメータキャリブレーションが完了しませんでした");
+        }
+
+        // 各カメラのrvec/tvecについて中央値を算出
+        fn median(values: &mut Vec<f64>) -> f64 {
+            values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let n = values.len();
+            if n % 2 == 0 {
+                (values[n / 2 - 1] + values[n / 2]) / 2.0
+            } else {
+                values[n / 2]
+            }
+        }
+
+        println!();
+        println!("  外部パラメータ集計（{}フレーム）:", pose_samples.len());
+
+        log_lines.push(format!("[外部パラメータ] {}フレーム", pose_samples.len()));
+
+        // 全フレームの生データをログに記録
+        for (frame_idx, sample) in pose_samples.iter().enumerate() {
+            log_lines.push(format!("  フレーム {}:", frame_idx));
+            for (cam_idx, (rv, tv)) in sample.iter().enumerate() {
+                log_lines.push(format!("    カメラ{}: rvec=[{:.6}, {:.6}, {:.6}] tvec=[{:.6}, {:.6}, {:.6}]",
+                    camera_indices[cam_idx], rv[0], rv[1], rv[2], tv[0], tv[1], tv[2]));
+            }
+        }
+        log_lines.push(String::new());
+
+        let mut all_poses: Vec<(Mat, Mat)> = Vec::new();
+        for cam_idx in 0..num_cameras {
+            let mut rvecs: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+            let mut tvecs: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+
+            for sample in &pose_samples {
+                let (rv, tv) = &sample[cam_idx];
+                for k in 0..3 {
+                    rvecs[k].push(rv[k]);
+                    tvecs[k].push(tv[k]);
+                }
+            }
+
+            // 中央値
+            let rv_med: [f64; 3] = [
+                median(&mut rvecs[0]),
+                median(&mut rvecs[1]),
+                median(&mut rvecs[2]),
+            ];
+            let tv_med: [f64; 3] = [
+                median(&mut tvecs[0]),
+                median(&mut tvecs[1]),
+                median(&mut tvecs[2]),
+            ];
+
+            // 標準偏差
+            let rv_std: [f64; 3] = if pose_samples.len() >= 2 {
+                let s: Vec<f64> = (0..3).map(|k| {
+                    let mean = rvecs[k].iter().sum::<f64>() / rvecs[k].len() as f64;
+                    let var = rvecs[k].iter().map(|v| (v - mean).powi(2)).sum::<f64>() / rvecs[k].len() as f64;
+                    var.sqrt()
+                }).collect();
+                [s[0], s[1], s[2]]
+            } else {
+                [0.0; 3]
+            };
+            let tv_std: [f64; 3] = if pose_samples.len() >= 2 {
+                let s: Vec<f64> = (0..3).map(|k| {
+                    let mean = tvecs[k].iter().sum::<f64>() / tvecs[k].len() as f64;
+                    let var = tvecs[k].iter().map(|v| (v - mean).powi(2)).sum::<f64>() / tvecs[k].len() as f64;
+                    var.sqrt()
+                }).collect();
+                [s[0], s[1], s[2]]
+            } else {
+                [0.0; 3]
+            };
+
+            println!("  カメラ{}: rvec median=[{:.4}, {:.4}, {:.4}] std=[{:.4}, {:.4}, {:.4}]",
+                camera_indices[cam_idx], rv_med[0], rv_med[1], rv_med[2], rv_std[0], rv_std[1], rv_std[2]);
+            println!("           tvec median=[{:.4}, {:.4}, {:.4}] std=[{:.4}, {:.4}, {:.4}]",
+                tv_med[0], tv_med[1], tv_med[2], tv_std[0], tv_std[1], tv_std[2]);
+
+            log_lines.push(format!("  [集計] カメラ{}:", camera_indices[cam_idx]));
+            log_lines.push(format!("    rvec median=[{:.6}, {:.6}, {:.6}] std=[{:.6}, {:.6}, {:.6}]",
+                rv_med[0], rv_med[1], rv_med[2], rv_std[0], rv_std[1], rv_std[2]));
+            log_lines.push(format!("    tvec median=[{:.6}, {:.6}, {:.6}] std=[{:.6}, {:.6}, {:.6}]",
+                tv_med[0], tv_med[1], tv_med[2], tv_std[0], tv_std[1], tv_std[2]));
+            log_lines.push(String::new());
+
+            // 中央値からMat復元（compute_relative_posesに渡すため）
+            let mut rvec_mat = Mat::zeros(3, 1, opencv::core::CV_64F)?.to_mat()?;
+            let mut tvec_mat = Mat::zeros(3, 1, opencv::core::CV_64F)?.to_mat()?;
+            for k in 0..3 {
+                *rvec_mat.at_2d_mut::<f64>(k as i32, 0)? = rv_med[k];
+                *tvec_mat.at_2d_mut::<f64>(k as i32, 0)? = tv_med[k];
+            }
+            all_poses.push((rvec_mat, tvec_mat));
         }
 
         // 相対ポーズ計算
@@ -574,6 +757,15 @@ fn main() -> Result<()> {
         save_calibration(&cal_config.output_path, &result)?;
         println!("保存完了: {}", cal_config.output_path);
     }
+
+    // ログファイル保存
+    let log_path = format!("calibration_{}.log",
+        chrono::Local::now().format("%Y%m%d_%H%M%S"));
+    let mut log_file = std::fs::File::create(&log_path)?;
+    for line in &log_lines {
+        writeln!(log_file, "{}", line)?;
+    }
+    println!("ログ保存: {}", log_path);
 
     println!();
     println!("=== キャリブレーション完了 ===");
