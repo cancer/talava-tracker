@@ -32,6 +32,9 @@ pub struct CalibrationConfig {
     /// 内部パラメータ用キャプチャフレーム数
     #[serde(default = "default_intrinsic_frames")]
     pub intrinsic_frames: usize,
+    /// 外部パラメータ用キャプチャフレーム数
+    #[serde(default = "default_extrinsic_frames")]
+    pub extrinsic_frames: usize,
 }
 
 fn default_dictionary() -> String { "DICT_4X4_50".to_string() }
@@ -41,6 +44,7 @@ fn default_square_length() -> f32 { 0.04 }
 fn default_marker_length() -> f32 { 0.03 }
 fn default_calibration_output() -> String { "calibration.json".to_string() }
 fn default_intrinsic_frames() -> usize { 15 }
+fn default_extrinsic_frames() -> usize { 10 }
 
 impl Default for CalibrationConfig {
     fn default() -> Self {
@@ -52,6 +56,7 @@ impl Default for CalibrationConfig {
             marker_length: default_marker_length(),
             output_path: default_calibration_output(),
             intrinsic_frames: default_intrinsic_frames(),
+            extrinsic_frames: default_extrinsic_frames(),
         }
     }
 }

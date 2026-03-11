@@ -6,3 +6,4 @@ square_length = 0.035   # チェスボードのマス辺長（メートル）
 marker_length = 0.025   # マス内ArUcoマーカー辺長（メートル）
 output_path = "calibration.json"
 intrinsic_frames = 15
+extrinsic_frames = 10
