@@ -68,10 +68,17 @@ impl OpenCvCamera {
         }
         capture.set(videoio::CAP_PROP_BUFFERSIZE, 1.0)?;
 
-        let actual_width = capture.get(videoio::CAP_PROP_FRAME_WIDTH)? as u32;
-        let actual_height = capture.get(videoio::CAP_PROP_FRAME_HEIGHT)? as u32;
         let actual_fps = capture.get(videoio::CAP_PROP_FPS)?;
         println!("Camera FPS: {}", actual_fps);
+
+        // CAP_PROPは信頼できないため、実フレームから解像度を取得
+        let mut first_frame = Mat::default();
+        capture.read(&mut first_frame).context("Failed to read first frame for resolution detection")?;
+        if first_frame.empty() {
+            anyhow::bail!("Camera {} returned empty first frame", index);
+        }
+        let actual_width = first_frame.cols() as u32;
+        let actual_height = first_frame.rows() as u32;
 
         Ok(Self {
             capture,

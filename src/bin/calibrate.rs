@@ -205,9 +205,10 @@ fn main() -> Result<()> {
         )?;
 
         // k3異常値検出時にリトライするための外側ループ
-        let (k_result, dist_result, error_result) = loop {
+        let (k_result, dist_result, error_result, capture_stats) = loop {
             let mut all_corners: Vec<Mat> = Vec::new();
             let mut all_ids: Vec<Mat> = Vec::new();
+            let mut capture_stats: Vec<(i32, f64, f64, f64, f64, f64)> = Vec::new(); // (n_corners, area_ratio, min_x, min_y, max_x, max_y)
             let mut last_capture = Instant::now() - capture_interval;
 
             println!("  キャプチャ: 0/{}", cal_config.intrinsic_frames);
@@ -223,10 +224,28 @@ fn main() -> Result<()> {
 
                 // 自動キャプチャ
                 let captured_now = if n_corners >= 6 && last_capture.elapsed() >= capture_interval {
+                    // コーナーのバウンディングボックスと面積比を計算
+                    let mut min_x = f64::MAX;
+                    let mut min_y = f64::MAX;
+                    let mut max_x = f64::MIN;
+                    let mut max_y = f64::MIN;
+                    for i in 0..n_corners {
+                        let pt = corners.at_2d::<opencv::core::Point2f>(i, 0)?;
+                        min_x = min_x.min(pt.x as f64);
+                        min_y = min_y.min(pt.y as f64);
+                        max_x = max_x.max(pt.x as f64);
+                        max_y = max_y.max(pt.y as f64);
+                    }
+                    let bbox_area = (max_x - min_x) * (max_y - min_y);
+                    let image_area = w as f64 * h as f64;
+                    let area_ratio = bbox_area / image_area;
+                    capture_stats.push((n_corners, area_ratio, min_x, min_y, max_x, max_y));
+
                     all_corners.push(corners.clone());
                     all_ids.push(ids);
                     last_capture = Instant::now();
-                    println!("  キャプチャ: {}/{}", all_corners.len(), cal_config.intrinsic_frames);
+                    println!("  キャプチャ: {}/{} (corners={}, area={:.1}%)",
+                        all_corners.len(), cal_config.intrinsic_frames, n_corners, area_ratio * 100.0);
                     true
                 } else {
                     false
@@ -288,7 +307,7 @@ fn main() -> Result<()> {
                 *k.at_2d_mut::<f64>(1, 1)? = fy;
                 *k.at_2d_mut::<f64>(0, 2)? = w as f64 / 2.0;
                 *k.at_2d_mut::<f64>(1, 2)? = h as f64 / 2.0;
-                break (k, Mat::zeros(5, 1, opencv::core::CV_64F)?.to_mat()?, -1.0);
+                break (k, Mat::zeros(5, 1, opencv::core::CV_64F)?.to_mat()?, -1.0, capture_stats);
             }
 
             println!("  キャリブレーション中...");
@@ -338,7 +357,7 @@ fn main() -> Result<()> {
                 continue; // 外側loopの先頭に戻り、キャプチャからやり直し
             }
 
-            break (k, dist, error);
+            break (k, dist, error, capture_stats);
         };
 
         // 内部パラメータのログ記録
@@ -361,6 +380,23 @@ fn main() -> Result<()> {
             log_lines.push(format!("  fx/fy={:.4}", if fy.abs() > 1e-10 { fx / fy } else { f64::NAN }));
             log_lines.push(format!("  dist_coeffs={:?}", dist_vals));
             log_lines.push(format!("  reproj_error={:.4} px", error_result));
+            log_lines.push(format!("  キャプチャフレーム: {}枚", capture_stats.len()));
+            for (fi, (nc, area, x0, y0, x1, y1)) in capture_stats.iter().enumerate() {
+                log_lines.push(format!("    frame {}: corners={} area={:.1}% bbox=({:.0},{:.0})-({:.0},{:.0})",
+                    fi, nc, area * 100.0, x0, y0, x1, y1));
+            }
+            // カバー範囲の集計: 全フレームの全コーナーが画像のどの領域をカバーしているか
+            if !capture_stats.is_empty() {
+                let global_min_x = capture_stats.iter().map(|s| s.2).fold(f64::MAX, f64::min);
+                let global_min_y = capture_stats.iter().map(|s| s.3).fold(f64::MAX, f64::min);
+                let global_max_x = capture_stats.iter().map(|s| s.4).fold(f64::MIN, f64::max);
+                let global_max_y = capture_stats.iter().map(|s| s.5).fold(f64::MIN, f64::max);
+                let avg_area: f64 = capture_stats.iter().map(|s| s.1).sum::<f64>() / capture_stats.len() as f64;
+                log_lines.push(format!("  全体カバー範囲: ({:.0},{:.0})-({:.0},{:.0}) = {:.0}x{:.0}px",
+                    global_min_x, global_min_y, global_max_x, global_max_y,
+                    global_max_x - global_min_x, global_max_y - global_min_y));
+                log_lines.push(format!("  平均ボード面積比: {:.1}%", avg_area * 100.0));
+            }
             log_lines.push(String::new());
         }
 
