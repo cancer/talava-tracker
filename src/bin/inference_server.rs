@@ -172,13 +172,15 @@ fn check_hip_z_jump(
     false
 }
 
+/// Returns (pose, inlier_counts) where inlier_counts[cam_idx] = number of keypoints
+/// where that camera was used as an inlier.
 fn triangulate_poses_multi(
     cameras: &[&CameraParams],
     poses_2d: &[&Pose],
     confidence_threshold: f32,
     prev_hip_z: &mut Option<f32>,
     prev_hip_z_reject_count: &mut u32,
-) -> Pose {
+) -> (Pose, Vec<u32>) {
     assert_eq!(cameras.len(), poses_2d.len());
     let n = cameras.len();
 
@@ -203,16 +205,22 @@ fn triangulate_poses_multi(
 
     let mut keypoints = [Keypoint::default(); KP_COUNT];
 
+    // inlier_counts[cam_idx] = そのカメラがinlierとして採用された回数
+    let mut inlier_counts: Vec<u32> = vec![0; n];
+    let mut total_triangulated: u32 = 0;
+
     for kp_idx in 0..KP_COUNT {
         let mut valid_cameras: Vec<&CameraParams> = Vec::new();
         let mut valid_points: Vec<(f32, f32)> = Vec::new();
         let mut valid_confs: Vec<f32> = Vec::new();
+        let mut valid_cam_indices: Vec<usize> = Vec::new();
 
         for cam_idx in 0..n {
             if let Some((u, v, conf)) = observations[kp_idx][cam_idx] {
                 valid_cameras.push(cameras[cam_idx]);
                 valid_points.push((u, v));
                 valid_confs.push(conf);
+                valid_cam_indices.push(cam_idx);
             }
         }
 
@@ -228,6 +236,7 @@ fn triangulate_poses_multi(
         let mut inlier_cams: Vec<&CameraParams> = Vec::new();
         let mut inlier_pts: Vec<(f32, f32)> = Vec::new();
         let mut inlier_confs: Vec<f32> = Vec::new();
+        let mut inlier_indices: Vec<usize> = Vec::new();
 
         for i in 0..valid_cameras.len() {
             let cam_err = reprojection_error(
@@ -237,11 +246,11 @@ fn triangulate_poses_multi(
                 inlier_cams.push(valid_cameras[i]);
                 inlier_pts.push(valid_points[i]);
                 inlier_confs.push(valid_confs[i]);
+                inlier_indices.push(valid_cam_indices[i]);
             }
         }
 
         if inlier_cams.len() >= 2 {
-            // inlierのみで再三角測量
             let (rx, ry, rz) = if inlier_cams.len() < valid_cameras.len() {
                 triangulate_point(&inlier_cams, &inlier_pts)
             } else {
@@ -249,6 +258,10 @@ fn triangulate_poses_multi(
             };
             let avg_conf: f32 = inlier_confs.iter().sum::<f32>() / inlier_confs.len() as f32;
             keypoints[kp_idx] = Keypoint::new_3d(rx, ry, rz, avg_conf);
+            total_triangulated += 1;
+            for &ci in &inlier_indices {
+                inlier_counts[ci] += 1;
+            }
         }
     }
 
@@ -266,10 +279,10 @@ fn triangulate_poses_multi(
     };
 
     if check_hip_z_jump(current_hip_z, prev_hip_z, prev_hip_z_reject_count) {
-        return Pose::new([Keypoint::default(); KP_COUNT]);
+        return (Pose::new([Keypoint::default(); KP_COUNT]), inlier_counts);
     }
 
-    Pose::new(keypoints)
+    (Pose::new(keypoints), inlier_counts)
 }
 
 // ===========================================================================
@@ -1668,11 +1681,17 @@ fn run_inference_loop(
 
                             if available_poses.len() >= 2 {
                                 let zjump_count_before = prev_hip_z_reject_count;
-                                let mut tri_pose = triangulate_poses_multi(
+                                let (mut tri_pose, tri_inlier_counts) = triangulate_poses_multi(
                                     &available_params, &available_poses, CONFIDENCE_THRESHOLD,
                                     &mut prev_hip_z,
                                     &mut prev_hip_z_reject_count,
                                 );
+                                {
+                                    let inlier_strs: Vec<String> = tri_inlier_counts.iter().enumerate()
+                                        .map(|(i, c)| format!("cam{}={}", i, c))
+                                        .collect();
+                                    log!(logfile, "[tri] inliers=[{}]", inlier_strs.join(" "));
+                                }
                                 if prev_hip_z_reject_count > zjump_count_before {
                                     fps_reject_zjump += 1;
                                 }
