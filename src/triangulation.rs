@@ -345,7 +345,12 @@ pub fn triangulate_point(cameras: &[&CameraParams], points_2d: &[(f32, f32)]) ->
     (x[0] / w, x[1] / w, x[2] / w)
 }
 
-/// 3D点のリプロジェクションエラーを計算
+/// 3D点の角度ベースリプロジェクションエラーを計算（ラジアン）
+///
+/// ピクセル誤差を atan(px_err / fx) で角度に正規化する。
+/// fxが異なるカメラ間で公平に比較できる。
+/// fx のみで除算するため fx≠fy のカメラでは方向依存の近似となるが、
+/// 正常なキャリブレーションでは fx≈fy であり実用上問題ない。
 pub fn reprojection_error(
     cameras: &[&CameraParams],
     points_2d: &[(f32, f32)],
@@ -360,15 +365,14 @@ pub fn reprojection_error(
         let u_proj = projected[0] / projected[2];
         let v_proj = projected[1] / projected[2];
         let (u_obs, v_obs) = points_2d[i];
-        let err = ((u_proj - u_obs).powi(2) + (v_proj - v_obs).powi(2)).sqrt();
-        max_err = max_err.max(err);
+        let px_err = ((u_proj - u_obs).powi(2) + (v_proj - v_obs).powi(2)).sqrt();
+        let fx = cameras[i].intrinsic[(0, 0)];
+        let angle_err = (px_err / fx).atan();
+        max_err = max_err.max(angle_err);
     }
     max_err
 }
 
-/// N台のカメラの2Dポーズから3Dポーズを三角測量
-///
-/// - 各キーポイントについて、confidence_threshold以上のカメラの観測を集める
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,11 +489,11 @@ mod tests {
             let p3d = Vector4::new(x, y, z, 1.0);
             let err = reprojection_error(&pair_cams, &pair_pts, &p3d);
 
-            eprintln!("{}: triangulated ({:.4}, {:.4}, {:.4}) reproj_err={:.2}px",
+            eprintln!("{}: triangulated ({:.4}, {:.4}, {:.4}) reproj_err={:.6}rad",
                 name, x, y, z, err);
 
             // 自己整合性テスト: 同じ行列で投影→三角測量なので誤差はほぼゼロ
-            assert!(err < 1.0, "{}: self-consistency reproj err too high: {:.2}px", name, err);
+            assert!(err < 0.001, "{}: self-consistency reproj err too high: {:.6}rad", name, err);
             assert!((x - 0.0).abs() < 0.05, "{}: x={:.4} expected ~0.0", name, x);
             assert!((y - 0.0).abs() < 0.05, "{}: y={:.4} expected ~0.0", name, y);
             assert!((z - 2.0).abs() < 0.05, "{}: z={:.4} expected ~2.0", name, z);
@@ -568,6 +572,58 @@ mod tests {
             // 10px noise → 合理的なカメラペアなら3Dエラーは1m未満
             // （壊れたキャリブレーションでは数十m以上になる可能性あり）
         }
+    }
+
+    /// reprojection_errorが角度ベース（ラジアン）で返ることを検証
+    /// 既知の3D点に対してずらした2D観測を与え、返り値がatan(px_err/fx)であることを確認
+    #[test]
+    fn test_reprojection_error_is_angle_based() {
+        let cam_lo = CameraParams::from_config(55.0, 640, 480, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
+        let cam_hi = CameraParams::from_config(27.0, 640, 480, [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
+
+        let fx_lo = cam_lo.intrinsic[(0, 0)];
+        let fx_hi = cam_hi.intrinsic[(0, 0)];
+        assert!(fx_hi > fx_lo * 1.5);
+
+        let target = Vector4::new(0.5, 0.0, 3.0, 1.0);
+
+        // 正確な2D投影を得る
+        let proj_lo = cam_lo.projection * target;
+        let u_lo = proj_lo[0] / proj_lo[2];
+        let v_lo = proj_lo[1] / proj_lo[2];
+        let proj_hi = cam_hi.projection * target;
+        let u_hi = proj_hi[0] / proj_hi[2];
+        let v_hi = proj_hi[1] / proj_hi[2];
+
+        // cam_loの2D観測を10px右にずらす
+        let shift_px = 10.0_f32;
+        let err = reprojection_error(
+            &[&cam_lo, &cam_hi],
+            &[(u_lo + shift_px, v_lo), (u_hi, v_hi)],
+            &target,
+        );
+
+        // 期待値: atan(10 / fx_lo) ラジアン（cam_hiは誤差0なのでcam_loのみ）
+        let expected = (shift_px / fx_lo).atan();
+        assert!(
+            (err - expected).abs() < 1e-5,
+            "reprojection_error={:.6} should be atan({}/{})={:.6}",
+            err, shift_px, fx_lo, expected,
+        );
+
+        // fx が大きいカメラで同じピクセルずれ → 角度誤差が小さい
+        let err_hi_shifted = reprojection_error(
+            &[&cam_lo, &cam_hi],
+            &[(u_lo, v_lo), (u_hi + shift_px, v_hi)],
+            &target,
+        );
+        let expected_hi = (shift_px / fx_hi).atan();
+        assert!(
+            (err_hi_shifted - expected_hi).abs() < 1e-5,
+            "err_hi={:.6} should be atan({}/{})={:.6}",
+            err_hi_shifted, shift_px, fx_hi, expected_hi,
+        );
+        assert!(err > err_hi_shifted, "same pixel shift should produce larger angle error for smaller fx");
     }
 
     /// fx/fy比の検証: 正常なカメラは1.0に近い、非正方ピクセルは異常
@@ -682,7 +738,7 @@ mod tests {
         eprintln!("Resolution mismatch (1920x1080 cal, 720x1280 actual):");
         eprintln!("  cam4 pixel: true=({:.0},{:.0}) mismatched=({:.0},{:.0})",
             u4_true, v4_true, u4_mismatched, v4_mismatched);
-        eprintln!("  triangulated ({:.3}, {:.3}, {:.3}) 3D_err={:.3}m reproj={:.0}px",
+        eprintln!("  triangulated ({:.3}, {:.3}, {:.3}) 3D_err={:.3}m reproj={:.6}rad",
             x2, y2, z2, err_3d, reproj);
     }
 

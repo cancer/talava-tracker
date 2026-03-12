@@ -137,74 +137,12 @@ const KP_NAMES: &[&str] = &[
 // Triangulation helpers (uses library CameraParams, triangulate_point, reprojection_error)
 // ===========================================================================
 
-const MAX_REPROJ_ERROR: f32 = 120.0;
+const MAX_REPROJ_ANGLE: f32 = 0.084;
 const MAX_HIP_Z_JUMP: f32 = 0.3;
 const MAX_HIP_Z_REJECT_STREAK: u32 = 5;
 const MAX_FOOT_YAW: f32 = std::f32::consts::FRAC_PI_4;   // ±45°
 const MAX_FOOT_PITCH: f32 = std::f32::consts::FRAC_PI_6;  // ±30°
 const MAX_FOOT_ROLL: f32 = std::f32::consts::FRAC_PI_6;   // ±30°
-
-fn find_hip_reference_pair(
-    cameras: &[&CameraParams],
-    observations: &[Vec<Option<(f32, f32, f32)>>],
-    prev_pair: Option<(usize, usize)>,
-) -> Option<(usize, usize)> {
-    let kp_idx = KP_LEFT_HIP;
-    let n = cameras.len();
-
-    let mut valid_cameras = Vec::new();
-    let mut valid_points = Vec::new();
-    let mut valid_cam_indices = Vec::new();
-
-    for cam_idx in 0..n {
-        if let Some((u, v, _conf)) = observations[kp_idx][cam_idx] {
-            valid_cameras.push(cameras[cam_idx]);
-            valid_points.push((u, v));
-            valid_cam_indices.push(cam_idx);
-        }
-    }
-
-    if valid_cameras.len() < 2 {
-        return None;
-    }
-
-    // Hysteresis: prefer previous pair if still valid
-    if let Some((prev_ci, prev_cj)) = prev_pair {
-        let pi = valid_cam_indices.iter().position(|&c| c == prev_ci);
-        let pj = valid_cam_indices.iter().position(|&c| c == prev_cj);
-        if let (Some(vi), Some(vj)) = (pi, pj) {
-            let pair_cams = [valid_cameras[vi], valid_cameras[vj]];
-            let pair_pts = [valid_points[vi], valid_points[vj]];
-            let (px, py, pz) = triangulate_point(&pair_cams, &pair_pts);
-            let p3d = Vector4::new(px, py, pz, 1.0);
-            let prev_err = reprojection_error(&pair_cams, &pair_pts, &p3d);
-            if prev_err < MAX_REPROJ_ERROR {
-                return Some((prev_ci, prev_cj));
-            }
-        }
-    }
-
-    let mut best_err = f32::MAX;
-    let mut best_pair = None;
-
-    let vc = valid_cameras.len();
-    for i in 0..vc {
-        for j in (i + 1)..vc {
-            let pair_cams = [valid_cameras[i], valid_cameras[j]];
-            let pair_pts = [valid_points[i], valid_points[j]];
-            let (px, py, pz) = triangulate_point(&pair_cams, &pair_pts);
-            let p3d = Vector4::new(px, py, pz, 1.0);
-            let pair_err = reprojection_error(&pair_cams, &pair_pts, &p3d);
-
-            if pair_err < best_err {
-                best_err = pair_err;
-                best_pair = Some((valid_cam_indices[i], valid_cam_indices[j]));
-            }
-        }
-    }
-
-    if best_err < MAX_REPROJ_ERROR { best_pair } else { None }
-}
 
 /// Triangulate 3D pose from N camera 2D observations
 /// Check hip z-jump and update state. Returns `true` if the frame should be rejected.
@@ -238,7 +176,6 @@ fn triangulate_poses_multi(
     cameras: &[&CameraParams],
     poses_2d: &[&Pose],
     confidence_threshold: f32,
-    prev_hip_ref_pair: &mut Option<(usize, usize)>,
     prev_hip_z: &mut Option<f32>,
     prev_hip_z_reject_count: &mut u32,
 ) -> Pose {
@@ -264,42 +201,18 @@ fn triangulate_poses_multi(
         observations.push(cam_obs);
     }
 
-    let hip_ref_pair = find_hip_reference_pair(cameras, &observations, *prev_hip_ref_pair);
-
     let mut keypoints = [Keypoint::default(); KP_COUNT];
 
     for kp_idx in 0..KP_COUNT {
-        // Try reference pair first
-        if let Some((ci, cj)) = hip_ref_pair {
-            if let (Some((ui, vi, conf_i)), Some((uj, vj, conf_j))) =
-                (observations[kp_idx][ci], observations[kp_idx][cj])
-            {
-                let pair_cams = [cameras[ci], cameras[cj]];
-                let pair_pts = [(ui, vi), (uj, vj)];
-                let (x, y, z) = triangulate_point(&pair_cams, &pair_pts);
-                let p3d = Vector4::new(x, y, z, 1.0);
-                let err = reprojection_error(&pair_cams, &pair_pts, &p3d);
-
-                if err < MAX_REPROJ_ERROR {
-                    let avg_conf = (conf_i + conf_j) / 2.0;
-                    keypoints[kp_idx] = Keypoint::new_3d(x, y, z, avg_conf);
-                    continue;
-                }
-            }
-        }
-
-        // Fallback: per-keypoint pair selection
-        let mut valid_cameras = Vec::new();
-        let mut valid_points = Vec::new();
-        let mut valid_confs = Vec::new();
-        let mut valid_cam_indices = Vec::new();
+        let mut valid_cameras: Vec<&CameraParams> = Vec::new();
+        let mut valid_points: Vec<(f32, f32)> = Vec::new();
+        let mut valid_confs: Vec<f32> = Vec::new();
 
         for cam_idx in 0..n {
             if let Some((u, v, conf)) = observations[kp_idx][cam_idx] {
                 valid_cameras.push(cameras[cam_idx]);
                 valid_points.push((u, v));
                 valid_confs.push(conf);
-                valid_cam_indices.push(cam_idx);
             }
         }
 
@@ -307,44 +220,37 @@ fn triangulate_poses_multi(
             continue;
         }
 
+        // 全カメラでDLT三角測量
         let (x, y, z) = triangulate_point(&valid_cameras, &valid_points);
-        let point_3d = Vector4::new(x, y, z, 1.0);
-        let err = reprojection_error(&valid_cameras, &valid_points, &point_3d);
+        let p3d = Vector4::new(x, y, z, 1.0);
 
-        if err < MAX_REPROJ_ERROR {
-            let avg_conf: f32 = valid_confs.iter().sum::<f32>() / valid_confs.len() as f32;
-            keypoints[kp_idx] = Keypoint::new_3d(x, y, z, avg_conf);
-            continue;
-        }
+        // 各カメラの角度reproj errorを計算し、外れカメラを除外
+        let mut inlier_cams: Vec<&CameraParams> = Vec::new();
+        let mut inlier_pts: Vec<(f32, f32)> = Vec::new();
+        let mut inlier_confs: Vec<f32> = Vec::new();
 
-        // Try all pairs
-        let mut best_err = f32::MAX;
-        let mut best_point = (0.0f32, 0.0f32, 0.0f32);
-        let mut best_conf = 0.0f32;
-
-        let vc = valid_cameras.len();
-        for i in 0..vc {
-            for j in (i + 1)..vc {
-                let pair_cams = [valid_cameras[i], valid_cameras[j]];
-                let pair_pts = [valid_points[i], valid_points[j]];
-                let (px, py, pz) = triangulate_point(&pair_cams, &pair_pts);
-                let p3d = Vector4::new(px, py, pz, 1.0);
-                let pair_err = reprojection_error(&pair_cams, &pair_pts, &p3d);
-
-                if pair_err < best_err {
-                    best_err = pair_err;
-                    best_point = (px, py, pz);
-                    best_conf = (valid_confs[i] + valid_confs[j]) / 2.0;
-                }
+        for i in 0..valid_cameras.len() {
+            let cam_err = reprojection_error(
+                &[valid_cameras[i]], &[valid_points[i]], &p3d,
+            );
+            if cam_err < MAX_REPROJ_ANGLE {
+                inlier_cams.push(valid_cameras[i]);
+                inlier_pts.push(valid_points[i]);
+                inlier_confs.push(valid_confs[i]);
             }
         }
 
-        if best_err < MAX_REPROJ_ERROR {
-            keypoints[kp_idx] = Keypoint::new_3d(best_point.0, best_point.1, best_point.2, best_conf);
+        if inlier_cams.len() >= 2 {
+            // inlierのみで再三角測量
+            let (rx, ry, rz) = if inlier_cams.len() < valid_cameras.len() {
+                triangulate_point(&inlier_cams, &inlier_pts)
+            } else {
+                (x, y, z)
+            };
+            let avg_conf: f32 = inlier_confs.iter().sum::<f32>() / inlier_confs.len() as f32;
+            keypoints[kp_idx] = Keypoint::new_3d(rx, ry, rz, avg_conf);
         }
     }
-
-    *prev_hip_ref_pair = hip_ref_pair;
 
     // Hip z-jump rejection
     let lh = &keypoints[KP_LEFT_HIP];
@@ -1487,7 +1393,6 @@ fn run_inference_loop(
     let mut reject_count: [u32; TRACKER_COUNT] = [0; TRACKER_COUNT];
 
     // Triangulation state
-    let mut prev_hip_ref_pair: Option<(usize, usize)> = None;
     let mut prev_hip_z: Option<f32> = None;
     let mut prev_hip_z_reject_count: u32 = 0;
 
@@ -1607,7 +1512,6 @@ fn run_inference_loop(
                     recent_hip_z.clear();
                     cal_deadline = None;
                     pose_3d = None;
-                    prev_hip_ref_pair = None;
                     prev_hip_z = None;
                     prev_hip_z_reject_count = 0;
 
@@ -1758,15 +1662,15 @@ fn run_inference_loop(
                             }
 
                             if verbose {
-                                log!(logfile, "[verbose] tri: using {} cameras (idx {:?}), prev_ref_pair={:?}, prev_hip_z={:?}",
-                                    available_poses.len(), available_cam_indices, prev_hip_ref_pair, prev_hip_z);
+                                log!(logfile, "[verbose] tri: using {} cameras (idx {:?}), prev_hip_z={:?}",
+                                    available_poses.len(), available_cam_indices, prev_hip_z);
                             }
 
                             if available_poses.len() >= 2 {
                                 let zjump_count_before = prev_hip_z_reject_count;
                                 let mut tri_pose = triangulate_poses_multi(
                                     &available_params, &available_poses, CONFIDENCE_THRESHOLD,
-                                    &mut prev_hip_ref_pair, &mut prev_hip_z,
+                                    &mut prev_hip_z,
                                     &mut prev_hip_z_reject_count,
                                 );
                                 if prev_hip_z_reject_count > zjump_count_before {
@@ -1777,7 +1681,7 @@ fn run_inference_loop(
                                 }
 
                                 if verbose {
-                                    log!(logfile, "[verbose] tri: ref_pair={:?} hip_z={:?}", prev_hip_ref_pair, prev_hip_z);
+                                    log!(logfile, "[verbose] tri: hip_z={:?}", prev_hip_z);
                                     let diag_kps: &[(usize, &str)] = &[
                                         (KP_LEFT_HIP, "LHip"), (KP_RIGHT_HIP, "RHip"),
                                         (KP_LEFT_KNEE, "LKnee"), (KP_RIGHT_KNEE, "RKnee"),
